@@ -2107,6 +2107,8 @@ async function renderTelegramSettings(view){
         <div class="row wrap">
           <select class="input" id="tgLogStatus" style="display:none;width:auto;min-width:130px">
             <option value="">全部状态</option>
+            <option value="pending">等待发送</option>
+            <option value="retry">自动重试</option>
             <option value="success">发送成功</option>
             <option value="failed">发送失败</option>
             <option value="skipped">已跳过</option>
@@ -2123,8 +2125,8 @@ async function renderTelegramSettings(view){
               <td>${esc(x.actor_name||"")}</td>
               <td>${esc(x.customer_name||"")}</td>
               <td>${esc(x.progress_name||"")}</td>
-              <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":"已跳过"}</span></td>
-              <td>${esc(x.error_text||"")}</td>
+              <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":x.status==="pending"?"等待发送":x.status==="retry"?"自动重试":"已跳过"}</span></td>
+              <td>${esc(x.status==="pending"?("群 "+(x.chat_id||"")+" · 等待发送"):x.status==="retry"?("群 "+(x.chat_id||"")+" · "+(x.error_text||"系统会自动重试")):(x.error_text||""))}</td>
             </tr>`).join("")||'<tr><td colspan="6" class="muted">还没有发送记录</td></tr>'}
           </tbody>
         </table>
@@ -2246,7 +2248,7 @@ async function renderTelegramSettings(view){
     try{
       await saveSettings(false);
       await api("/api/admin/telegram/test",{method:"POST"});
-      toast("模板测试消息已发送到默认 Telegram 群");
+      toast("模板测试消息已进入可靠发送队列");
       setTimeout(()=>renderTelegramSettings(view),500);
     }catch(e){toast(e.message)}
     btn.disabled=false;
@@ -2262,8 +2264,8 @@ async function renderTelegramSettings(view){
     <td>${esc(x.actor_name||"")}</td>
     <td>${esc(x.customer_name||"")}</td>
     <td>${esc(x.progress_name||"")}</td>
-    <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":"已跳过"}</span></td>
-    <td>${esc(x.error_text||"")}</td>
+    <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":x.status==="pending"?"等待发送":x.status==="retry"?"自动重试":"已跳过"}</span></td>
+    <td>${esc(x.status==="pending"?("群 "+(x.chat_id||"")+" · 等待发送"):x.status==="retry"?("群 "+(x.chat_id||"")+" · "+(x.error_text||"系统会自动重试")):(x.error_text||""))}</td>
   </tr>`).join(""):'<tr><td colspan="6" class="muted">还没有发送记录</td></tr>';
 
   function showRecentTelegramLogs(){
