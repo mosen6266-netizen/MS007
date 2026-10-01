@@ -10,6 +10,7 @@ on:
       - "schema.sql"
       - "migrations/**"
       - "scripts/**"
+      - "tests/**"
       - "wrangler.toml"
       - ".github/workflows/test.yml"
       - ".github/workflows/deploy.yml"
@@ -75,6 +76,9 @@ jobs:
 
           print("Fresh schema + migrations OK. Tables:",len(tables))
           PY
+
+      - name: Batch 1 customer integrity regression
+        run: python tests/batch1_integrity.py
 
       - name: Verify bootstrap defaults do not leak into migration files
         shell: bash
