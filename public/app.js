@@ -631,11 +631,29 @@ async function renderFields(view){
   document.querySelectorAll("[data-del-field]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/fields/"+b.dataset.delField,{method:"DELETE"});toast("字段已停用");renderFields(view)}catch(e){toast(e.message)}});
 }
 function fieldModal(view,f){
+  let fieldOptions=[];
+  try{
+    const parsed=JSON.parse(f?.options_json||"[]");
+    if(Array.isArray(parsed)) fieldOptions=parsed.map(x=>String(x)).filter(Boolean);
+  }catch{}
+
   openModal(f?"编辑字段":"添加字段",`
     <div class="field"><label>字段名称</label><input class="input" id="fLabel" value="${esc(f?.label||"")}"></div>
     <div class="field"><label>字段类型</label><select class="input" id="fType">
       ${["text","textarea","phone","email","number","date","time","url","select"].map(x=>`<option ${x===f?.field_type?"selected":""} value="${x}">${esc(fieldTypeName[x]||x)}</option>`).join("")}
     </select></div>
+
+    <div id="fOptionsBox" class="field-options-box hidden">
+      <div class="field-options-head">
+        <div>
+          <strong>下拉选择项</strong>
+          <div class="muted" style="font-size:12px;margin-top:3px">业务员登记客户时，会从这里设置的选项中选择。</div>
+        </div>
+        <button class="btn secondary small" type="button" id="addFieldOption">＋ 添加选项</button>
+      </div>
+      <div id="fieldOptionsList" class="field-options-list"></div>
+    </div>
+
     <div class="row wrap">
       <label><input type="checkbox" id="fRequired" ${f?.required?"checked":""}> 必填</label>
       <label><input type="checkbox" id="fList" ${f?.list_visible?"checked":""}> 客户列表显示</label>
@@ -644,7 +662,107 @@ function fieldModal(view,f){
     </div>
     <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="fSort" type="number" value="${f?.sort_order??100}"></div>
     <button class="btn full" id="fSave">保存</button>`,()=>{
-      document.querySelector("#fSave").onclick=async()=>{const body={label:val("fLabel"),fieldType:val("fType"),required:checked("fRequired"),listVisible:checked("fList"),searchable:checked("fSearch"),enabled:checked("fEnabled"),sortOrder:Number(val("fSort")||100),listSortOrder:Number(val("fSort")||100)};try{if(f)await api("/api/admin/fields/"+f.id,{method:"PATCH",body});else await api("/api/admin/fields",{method:"POST",body});closeModal();toast("字段设置已保存");renderFields(view)}catch(e){toast(e.message)}};
+      const typeEl=document.querySelector("#fType");
+      const box=document.querySelector("#fOptionsBox");
+      const list=document.querySelector("#fieldOptionsList");
+
+      function syncOptionsFromInputs(){
+        fieldOptions=[...list.querySelectorAll(".field-option-input")]
+          .map(x=>x.value.trim())
+          .filter(Boolean);
+      }
+
+      function renderOptions(){
+        list.innerHTML=fieldOptions.length
+          ? fieldOptions.map((option,i)=>`
+              <div class="field-option-row" data-option-index="${i}">
+                <span class="drag">⋮⋮</span>
+                <input class="input field-option-input" value="${esc(option)}" placeholder="例如：是">
+                <button class="btn ghost small" type="button" data-option-up="${i}" ${i===0?"disabled":""}>↑</button>
+                <button class="btn ghost small" type="button" data-option-down="${i}" ${i===fieldOptions.length-1?"disabled":""}>↓</button>
+                <button class="btn danger small" type="button" data-option-delete="${i}">删除</button>
+              </div>`).join("")
+          : '<div class="empty-options">还没有选项，点击右上角“＋ 添加选项”。</div>';
+
+        list.querySelectorAll(".field-option-input").forEach(input=>{
+          input.oninput=()=>{
+            const row=input.closest("[data-option-index]");
+            if(row) fieldOptions[Number(row.dataset.optionIndex)]=input.value;
+          };
+        });
+        list.querySelectorAll("[data-option-up]").forEach(btn=>btn.onclick=()=>{
+          syncOptionsFromInputs();
+          const i=Number(btn.dataset.optionUp);
+          if(i>0)[fieldOptions[i-1],fieldOptions[i]]=[fieldOptions[i],fieldOptions[i-1]];
+          renderOptions();
+        });
+        list.querySelectorAll("[data-option-down]").forEach(btn=>btn.onclick=()=>{
+          syncOptionsFromInputs();
+          const i=Number(btn.dataset.optionDown);
+          if(i<fieldOptions.length-1)[fieldOptions[i+1],fieldOptions[i]]=[fieldOptions[i],fieldOptions[i+1]];
+          renderOptions();
+        });
+        list.querySelectorAll("[data-option-delete]").forEach(btn=>btn.onclick=()=>{
+          syncOptionsFromInputs();
+          fieldOptions.splice(Number(btn.dataset.optionDelete),1);
+          renderOptions();
+        });
+      }
+
+      function updateOptionVisibility(){
+        const isSelect=typeEl.value==="select";
+        box.classList.toggle("hidden",!isSelect);
+        if(isSelect&&fieldOptions.length===0){
+          fieldOptions=["是","否"];
+          renderOptions();
+        }
+      }
+
+      document.querySelector("#addFieldOption").onclick=()=>{
+        syncOptionsFromInputs();
+        fieldOptions.push("");
+        renderOptions();
+        const inputs=list.querySelectorAll(".field-option-input");
+        inputs[inputs.length-1]?.focus();
+      };
+
+      typeEl.onchange=updateOptionVisibility;
+      renderOptions();
+      updateOptionVisibility();
+
+      document.querySelector("#fSave").onclick=async()=>{
+        syncOptionsFromInputs();
+        const type=val("fType");
+        const label=val("fLabel").trim();
+        if(!label){toast("请输入字段名称");return}
+        if(type==="select"){
+          const normalized=[];
+          const seen=new Set();
+          for(const option of fieldOptions.map(x=>String(x).trim()).filter(Boolean)){
+            if(!seen.has(option)){seen.add(option);normalized.push(option)}
+          }
+          fieldOptions=normalized;
+          if(fieldOptions.length===0){toast("下拉选择至少需要一个选项");return}
+        }
+        const body={
+          label,
+          fieldType:type,
+          required:checked("fRequired"),
+          listVisible:checked("fList"),
+          searchable:checked("fSearch"),
+          enabled:checked("fEnabled"),
+          sortOrder:Number(val("fSort")||100),
+          listSortOrder:Number(val("fSort")||100),
+          options:type==="select"?fieldOptions:[]
+        };
+        try{
+          if(f)await api("/api/admin/fields/"+f.id,{method:"PATCH",body});
+          else await api("/api/admin/fields",{method:"POST",body});
+          closeModal();
+          toast("字段设置已保存");
+          renderFields(view);
+        }catch(e){toast(e.message)}
+      };
     });
 }
 
