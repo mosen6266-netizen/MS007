@@ -1008,6 +1008,12 @@ async function api(request, env) {
 
   if (path === "/api/health") return responseJson({ ok: true, app: env.APP_NAME || "MS007" });
   if (path === "/api/bootstrap-status" && method === "GET") return responseJson({ ok:true, needsBootstrap: await bootstrapStatus(env) });
+  if (path === "/api/bootstrap-token-check" && method === "GET") {
+    const token = request.headers.get("x-bootstrap-token") || "";
+    const configured = !!env.BOOTSTRAP_TOKEN;
+    const valid = configured && token === env.BOOTSTRAP_TOKEN;
+    return responseJson({ ok:true, configured, valid });
+  }
   if (path === "/api/bootstrap" && method === "POST") return handleBootstrap(request, env);
   if (path === "/api/login" && method === "POST") return handleLogin(request, env);
 
