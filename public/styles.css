@@ -809,3 +809,13 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
     flex-direction:column;
   }
 }
+
+
+/* Deployment version marker */
+.system-version{
+  margin:0 0 8px;
+  text-align:center;
+  font-size:11px;
+  color:var(--muted);
+  word-break:break-all;
+}
