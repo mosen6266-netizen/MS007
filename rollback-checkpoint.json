@@ -1,0 +1,21 @@
+{
+  "project": "MS007",
+  "release": "seven-batch-hardening-final",
+  "policy": {
+    "record_d1_time_travel_before_production_migrations": true,
+    "deploy_staging_before_production": true,
+    "require_quality_and_scale_regressions": true,
+    "preserve_existing_customer_records": true,
+    "code_rollback_does_not_require_customer_data_rollback": true
+  },
+  "production_targets": {
+    "worker": "ms007-crm",
+    "d1": "ms007-crm"
+  },
+  "rollback_order": [
+    "Stop unsafe deployment if validation/staging fails.",
+    "For code-only regressions, redeploy a previously verified commit without recreating D1.",
+    "For migration/data regressions, use the D1 Time Travel point recorded before migration.",
+    "If the Cloudflare account/database is unavailable, rebuild infrastructure from main and import the latest verified MS007 V3 business backup."
+  ]
+}
