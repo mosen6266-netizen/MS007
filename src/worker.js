@@ -1387,19 +1387,40 @@ async function stats(request, env, user) {
   const createdBind=from?[from]:[];
 
   const base=await env.DB.prepare(
-    `SELECT COUNT(*) total,
-      SUM(CASE WHEN c.progress_percent=100 THEN 1 ELSE 0 END) completed
+    `SELECT COUNT(*) total
      FROM customers c
      WHERE c.deleted_at IS NULL AND c.archived=0${ownerSql}${createdPeriodSql}`
   ).bind(...ownerBind,...createdBind).first();
 
-  const todayStart=new Date(); // fallback only; UI normally supplies local boundary.
-  todayStart.setUTCHours(0,0,0,0);
-  const todayIso=todayStart.toISOString();
+  let completed;
+  if(from){
+    completed=await env.DB.prepare(
+      `SELECT COUNT(*) n
+       FROM customers c
+       WHERE c.deleted_at IS NULL
+         AND c.archived=0
+         AND c.progress_percent=100
+         ${salesOnly?"AND c.assigned_user_id=?":""}
+         AND (SELECT MAX(cp.completed_at) FROM customer_progress cp
+              WHERE cp.customer_id=c.id AND cp.completed=1) >= ?`
+    ).bind(...ownerBind,from).first();
+  }else{
+    completed=await env.DB.prepare(
+      `SELECT COUNT(*) n
+       FROM customers c
+       WHERE c.deleted_at IS NULL
+         AND c.archived=0
+         AND c.progress_percent=100
+         ${salesOnly?"AND c.assigned_user_id=?":""}`
+    ).bind(...ownerBind).first();
+  }
+
+  const todayFromRaw=String(url.searchParams.get("todayFrom")||"").trim();
+  const todayFrom=/^\d{4}-\d{2}-\d{2}T/.test(todayFromRaw)?todayFromRaw:new Date(new Date().setUTCHours(0,0,0,0)).toISOString();
   const today=await env.DB.prepare(
     `SELECT COUNT(*) n FROM customers c
       WHERE c.deleted_at IS NULL AND c.archived=0${ownerSql} AND c.created_at>=?`
-  ).bind(...ownerBind,todayIso).first();
+  ).bind(...ownerBind,todayFrom).first();
 
   const progressRows=await env.DB.prepare(
     `SELECT cp.progress_id, COUNT(DISTINCT cp.customer_id) n
@@ -1436,7 +1457,7 @@ async function stats(request, env, user) {
   return responseJson({ok:true,period,from:from||null,summary:{
     total:Number(base?.total||0),
     today:Number(today?.n||0),
-    completed:Number(base?.completed||0),
+    completed:Number(completed?.n||0),
     archived:0
   },progressCounts,sales});
 }
