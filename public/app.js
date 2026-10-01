@@ -1181,51 +1181,168 @@ function progressModal(view,p,nextSort=1,insert=null){
 }
 
 async function renderSidebarAdmin(view){
-  const r=await api("/api/admin/sidebar");const items=r.items||[];
-  view.innerHTML=pageHead("左侧栏管理","只有管理员可以设置；保存后管理员端和业务员端会自动同步",`<button class="btn" id="addSide">＋ 添加按钮</button>`)+
-    `<div class="notice" style="margin-bottom:14px">当前侧栏配置版本：<strong>${r.version}</strong>。在线用户会自动检测新版本并刷新左侧栏，不需要退出登录。</div>
-    <div class="settings-list" id="sideRows">
-      ${items.map(x=>`<div class="setting-row" draggable="true" data-side-id="${esc(x.id)}" data-audience="${esc(x.audience)}">
-        <div class="drag">⋮⋮</div><div><strong>${esc(x.label)}</strong><div class="muted" style="font-size:12px">${esc(x.url)}</div></div>
-        <div><span class="tag">${x.audience==="admin"?"管理员":x.audience==="sales"?"业务员":"两边"}</span></div>
-        <div>${x.enabled?"启用":"停用"}</div>
-        <div><button class="btn ghost small" data-side-edit="${esc(x.id)}">编辑</button> <button class="btn danger small" data-side-del="${esc(x.id)}">删除</button></div>
-      </div>`).join("")}
-    </div>`;
-  document.querySelector("#addSide").onclick=()=>sidebarModal(view,null);
-  document.querySelectorAll("[data-side-edit]").forEach(b=>b.onclick=()=>sidebarModal(view,items.find(x=>x.id===b.dataset.sideEdit)));
-  document.querySelectorAll("[data-side-del]").forEach(b=>b.onclick=async()=>{if(!await uiConfirm("确认删除这个侧栏按钮？",{title:"删除侧栏按钮",confirmText:"删除",danger:true}))return;try{await api("/api/admin/sidebar/"+b.dataset.sideDel,{method:"DELETE"});toast("侧栏按钮已删除并同步");await refreshSidebar(true);renderSidebarAdmin(view)}catch(e){toast(e.message)}});
+  const r=await api("/api/admin/sidebar");
+  const items=r.items||[];
+
+  const sectionItems=(audience)=>items
+    .filter(x=>x.audience===audience || x.audience==="all")
+    .slice()
+    .sort((a,b)=>(Number(a.sort_order)||0)-(Number(b.sort_order)||0)||String(a.label||"").localeCompare(String(b.label||"")));
+
+  const renderSection=(audience,title,description)=>{
+    const rows=sectionItems(audience);
+    return `
+      <section class="card sidebar-admin-section" style="margin-bottom:18px">
+        <div class="row wrap" style="justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div>
+            <h3 style="margin:0 0 4px">${esc(title)}</h3>
+            <div class="muted" style="font-size:12px">${esc(description)}</div>
+          </div>
+          <button class="btn" data-add-side="${audience}">＋ 添加按钮</button>
+        </div>
+        <div class="settings-list">
+          ${rows.length?rows.map(x=>`
+            <div class="setting-row" draggable="true" data-side-id="${esc(x.id)}" data-audience="${esc(x.audience)}" data-side-section="${audience}">
+              <div class="drag">⋮⋮</div>
+              <div>
+                <strong>${esc(x.label)}</strong>
+                <div class="muted" style="font-size:12px">${esc(x.url)}</div>
+              </div>
+              <div><span class="tag">排序：${Number(x.sort_order)||0}</span></div>
+              <div><span class="tag">${x.audience==="all"?"管理员和业务员":x.audience==="admin"?"管理员":"业务员"}</span></div>
+              <div>${x.enabled?"启用":"停用"}</div>
+              <div>
+                <button class="btn ghost small" data-side-edit="${esc(x.id)}">编辑</button>
+                <button class="btn danger small" data-side-del="${esc(x.id)}">删除</button>
+              </div>
+            </div>`).join(""):'<div class="muted" style="padding:14px 4px">这个区域目前没有左侧栏按钮。</div>'}
+        </div>
+      </section>`;
+  };
+
+  view.innerHTML=pageHead(
+    "左侧栏管理",
+    "管理员左侧栏和业务员左侧栏分开管理；保存后在线用户会自动同步。"
+  )+
+    `<div class="notice" style="margin-bottom:14px">当前侧栏配置版本：<strong>${r.version}</strong>。每一项现在都会显示实际排序数字；新增按钮默认使用当前区域最大排序数字 +1。</div>
+    ${renderSection("admin","管理员左侧栏","这里只管理管理员登录后看到的左侧栏。")}
+    ${renderSection("sales","业务员左侧栏","这里只管理业务员登录后看到的左侧栏。")}`;
+
+  document.querySelectorAll("[data-add-side]").forEach(b=>{
+    b.onclick=()=>sidebarModal(view,null,items,b.dataset.addSide);
+  });
+
+  document.querySelectorAll("[data-side-edit]").forEach(b=>b.onclick=()=>{
+    sidebarModal(view,items.find(x=>x.id===b.dataset.sideEdit),items);
+  });
+
+  document.querySelectorAll("[data-side-del]").forEach(b=>b.onclick=async()=>{
+    if(!await uiConfirm("确认删除这个侧栏按钮？",{title:"删除侧栏按钮",confirmText:"删除",danger:true}))return;
+    try{
+      await api("/api/admin/sidebar/"+b.dataset.sideDel,{method:"DELETE"});
+      toast("侧栏按钮已删除并同步");
+      await refreshSidebar(true);
+      renderSidebarAdmin(view);
+    }catch(e){toast(e.message)}
+  });
+
   enableSidebarDrag(view,items);
 }
-function sidebarModal(view,x){
+
+function sidebarNextSort(items,audience){
+  const relevant=audience==="all"
+    ? items
+    : items.filter(x=>x.audience===audience || x.audience==="all");
+  return relevant.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0)+1;
+}
+
+function sidebarModal(view,x,items=[],defaultAudience="sales"){
+  const initialAudience=x?.audience||defaultAudience;
+  const initialSort=x?.sort_order??sidebarNextSort(items,initialAudience);
+
   openModal(x?"编辑左侧栏按钮":"添加左侧栏按钮",`
     <div class="field"><label>按钮名称</label><input class="input" id="sLabel" value="${esc(x?.label||"")}"></div>
-    <div class="field"><label>显示对象</label><select class="input" id="sAudience"><option value="admin" ${x?.audience==="admin"?"selected":""}>管理员</option><option value="sales" ${x?.audience==="sales"?"selected":""}>业务员</option><option value="all" ${x?.audience==="all"?"selected":""}>管理员和业务员</option></select></div>
+    <div class="field"><label>显示对象</label><select class="input" id="sAudience">
+      <option value="admin" ${initialAudience==="admin"?"selected":""}>管理员</option>
+      <option value="sales" ${initialAudience==="sales"?"selected":""}>业务员</option>
+      <option value="all" ${initialAudience==="all"?"selected":""}>管理员和业务员</option>
+    </select></div>
     <div class="field"><label>跳转链接</label><input class="input" id="sUrl" value="${esc(x?.url||"https://")}"></div>
     <div class="field"><label>图标文字/图标代号</label><input class="input" id="sIcon" value="${esc(x?.icon||"link")}"></div>
     <div class="field"><label>分组标题</label><input class="input" id="sGroup" value="${esc(x?.group_label||"")}"></div>
     <div class="field"><label>打开方式</label><select class="input" id="sTarget"><option value="same" ${x?.target!=="new"?"selected":""}>当前页面</option><option value="new" ${x?.target==="new"?"selected":""}>新窗口</option></select></div>
-    <div class="field"><label>排序数字</label><input class="input" type="number" id="sSort" value="${x?.sort_order??100}"></div>
+    <div class="field"><label>排序数字</label><input class="input" type="number" id="sSort" value="${initialSort}"><div class="muted" style="font-size:12px;margin-top:5px">${x?"当前保存的排序数字。":"已自动取当前区域最大排序数字 +1，你也可以手动修改。"}</div></div>
     <label><input type="checkbox" id="sEnabled" ${x?.enabled!==0?"checked":""}> 启用</label>
     <button class="btn full" id="sSave" style="margin-top:16px">保存并同步</button>`,()=>{
-      document.querySelector("#sSave").onclick=async()=>{const body={label:val("sLabel"),audience:val("sAudience"),url:val("sUrl"),icon:val("sIcon"),groupLabel:val("sGroup"),target:val("sTarget"),sortOrder:Number(val("sSort")||100),enabled:checked("sEnabled")};try{if(x)await api("/api/admin/sidebar/"+x.id,{method:"PATCH",body});else await api("/api/admin/sidebar",{method:"POST",body});closeModal();toast("左侧栏已保存并同步");await refreshSidebar(true);renderSidebarAdmin(view)}catch(e){toast(e.message)}};
-    },{draftKey:`sidebar:${x?.id||"new"}`});
+      if(!x){
+        document.querySelector("#sAudience").onchange=()=>{
+          document.querySelector("#sSort").value=sidebarNextSort(items,val("sAudience"));
+        };
+      }
+
+      document.querySelector("#sSave").onclick=async()=>{
+        const body={
+          label:val("sLabel"),
+          audience:val("sAudience"),
+          url:val("sUrl"),
+          icon:val("sIcon"),
+          groupLabel:val("sGroup"),
+          target:val("sTarget"),
+          sortOrder:Number(val("sSort")||sidebarNextSort(items,val("sAudience"))),
+          enabled:checked("sEnabled")
+        };
+        try{
+          if(x)await api("/api/admin/sidebar/"+x.id,{method:"PATCH",body});
+          else await api("/api/admin/sidebar",{method:"POST",body});
+          closeModal();
+          toast("左侧栏已保存并同步");
+          await refreshSidebar(true);
+          renderSidebarAdmin(view);
+        }catch(e){toast(e.message)}
+      };
+    },{draftKey:`sidebar:${x?.id||("new:"+initialAudience)}`});
 }
+
 function enableSidebarDrag(view,items){
   let dragId=null;
+  let dragSection=null;
+
   document.querySelectorAll("[data-side-id]").forEach(row=>{
-    row.addEventListener("dragstart",()=>dragId=row.dataset.sideId);
+    row.addEventListener("dragstart",()=>{
+      dragId=row.dataset.sideId;
+      dragSection=row.dataset.sideSection||row.dataset.audience;
+    });
     row.addEventListener("dragover",e=>e.preventDefault());
     row.addEventListener("drop",async e=>{
-      e.preventDefault();const targetId=row.dataset.sideId;if(!dragId||dragId===targetId)return;
-      const a=items.find(x=>x.id===dragId),b=items.find(x=>x.id===targetId);
-      if(!a||!b||a.audience!==b.audience){toast("请在同一显示对象内排序");return;}
+      e.preventDefault();
+      const targetId=row.dataset.sideId;
+      const targetSection=row.dataset.sideSection||row.dataset.audience;
+      if(!dragId||dragId===targetId)return;
+      if(dragSection!==targetSection){toast("请在同一个区域内排序");return;}
+
+      const a=items.find(x=>x.id===dragId);
+      const b=items.find(x=>x.id===targetId);
+      if(!a||!b){return;}
+      if(a.audience!==b.audience){
+        toast("“管理员和业务员”共用按钮不能和单独按钮直接拖动混排，请编辑排序数字调整。");
+        return;
+      }
+
       const subset=items.filter(x=>x.audience===a.audience).sort((x,y)=>x.sort_order-y.sort_order);
-      const from=subset.findIndex(x=>x.id===dragId),to=subset.findIndex(x=>x.id===targetId);
-      const [moved]=subset.splice(from,1);subset.splice(to,0,moved);
+      const from=subset.findIndex(x=>x.id===dragId);
+      const to=subset.findIndex(x=>x.id===targetId);
+      if(from<0||to<0)return;
+
+      const [moved]=subset.splice(from,1);
+      subset.splice(to,0,moved);
+
       try{
-        for(let i=0;i<subset.length;i++)await api("/api/admin/sidebar/"+subset[i].id,{method:"PATCH",body:{sortOrder:(i+1)*10}});
-        toast("排序已同步");await refreshSidebar(true);renderSidebarAdmin(view);
+        for(let i=0;i<subset.length;i++){
+          await api("/api/admin/sidebar/"+subset[i].id,{method:"PATCH",body:{sortOrder:(i+1)*10}});
+        }
+        toast("排序已同步");
+        await refreshSidebar(true);
+        renderSidebarAdmin(view);
       }catch(err){toast(err.message)}
     });
   });
