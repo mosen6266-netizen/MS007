@@ -2054,7 +2054,13 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[],nextSort=1,insert=
 }
 
 
+let telegramUnresolvedRefreshTimer=null;
+
 async function renderTelegramSettings(view){
+  if(telegramUnresolvedRefreshTimer){
+    clearInterval(telegramUnresolvedRefreshTimer);
+    telegramUnresolvedRefreshTimer=null;
+  }
   const r=await api("/api/admin/telegram");
   const s=r.settings||{};
   const progressDefs=r.progressDefs||[];
@@ -2074,6 +2080,7 @@ async function renderTelegramSettings(view){
   });
 
   const queueMonitor=r.queueMonitor||{};
+  const unresolvedInitial=Array.isArray(r.unresolved?.items)?r.unresolved.items:[];
   const formatQueueWait=seconds=>{
     const value=Math.max(0,Number(seconds||0));
     if(!value)return "无等待";
@@ -2084,15 +2091,38 @@ async function renderTelegramSettings(view){
   const telegramStatusText=x=>x.status==="success"?"发送成功":
     x.status==="failed"?"发送失败":
     x.status==="pending"?"等待发送":
+    x.status==="sending"?"正在发送":
     x.status==="retry"?"自动重试":
     x.status==="needs_admin"?"需要管理员处理":"已跳过";
   const telegramLogReason=x=>x.status==="pending"
     ?("群 "+(x.chat_id||"")+" · 等待发送")
-    :x.status==="retry"
-      ?("群 "+(x.chat_id||"")+" · "+(x.error_text||"系统会自动重试"))
-      :x.status==="needs_admin"
-        ?("群 "+(x.chat_id||"")+" · "+(x.error_text||"需要管理员检查后手动重试"))
-        :(x.error_text||"");
+    :x.status==="sending"
+      ?("群 "+(x.chat_id||"")+" · 正在发送")
+      :x.status==="retry"
+        ?("群 "+(x.chat_id||"")+" · "+(x.error_text||"系统会自动重试"))
+        :x.status==="needs_admin"
+          ?("群 "+(x.chat_id||"")+" · "+(x.error_text||"需要管理员检查后手动重试"))
+          :(x.error_text||"");
+
+  const telegramUnresolvedRowsHtml=(items)=>items.length?items.map(x=>{
+    const source=x.source==="delivery"?"delivery":"queue";
+    const waiting=x.status==="retry"&&x.next_attempt_at
+      ?(" · 下次尝试 "+String(x.next_attempt_at).replace("T"," ").slice(0,19))
+      :"";
+    const reason=(telegramLogReason(x)||"等待处理")+waiting;
+    const button=x.status==="sending"
+      ?'<span class="muted">发送处理中</span>'
+      :`<button class="btn secondary small" data-tg-unresolved-retry="${esc(x.id)}" data-tg-unresolved-source="${source}">${source==="delivery"?"重新发送":"立即重试"}</button>`;
+    return `<tr>
+      <td>${esc((x.updated_at||x.created_at||"").replace("T"," ").slice(0,19))}</td>
+      <td>${esc(x.actor_name||"")}</td>
+      <td>${esc(x.customer_name||"")}</td>
+      <td>${esc(x.progress_name||"")}</td>
+      <td><span class="tag">${esc(telegramStatusText(x))}</span></td>
+      <td>${esc(reason)}</td>
+      <td>${button}</td>
+    </tr>`;
+  }).join(""):'<tr><td colspan="7" class="muted">当前没有未发送成功的通知。等待/重试中的消息发送成功后也会自动从这里消失。</td></tr>';
 
   view.innerHTML=pageHead("Telegram 通知","业务员完成客户进度后，机器人自动按你设置的群组规则播报。")+
     `<div class="grid telegram-settings-grid">
@@ -2205,6 +2235,23 @@ async function renderTelegramSettings(view){
         <div class="card metric"><div class="label">最早等待</div><div class="value" style="font-size:20px">${esc(formatQueueWait(queueMonitor.oldestWaitSeconds))}</div></div>
         <div class="card metric"><div class="label">近 24 小时成功率</div><div class="value" style="font-size:20px">${queueMonitor.recentSuccessRate===null||queueMonitor.recentSuccessRate===undefined?"暂无":money(queueMonitor.recentSuccessRate)+"%"}</div><div class="muted" style="font-size:12px">${money(queueMonitor.recentSuccessCount||0)} 成功 / ${money(queueMonitor.recentFailedCount||0)} 失败</div></div>
       </div>
+    </section>
+
+    <section class="card" style="margin-top:16px">
+      <div class="telegram-log-head">
+        <div>
+          <h3 style="margin:0">未发送成功 <span class="tag" id="tgUnresolvedCount">${money(unresolvedInitial.length)}</span></h3>
+          <p class="muted" id="tgUnresolvedMeta" style="margin:6px 0 0">这里自动汇总所有最终还没有成功的 Telegram 通知，包括等待发送、自动重试、需要管理员处理、已跳过和旧失败记录。发送成功后会自动从这里消失，不需要你再翻历史记录。</p>
+        </div>
+        <button class="btn ghost small" id="tgUnresolvedRefresh">立即刷新</button>
+      </div>
+      <div class="table-wrap" style="margin-top:12px">
+        <table>
+          <thead><tr><th>更新时间</th><th>业务员</th><th>客户</th><th>进度</th><th>当前状态</th><th>原因/等待</th><th>操作</th></tr></thead>
+          <tbody id="tgUnresolvedBody">${telegramUnresolvedRowsHtml(unresolvedInitial)}</tbody>
+        </table>
+      </div>
+      <div class="muted" id="tgUnresolvedAutoHint" style="margin-top:8px;font-size:12px">页面打开时每 5 秒自动检查一次；成功发送的项目会自动消失。</div>
     </section>
 
     <section class="card" style="margin-top:16px">
@@ -2366,6 +2413,58 @@ async function renderTelegramSettings(view){
     btn.disabled=false;
     btn.textContent="保存并发送模板测试";
   };
+
+  async function refreshTelegramUnresolved({showError=false}={}){
+    const body=document.querySelector("#tgUnresolvedBody");
+    if(!body)return;
+    try{
+      const out=await api("/api/admin/telegram/unresolved");
+      const items=Array.isArray(out.items)?out.items:[];
+      body.innerHTML=telegramUnresolvedRowsHtml(items);
+      const count=document.querySelector("#tgUnresolvedCount");
+      if(count)count.textContent=money(items.length);
+      const meta=document.querySelector("#tgUnresolvedMeta");
+      if(meta){
+        meta.textContent=items.length
+          ?("当前还有 "+items.length+" 条没有最终发送成功；等待/重试中的项目成功后会自动消失。")
+          :"当前全部 Telegram 通知都已经成功发送，没有需要处理的项目。";
+      }
+    }catch(e){
+      if(showError)toast(e.message);
+    }
+  }
+
+  document.querySelector("#tgUnresolvedRefresh").onclick=()=>refreshTelegramUnresolved({showError:true});
+  document.querySelector("#tgUnresolvedBody").onclick=async e=>{
+    const btn=e.target.closest("[data-tg-unresolved-retry]");
+    if(!btn)return;
+    const id=btn.dataset.tgUnresolvedRetry||"";
+    const source=btn.dataset.tgUnresolvedSource||"queue";
+    btn.disabled=true;
+    btn.textContent=source==="delivery"?"正在重新发送...":"正在重试...";
+    try{
+      const endpoint=source==="delivery"
+        ?("/api/admin/telegram/delivery/"+encodeURIComponent(id)+"/retry")
+        :("/api/admin/telegram/queue/"+encodeURIComponent(id)+"/retry");
+      await api(endpoint,{method:"POST"});
+      toast(source==="delivery"?"这条通知已重新进入发送流程":"已要求这条消息立即重试");
+      await refreshTelegramUnresolved({showError:true});
+    }catch(err){
+      toast(err.message);
+      btn.disabled=false;
+      btn.textContent=source==="delivery"?"重新发送":"立即重试";
+    }
+  };
+
+  telegramUnresolvedRefreshTimer=setInterval(()=>{
+    const body=document.querySelector("#tgUnresolvedBody");
+    if(!body || !location.hash.includes("/admin/telegram")){
+      clearInterval(telegramUnresolvedRefreshTimer);
+      telegramUnresolvedRefreshTimer=null;
+      return;
+    }
+    refreshTelegramUnresolved();
+  },5000);
 
   const recentTelegramLogs=r.logs||[];
   let telegramLogMode="recent";
