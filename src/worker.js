@@ -1094,28 +1094,54 @@ async function adminListColumns(request, env) {
   const url=new URL(request.url);
   const audience=url.searchParams.get("audience")==="sales"?"sales":"admin";
   const r=await env.DB.prepare(
-    "SELECT id,audience,column_key,field_id,label,enabled,sort_order FROM list_columns WHERE audience=? ORDER BY sort_order,label"
+    "SELECT id,audience,column_key,field_id,label,enabled,sort_order FROM list_columns WHERE audience=? ORDER BY sort_order,label,id"
   ).bind(audience).all();
+
+  const seen=new Set();
+  const duplicates=[];
+  const items=[];
+  for(const item of r.results||[]){
+    const key=String(item.column_key||"")+":"+String(item.field_id||"");
+    if(seen.has(key)){duplicates.push(item.id);continue}
+    seen.add(key);items.push(item);
+  }
+  if(duplicates.length){
+    const marks=duplicates.map(()=>"?").join(",");
+    await env.DB.prepare(`DELETE FROM list_columns WHERE id IN (${marks})`).bind(...duplicates).run();
+  }
+
   const fields=await env.DB.prepare("SELECT id,label,field_key FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label").all();
-  return responseJson({ok:true,audience,items:r.results||[],fields:fields.results||[]});
+  return responseJson({ok:true,audience,items,fields:fields.results||[]});
 }
 
 async function saveListColumns(request, env, user) {
   const b=await readBody(request);
   const audience=b.audience==="sales"?"sales":"admin";
-  const items=Array.isArray(b.items)?b.items:[];
+  const input=Array.isArray(b.items)?b.items:[];
   const statements=[env.DB.prepare("DELETE FROM list_columns WHERE audience=?").bind(audience)];
+  const seen=new Set();
   let sort=10;
-  for(const item of items){
-    if(item.columnKey==="dynamic" && !item.fieldId) continue;
+  let count=0;
+
+  for(const item of input){
+    const columnKey=String(item.columnKey||"dynamic");
+    const fieldId=item.fieldId||null;
+    if(columnKey==="dynamic"&&!fieldId)continue;
+    if(!["name","owner","dynamic"].includes(columnKey))continue;
+    if(audience==="sales"&&columnKey==="owner")continue;
+
+    const uniqueKey=columnKey+":"+String(fieldId||"");
+    if(seen.has(uniqueKey))continue;
+    seen.add(uniqueKey);
+
     statements.push(env.DB.prepare(
       "INSERT INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order) VALUES(?,?,?,?,?,?,?)"
-    ).bind(uid("lc_"),audience,String(item.columnKey||"dynamic"),item.fieldId||null,String(item.label||""),item.enabled===false?0:1,sort));
-    sort+=10;
+    ).bind(uid("lc_"),audience,columnKey,fieldId,String(item.label||""),item.enabled===false?0:1,sort));
+    sort+=10;count++;
   }
   await env.DB.batch(statements);
-  await audit(env,user,"replace","list_columns",audience,{count:items.length});
-  return responseJson({ok:true});
+  await audit(env,user,"replace","list_columns",audience,{count});
+  return responseJson({ok:true,count});
 }
 
 async function dashboardWidgets(env,user){
