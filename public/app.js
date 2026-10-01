@@ -2099,11 +2099,25 @@ async function renderTelegramSettings(view){
     </section>
 
     <section class="card" style="margin-top:16px">
-      <h3 style="margin-top:0">最近发送记录</h3>
-      <div class="table-wrap">
+      <div class="telegram-log-head">
+        <div>
+          <h3 id="tgLogTitle" style="margin:0">最近发送记录</h3>
+          <p class="muted" id="tgLogMeta" style="margin:6px 0 0">这里先显示最近 20 条，需要时可以查看全部历史记录。</p>
+        </div>
+        <div class="row wrap">
+          <select class="input" id="tgLogStatus" style="display:none;width:auto;min-width:130px">
+            <option value="">全部状态</option>
+            <option value="success">发送成功</option>
+            <option value="failed">发送失败</option>
+            <option value="skipped">已跳过</option>
+          </select>
+          <button class="btn secondary small" id="tgViewAllLogs">查看全部发送记录</button>
+        </div>
+      </div>
+      <div class="table-wrap" style="margin-top:12px">
         <table>
           <thead><tr><th>时间</th><th>业务员</th><th>客户</th><th>进度</th><th>状态</th><th>群/说明</th></tr></thead>
-          <tbody>
+          <tbody id="tgLogBody">
             ${(r.logs||[]).map(x=>`<tr>
               <td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td>
               <td>${esc(x.actor_name||"")}</td>
@@ -2115,6 +2129,7 @@ async function renderTelegramSettings(view){
           </tbody>
         </table>
       </div>
+      <div id="tgLogPager"></div>
     </section>`;
 
   const templateBox=document.querySelector("#tgMessageTemplate");
@@ -2237,6 +2252,61 @@ async function renderTelegramSettings(view){
     btn.disabled=false;
     btn.textContent="保存并发送模板测试";
   };
+
+  const recentTelegramLogs=r.logs||[];
+  let telegramLogMode="recent";
+  let telegramLogPage=1;
+
+  const telegramLogRowsHtml=(items)=>items.length?items.map(x=>`<tr>
+    <td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td>
+    <td>${esc(x.actor_name||"")}</td>
+    <td>${esc(x.customer_name||"")}</td>
+    <td>${esc(x.progress_name||"")}</td>
+    <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":"已跳过"}</span></td>
+    <td>${esc(x.error_text||"")}</td>
+  </tr>`).join(""):'<tr><td colspan="6" class="muted">还没有发送记录</td></tr>';
+
+  function showRecentTelegramLogs(){
+    telegramLogMode="recent";
+    document.querySelector("#tgLogTitle").textContent="最近发送记录";
+    document.querySelector("#tgLogMeta").textContent="这里先显示最近 20 条，需要时可以查看全部历史记录。";
+    document.querySelector("#tgLogBody").innerHTML=telegramLogRowsHtml(recentTelegramLogs);
+    document.querySelector("#tgLogPager").innerHTML="";
+    document.querySelector("#tgLogStatus").style.display="none";
+    document.querySelector("#tgViewAllLogs").textContent="查看全部发送记录";
+  }
+
+  async function loadTelegramLogPage(page=1){
+    telegramLogMode="all";
+    telegramLogPage=page;
+    const status=val("tgLogStatus");
+    const qs=new URLSearchParams({page:String(page),limit:"50"});
+    if(status)qs.set("status",status);
+
+    const body=document.querySelector("#tgLogBody");
+    body.innerHTML='<tr><td colspan="6" class="muted">正在加载发送记录...</td></tr>';
+    try{
+      const out=await api("/api/admin/telegram/logs?"+qs.toString());
+      telegramLogPage=Number(out.page||page||1);
+      document.querySelector("#tgLogTitle").textContent="全部发送记录";
+      document.querySelector("#tgLogMeta").textContent="共 "+Number(out.total||0)+" 条发送记录，每页 50 条。";
+      body.innerHTML=telegramLogRowsHtml(out.items||[]);
+      document.querySelector("#tgLogStatus").style.display="";
+      document.querySelector("#tgViewAllLogs").textContent="返回最近记录";
+      document.querySelector("#tgLogPager").innerHTML=listPagerHtml("tgLogsPage",telegramLogPage,out.pages||1,out.total||0);
+
+      document.querySelector("#tgLogsPagePrev").onclick=()=>loadTelegramLogPage(telegramLogPage-1);
+      document.querySelector("#tgLogsPageNext").onclick=()=>loadTelegramLogPage(telegramLogPage+1);
+    }catch(e){
+      body.innerHTML='<tr><td colspan="6" class="muted">'+esc(e.message)+'</td></tr>';
+    }
+  }
+
+  document.querySelector("#tgViewAllLogs").onclick=()=>{
+    if(telegramLogMode==="all")showRecentTelegramLogs();
+    else loadTelegramLogPage(1);
+  };
+  document.querySelector("#tgLogStatus").onchange=()=>loadTelegramLogPage(1);
 
   updateTemplatePreview();
 }
