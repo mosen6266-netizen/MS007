@@ -278,6 +278,41 @@ CREATE TABLE IF NOT EXISTS telegram_delivery_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_telegram_delivery_created ON telegram_delivery_logs(created_at DESC);
 
+
+-- Reliable Telegram delivery queue.
+-- Customer progress saves never wait for Telegram; queued messages are retried in the background.
+CREATE TABLE IF NOT EXISTS telegram_send_queue (
+  id TEXT PRIMARY KEY,
+  dedupe_key TEXT NOT NULL UNIQUE,
+  customer_id TEXT,
+  actor_user_id TEXT,
+  progress_id TEXT,
+  chat_id TEXT NOT NULL,
+  message_text TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','retry','sending')),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT NOT NULL,
+  locked_until TEXT,
+  last_error TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (customer_id) REFERENCES customers(id),
+  FOREIGN KEY (actor_user_id) REFERENCES users(id),
+  FOREIGN KEY (progress_id) REFERENCES progress_definitions(id)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_queue_due
+ON telegram_send_queue(status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_telegram_queue_chat
+ON telegram_send_queue(chat_id, status, next_attempt_at);
+
+-- Atomic per-chat pacing lease. This prevents concurrent Worker requests from
+-- sending multiple messages to the same Telegram group at the same instant.
+CREATE TABLE IF NOT EXISTS telegram_chat_rate (
+  chat_id TEXT PRIMARY KEY,
+  next_allowed_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 INSERT OR IGNORE INTO sidebar_items
 (id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
 ('sa_telegram','admin','Telegram 通知','link','#/admin/telegram','same',1,75,'通知',datetime('now'),datetime('now'));
