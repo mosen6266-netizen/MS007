@@ -1801,17 +1801,29 @@ async function usersList(env) {
 
 async function createUser(request, env, admin) {
   const b=await readBody(request);
-  const username=String(b.username||"").trim(),displayName=String(b.displayName||"").trim(),password=String(b.password||"");
+  const username=String(b.username||"").trim();
+  const displayName=String(b.displayName||"").trim();
+  const password=String(b.password||"");
+  const role=normalizedRole(b.role)||"sales";
+
+  if(!["admin","sales"].includes(role)) return fail("账号角色无效");
   if(username.length<3||!displayName||password.length<8) return fail("账号至少3位、姓名不能为空、密码至少8位");
+
   const exists=await env.DB.prepare("SELECT id FROM users WHERE username=?").bind(username).first();
   if(exists) return fail("这个账号已经存在",409);
-  const salt=newSalt(),iterations=100000,hash=await derivePassword(password,salt,iterations),id=uid("u_"),t=now();
+
+  const salt=newSalt();
+  const iterations=100000;
+  const hash=await derivePassword(password,salt,iterations);
+  const id=uid("u_"),t=now();
+
   await env.DB.prepare(
     `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
-     VALUES(?,?,?,?,?,?,'sales',1,?,?)`
-  ).bind(id,username,displayName,hash,salt,iterations,t,t).run();
-  await audit(env,admin,"create","user",id,{username,displayName,role:"sales"});
-  return responseJson({ok:true,id},201);
+     VALUES(?,?,?,?,?,?,?,?,?,?)`
+  ).bind(id,username,displayName,hash,salt,iterations,role,1,t,t).run();
+
+  await audit(env,admin,"create","user",id,{username,displayName,role});
+  return responseJson({ok:true,id,role},201);
 }
 
 
