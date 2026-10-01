@@ -2349,15 +2349,16 @@ async function stats(request, env, user) {
   let sales=[];
   if(normalizedRole(user.role)==="admin"){
     const r=await env.DB.prepare(
-      `SELECT u.id,u.display_name,COUNT(c.id) customer_count,
+      `SELECT u.id,u.display_name,u.active,COUNT(c.id) customer_count,
        COALESCE(ROUND(AVG(c.progress_percent)),0) avg_progress
        FROM users u
        LEFT JOIN customers c ON c.assigned_user_id=u.id
          AND c.deleted_at IS NULL
          AND c.archived=0
          ${from?"AND c.created_at>=?":""}
-       WHERE u.role='sales' AND u.active=1
-       GROUP BY u.id,u.display_name
+       WHERE u.role='sales'
+       GROUP BY u.id,u.display_name,u.active
+       HAVING u.active=1 OR COUNT(c.id)>0
        ORDER BY customer_count DESC,u.display_name`
     ).bind(...createdBind).all();
     sales=r.results||[];
@@ -2432,7 +2433,7 @@ async function statsBundle(request,env,user){
   let salesRows=[];
   if(normalizedRole(user.role)==="admin"){
     const salesResult=await env.DB.prepare(
-      `SELECT u.id,u.display_name,
+      `SELECT u.id,u.display_name,u.active,
         COUNT(c.id) total_count,
         SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) today_count,
         SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) week_count,
@@ -2445,8 +2446,9 @@ async function statsBundle(request,env,user){
        LEFT JOIN customers c ON c.assigned_user_id=u.id
          AND c.deleted_at IS NULL
          AND c.archived=0
-       WHERE u.role='sales' AND u.active=1
-       GROUP BY u.id,u.display_name
+       WHERE u.role='sales'
+       GROUP BY u.id,u.display_name,u.active
+       HAVING u.active=1 OR COUNT(c.id)>0
        ORDER BY total_count DESC,u.display_name`
     ).bind(todayFrom,weekFrom,monthFrom,todayFrom,weekFrom,monthFrom).all();
     salesRows=salesResult.results||[];
@@ -2462,10 +2464,10 @@ async function statsBundle(request,env,user){
 
   const salesByPeriod={total:[],today:[],week:[],month:[]};
   for(const row of salesRows){
-    salesByPeriod.total.push({id:row.id,display_name:row.display_name,customer_count:Number(row.total_count||0),avg_progress:Number(row.avg_total||0)});
-    salesByPeriod.today.push({id:row.id,display_name:row.display_name,customer_count:Number(row.today_count||0),avg_progress:Number(row.avg_today||0)});
-    salesByPeriod.week.push({id:row.id,display_name:row.display_name,customer_count:Number(row.week_count||0),avg_progress:Number(row.avg_week||0)});
-    salesByPeriod.month.push({id:row.id,display_name:row.display_name,customer_count:Number(row.month_count||0),avg_progress:Number(row.avg_month||0)});
+    salesByPeriod.total.push({id:row.id,display_name:row.display_name,active:!!row.active,customer_count:Number(row.total_count||0),avg_progress:Number(row.avg_total||0)});
+    salesByPeriod.today.push({id:row.id,display_name:row.display_name,active:!!row.active,customer_count:Number(row.today_count||0),avg_progress:Number(row.avg_today||0)});
+    salesByPeriod.week.push({id:row.id,display_name:row.display_name,active:!!row.active,customer_count:Number(row.week_count||0),avg_progress:Number(row.avg_week||0)});
+    salesByPeriod.month.push({id:row.id,display_name:row.display_name,active:!!row.active,customer_count:Number(row.month_count||0),avg_progress:Number(row.avg_month||0)});
   }
 
   const makePeriod=(key)=>({
