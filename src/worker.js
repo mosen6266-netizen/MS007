@@ -1239,6 +1239,7 @@ async function createDashboardWidget(request,env,user){
   const type=allowed.includes(b.widgetType)?b.widgetType:"metric_total";
   const audience=b.audience==="sales"?"sales":"admin";
   const id=uid("dw_"),t=now();
+
   let config=b.config&&typeof b.config==="object"?b.config:{};
   if(type==="metric_progress"){
     const progressId=String(config.progressId||"");
@@ -1246,11 +1247,46 @@ async function createDashboardWidget(request,env,user){
     if(!exists)return fail("请选择有效的客户进度");
     config={progressId};
   }
-  await env.DB.prepare(
-    "INSERT INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
-  ).bind(id,audience,type,String(b.title||"统计组件"),b.enabled===false?0:1,safeInt(b.sortOrder,100,0,100000),JSON.stringify(config)).run();
-  await audit(env,user,"create","dashboard_widget",id,b);
-  return responseJson({ok:true,id},201);
+
+  let sortOrder;
+  const insertAnchorId=String(b.insertAnchorId||"").trim();
+  const insertPosition=b.insertPosition==="before"?"before":b.insertPosition==="after"?"after":"";
+
+  if(insertAnchorId&&insertPosition){
+    const anchor=await env.DB.prepare(
+      "SELECT id,audience,sort_order FROM dashboard_widgets WHERE id=?"
+    ).bind(insertAnchorId).first();
+    if(!anchor)return fail("插入位置已经不存在，请刷新后重试",409,"INSERT_ANCHOR_MISSING");
+    if(anchor.audience!==audience)return fail("插入位置与当前仪表盘不一致，请刷新后重试",409,"INSERT_AUDIENCE_MISMATCH");
+
+    const anchorSort=Number(anchor.sort_order||0);
+    sortOrder=Math.max(0,anchorSort+(insertPosition==="after"?1:0));
+
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE dashboard_widgets SET sort_order=sort_order+1 WHERE audience=? AND sort_order>=?"
+      ).bind(audience,sortOrder),
+      env.DB.prepare(
+        "INSERT INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
+      ).bind(id,audience,type,String(b.title||"统计组件"),b.enabled===false?0:1,sortOrder,JSON.stringify(config))
+    ]);
+  }else{
+    const maxRow=await env.DB.prepare(
+      "SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM dashboard_widgets WHERE audience=?"
+    ).bind(audience).first();
+    const nextSort=Number(maxRow?.max_sort||0)+1;
+    sortOrder=b.sortOrder!==undefined?safeInt(b.sortOrder,nextSort,0,100000):nextSort;
+
+    await env.DB.prepare(
+      "INSERT INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
+    ).bind(id,audience,type,String(b.title||"统计组件"),b.enabled===false?0:1,sortOrder,JSON.stringify(config)).run();
+  }
+
+  await audit(env,user,"create","dashboard_widget",id,{
+    audience,type,title:String(b.title||"统计组件"),sortOrder,
+    insertAnchorId:insertAnchorId||null,insertPosition:insertPosition||null
+  });
+  return responseJson({ok:true,id,sortOrder},201);
 }
 
 async function updateDashboardWidget(request,env,user,id){
