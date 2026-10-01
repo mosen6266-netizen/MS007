@@ -32,7 +32,12 @@
       "quality_run": 36934819082,
       "quality_result": "success",
       "deploy_run": 36934819121,
-      "deploy_result": "pending_at_manifest_creation"
+      "deploy_result": "success",
+      "completed_at": "2026-10-01T22:25:55Z"
     }
-  ]
+  ],
+  "final_status": "success",
+  "final_verified_commit": "f656fa7a20021c66929b9904bab2fc8e569bb8f3",
+  "final_quality_run": 36934819082,
+  "final_deploy_run": 36934819121
 }
