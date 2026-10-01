@@ -305,6 +305,7 @@ async function renderDashboard(view,period=null){
   const qs=new URLSearchParams({period});
   const from=dashboardPeriodStart(period);
   if(from)qs.set("from",from);
+  qs.set("todayFrom",dashboardPeriodStart("today"));
 
   const [r,wr]=await Promise.all([
     api("/api/stats?"+qs.toString()),
@@ -1484,7 +1485,7 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[]){
       if(!w||!title.value){
         if(isProgress){
           const selected=progressDefs.find(x=>x.id===progressSelect.value);
-          title.value=selected?selected.label:"客户进度统计";
+          title.value=selected?(selected.label+"总数"):"客户进度统计";
         }else{
           title.value=widgetTypeName[type.value]||"统计组件";
         }
@@ -1496,7 +1497,7 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[]){
     progressSelect.onchange=()=>{
       if(type.value==="metric_progress"){
         const selected=progressDefs.find(x=>x.id===progressSelect.value);
-        if(selected)title.value=selected.label;
+        if(selected)title.value=selected.label+"总数";
       }
     };
     updateTypeUi();
