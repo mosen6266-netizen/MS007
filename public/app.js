@@ -740,7 +740,7 @@ async function setCustomerArchived(id,archived){
 }
 
 async function deleteCustomerRow(id){
-  if(!confirm("确认删除这个客户？删除后会进入管理员回收站，不会立即永久消失。"))return;
+  if(!await uiConfirm("确认删除这个客户？\n\n删除后会进入管理员回收站，不会立即永久消失。",{title:"删除客户",confirmText:"移入回收站",danger:true}))return;
   try{
     await api("/api/customers/"+encodeURIComponent(id),{method:"DELETE"});
     toast("客户已移入回收站");
@@ -817,8 +817,8 @@ async function renderFields(view){
   });
   document.querySelectorAll("[data-hard-del-field]").forEach(b=>b.onclick=async()=>{
     const item=items.find(x=>x.id===b.dataset.hardDelField);if(!item)return;
-    if(!confirm("永久删除登记条目「"+item.label+"」？\n\n这会同时删除所有客户在这个条目下已经填写的数据，并且无法恢复。"))return;
-    if(!confirm("请再次确认：真的要永久删除「"+item.label+"」吗？"))return;
+    if(!await uiConfirm("永久删除登记条目「"+item.label+"」？\n\n这会同时删除所有客户在这个条目下已经填写的数据，并且无法恢复。",{title:"永久删除登记条目",confirmText:"继续删除",danger:true}))return;
+    if(!await uiConfirm("请再次确认：真的要永久删除「"+item.label+"」吗？\n\n此操作无法撤销。",{title:"最后确认",confirmText:"永久删除",danger:true}))return;
     try{
       const r=await api("/api/admin/fields/"+encodeURIComponent(item.id)+"/hard-delete",{method:"DELETE"});
       toast("登记条目已永久删除"+(r.deletedCustomerValues?("，同时删除 "+r.deletedCustomerValues+" 条客户字段数据"):""));
@@ -998,8 +998,8 @@ async function renderProgressAdmin(view){
   });
   document.querySelectorAll("[data-hard-del-prog]").forEach(b=>b.onclick=async()=>{
     const item=items.find(x=>x.id===b.dataset.hardDelProg);if(!item)return;
-    if(!confirm("永久删除客户进度「"+item.label+"」？\n\n这会同时删除所有客户在这个进度上的完成记录，并重新计算所有客户的完成百分比。此操作无法恢复。"))return;
-    if(!confirm("请再次确认：真的要永久删除「"+item.label+"」吗？"))return;
+    if(!await uiConfirm("永久删除客户进度「"+item.label+"」？\n\n这会同时删除所有客户在这个进度上的完成记录，并重新计算所有客户的完成百分比。",{title:"永久删除客户进度",confirmText:"继续删除",danger:true}))return;
+    if(!await uiConfirm("请再次确认：真的要永久删除「"+item.label+"」吗？\n\n此操作无法撤销。",{title:"最后确认",confirmText:"永久删除",danger:true}))return;
     try{
       const r=await api("/api/admin/progress/"+encodeURIComponent(item.id)+"/hard-delete",{method:"DELETE"});
       toast("客户进度已永久删除"+(r.deletedCustomerProgress?("，同时删除 "+r.deletedCustomerProgress+" 条完成记录"):""));
@@ -1051,7 +1051,7 @@ async function renderSidebarAdmin(view){
     </div>`;
   document.querySelector("#addSide").onclick=()=>sidebarModal(view,null);
   document.querySelectorAll("[data-side-edit]").forEach(b=>b.onclick=()=>sidebarModal(view,items.find(x=>x.id===b.dataset.sideEdit)));
-  document.querySelectorAll("[data-side-del]").forEach(b=>b.onclick=async()=>{if(!confirm("删除这个侧栏按钮？"))return;try{await api("/api/admin/sidebar/"+b.dataset.sideDel,{method:"DELETE"});toast("侧栏按钮已删除并同步");await refreshSidebar(true);renderSidebarAdmin(view)}catch(e){toast(e.message)}});
+  document.querySelectorAll("[data-side-del]").forEach(b=>b.onclick=async()=>{if(!await uiConfirm("确认删除这个侧栏按钮？",{title:"删除侧栏按钮",confirmText:"删除",danger:true}))return;try{await api("/api/admin/sidebar/"+b.dataset.sideDel,{method:"DELETE"});toast("侧栏按钮已删除并同步");await refreshSidebar(true);renderSidebarAdmin(view)}catch(e){toast(e.message)}});
   enableSidebarDrag(view,items);
 }
 function sidebarModal(view,x){
@@ -1363,7 +1363,7 @@ async function renderDashboardSettings(view,audience="admin"){
   document.querySelector("#dashSales").onclick=()=>renderDashboardSettings(view,"sales");
   document.querySelector("#addWidget").onclick=()=>dashboardWidgetModal(view,audience,null);
   document.querySelectorAll("[data-widget-edit]").forEach(b=>b.onclick=()=>dashboardWidgetModal(view,audience,items.find(x=>x.id===b.dataset.widgetEdit)));
-  document.querySelectorAll("[data-widget-del]").forEach(b=>b.onclick=async()=>{if(!confirm("删除这个仪表盘组件？"))return;try{await api("/api/admin/dashboard-widgets/"+b.dataset.widgetDel,{method:"DELETE"});toast("组件已删除");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}});
+  document.querySelectorAll("[data-widget-del]").forEach(b=>b.onclick=async()=>{if(!await uiConfirm("确认删除这个仪表盘组件？",{title:"删除仪表盘组件",confirmText:"删除",danger:true}))return;try{await api("/api/admin/dashboard-widgets/"+b.dataset.widgetDel,{method:"DELETE"});toast("组件已删除");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}});
 }
 function dashboardWidgetModal(view,audience,w){
   const allowed=audience==="admin"?Object.keys(widgetTypeName):Object.keys(widgetTypeName).filter(x=>x!=="sales_breakdown");
@@ -1638,7 +1638,7 @@ async function renderBackup(view){
     let backup;
     try{backup=JSON.parse(await file.text())}catch{toast("这个文件不是有效的 JSON 备份");return}
     if(backup?.format!=="MS007-BUSINESS-BACKUP"||!backup?.data){toast("这不是 MS007 业务备份文件");return}
-    if(!confirm("确认开始恢复这份备份？同ID数据会按备份内容覆盖。"))return;
+    if(!await uiConfirm("确认开始恢复这份备份？\n\n同 ID 数据会按备份内容覆盖。",{title:"恢复业务数据",confirmText:"开始恢复",danger:true}))return;
 
     const order=["users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress","sidebarItems","listColumns","dashboardWidgets","systemSettings"];
     const total=order.reduce((n,k)=>n+(Array.isArray(backup.data[k])?backup.data[k].length:0),0);
@@ -1770,9 +1770,47 @@ function hasUnsavedOverlay(root){
   return !!root && root.dataset.dirty==="1";
 }
 
-function confirmCloseUnsaved(root){
+async function confirmCloseUnsaved(root){
   if(!hasUnsavedOverlay(root))return true;
-  return confirm("当前内容还没有保存。\n\n关闭后不会丢失，系统已经自动保存为草稿，下次打开这个编辑面板会自动恢复。\n\n确定关闭吗？");
+  return uiConfirm(
+    "当前内容还没有保存。\n\n关闭后不会丢失，系统已经自动保存为草稿，下次打开这个编辑面板会自动恢复。\n\n确定关闭吗？",
+    {title:"未保存的内容",confirmText:"关闭并保留草稿",cancelText:"继续编辑"}
+  );
+}
+
+let activeUiDialogResolve=null;
+
+function closeUiDialog(result=false){
+  document.querySelector("#uiDialog")?.remove();
+  const resolve=activeUiDialogResolve;
+  activeUiDialogResolve=null;
+  if(resolve)resolve(!!result);
+}
+
+function uiConfirm(message,{title="确认操作",confirmText="确认",cancelText="取消",danger=false}={}){
+  if(activeUiDialogResolve)closeUiDialog(false);
+  return new Promise(resolve=>{
+    activeUiDialogResolve=resolve;
+    const el=document.createElement("div");
+    el.id="uiDialog";
+    el.className="ui-dialog-back";
+    el.innerHTML=`
+      <div class="ui-dialog-card" role="dialog" aria-modal="true" aria-labelledby="uiDialogTitle">
+        <div class="ui-dialog-icon ${danger?"danger":""}">${danger?"!":"?"}</div>
+        <div class="ui-dialog-content">
+          <h3 id="uiDialogTitle">${esc(title)}</h3>
+          <div class="ui-dialog-message">${esc(message)}</div>
+          <div class="ui-dialog-actions">
+            <button class="btn ghost" type="button" id="uiDialogCancel">${esc(cancelText)}</button>
+            <button class="btn ${danger?"danger":""}" type="button" id="uiDialogConfirm">${esc(confirmText)}</button>
+          </div>
+        </div>
+      </div>`;
+    document.body.appendChild(el);
+    el.querySelector("#uiDialogCancel").onclick=()=>closeUiDialog(false);
+    el.querySelector("#uiDialogConfirm").onclick=()=>closeUiDialog(true);
+    el.querySelector("#uiDialogCancel").focus();
+  });
 }
 
 function removeDrawer({clearDraft=false}={}){
@@ -1831,10 +1869,10 @@ function openDrawer(title,body,onReady,opts={}){
   setupOverlayDraft(el,title,opts);
 }
 
-function requestCloseDrawer(){
+async function requestCloseDrawer(){
   const el=document.querySelector("#drawer");
   if(!el)return;
-  if(!confirmCloseUnsaved(el))return;
+  if(!await confirmCloseUnsaved(el))return;
   removeDrawer({clearDraft:false});
 }
 
@@ -1854,10 +1892,10 @@ function openModal(title,body,onReady,opts={}){
   setupOverlayDraft(el,title,opts);
 }
 
-function requestCloseModal(){
+async function requestCloseModal(){
   const el=document.querySelector("#modal");
   if(!el)return;
-  if(!confirmCloseUnsaved(el))return;
+  if(!await confirmCloseUnsaved(el))return;
   removeModal({clearDraft:false});
 }
 
@@ -1868,6 +1906,24 @@ function closeModal(){
 function val(id){return document.querySelector("#"+id)?.value||""}
 function checked(id){return !!document.querySelector("#"+id)?.checked}
 
-document.addEventListener("keydown",e=>{if(e.key==="Escape")closeRowContextMenu()});
+document.addEventListener("keydown",async e=>{
+  if(e.key!=="Escape")return;
+  e.preventDefault();
+  if(document.querySelector("#uiDialog")){
+    closeUiDialog(false);
+    return;
+  }
+  if(document.querySelector("#rowContextMenu")){
+    closeRowContextMenu();
+    return;
+  }
+  if(document.querySelector("#modal")){
+    await requestCloseModal();
+    return;
+  }
+  if(document.querySelector("#drawer")){
+    await requestCloseDrawer();
+  }
+});
 
 bootstrap();
