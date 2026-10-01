@@ -1085,9 +1085,15 @@ async function updateProgressDef(request, env, user, id) {
 
 async function listColumns(env, user) {
   const r = await env.DB.prepare(
-    "SELECT id,audience,column_key,field_id,label,enabled,sort_order FROM list_columns WHERE audience=? AND enabled=1 ORDER BY sort_order,label"
-  ).bind(user.role).all();
-  return responseJson({ok:true,items:r.results||[]});
+    "SELECT id,audience,column_key,field_id,label,enabled,sort_order FROM list_columns WHERE audience=? AND enabled=1 ORDER BY sort_order,label,id"
+  ).bind(normalizedRole(user.role)).all();
+  const seen=new Set(),items=[];
+  for(const item of r.results||[]){
+    const key=String(item.column_key||"")+":"+String(item.field_id||"");
+    if(seen.has(key))continue;
+    seen.add(key);items.push(item);
+  }
+  return responseJson({ok:true,items});
 }
 
 async function adminListColumns(request, env) {
