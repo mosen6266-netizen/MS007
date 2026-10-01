@@ -140,3 +140,18 @@ jobs:
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' && env.BOOTSTRAP_TOKEN != '' }}
         shell: bash
         run: printf '%s' "$BOOTSTRAP_TOKEN" | npx --yes wrangler@latest secret put BOOTSTRAP_TOKEN --config wrangler.deploy.toml
+
+      - name: Production smoke test
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://ms007-crm.mosen6266-ms007.workers.dev"
+          for i in 1 2 3 4 5; do
+            if curl -fsS "$URL/api/health" > /tmp/health.json; then
+              break
+            fi
+            sleep 3
+          done
+          cat /tmp/health.json
+          curl -fsS "$URL/api/bootstrap-status"
