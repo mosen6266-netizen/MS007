@@ -182,7 +182,8 @@ function sideHtml(){
     if(g!==currentGroup){ currentGroup=g; if(g)html+=`<div class="side-group">${esc(g)}</div>`; }
     const icon=iconMap[item.icon]||"•";
     const active=item.url.startsWith("#/")&&location.hash===item.url?"active":"";
-    html+=`<a class="side-link ${active}" href="${esc(item.url)}" ${item.target==="new"?'target="_blank" rel="noopener"':""}>
+    const isNewCustomer=item.url==="#/sales/new"||item.url==="#/admin/new";
+    html+=`<a class="side-link ${active}" href="${isNewCustomer?"#":esc(item.url)}" ${isNewCustomer?'data-action="new-customer"':""} ${!isNewCustomer&&item.target==="new"?'target="_blank" rel="noopener"':""}>
       <span class="side-icon">${esc(icon)}</span><span>${esc(item.label)}</span></a>`;
   }
   return html;
@@ -208,6 +209,10 @@ async function renderShell(){
       </section>
     </div>`;
   document.querySelector("#logoutBtn").onclick=logout;
+  document.querySelector("#sideNav").onclick=e=>{
+    const a=e.target.closest('[data-action="new-customer"]');
+    if(a){e.preventDefault();openCustomerEditor();}
+  };
   if(state.user.role==="admin") refreshMiniStatus();
   await renderRoute();
 }
@@ -235,12 +240,13 @@ async function renderRoute(){
   try{
     if(page==="dashboard")return renderDashboard(view);
     if(page==="customers")return renderCustomers(view);
-    if(page==="new")return renderCustomerForm(view);
+    if(page==="new"){await renderCustomers(view);return openCustomerEditor();}
     if(page==="customer"&&id)return renderCustomerDetail(view,id);
     if(role==="admin"&&page==="sales")return renderSales(view);
     if(role==="admin"&&page==="fields")return renderFields(view);
     if(role==="admin"&&page==="progress")return renderProgressAdmin(view);
     if(role==="admin"&&page==="sidebar")return renderSidebarAdmin(view);
+    if(role==="admin"&&page==="registration-layout")return renderRegistrationLayoutSettings(view);
     if(role==="admin"&&page==="list-settings")return renderListSettings(view);
     if(role==="admin"&&page==="dashboard-settings")return renderDashboardSettings(view);
     if(role==="admin"&&page==="capacity")return renderCapacity(view);
@@ -292,64 +298,122 @@ async function getSales(){
   return state.sales;
 }
 let currentListColumns=[];
+let customerPageState={cursor:null,loading:false,items:[],viewArchived:false};
+
 async function renderCustomers(view){
   const [sales,lc]=await Promise.all([
     state.user.role==="admin"?getSales():Promise.resolve([]),
     api("/api/list-columns")
   ]);
   currentListColumns=lc.items||[];
+  customerPageState={cursor:null,loading:false,items:[],viewArchived:false};
+
   view.innerHTML=
-    pageHead(state.user.role==="admin"?"全部客户":"我的客户","每次只读取当前需要的数据，避免客户数量增加后卡顿",
+    pageHead(state.user.role==="admin"?"全部客户":"我的客户","客户以整行方式显示，整行背景就是当前完成进度。",
       `<button class="btn" id="newCustomer">＋ 登记客户</button>`)+
     `<div class="toolbar">
       <input class="input" id="searchCustomer" placeholder="搜索姓名、案件编号或其他可搜索字段">
       ${state.user.role==="admin"?`<select class="input" id="ownerFilter"><option value="">全部业务员</option>${sales.map(x=>`<option value="${esc(x.id)}">${esc(x.display_name)}</option>`).join("")}</select>`:""}
       <button class="btn secondary" id="searchBtn">搜索</button>
+      <span class="grow"></span>
+      <button class="btn small" id="activeCustomersBtn">当前客户</button>
+      <button class="btn ghost small" id="archivedCustomersBtn">已归档</button>
     </div>
     <div id="customerResults"></div>`;
-  document.querySelector("#newCustomer").onclick=()=>location.hash=`#/${state.user.role}/new`;
+
+  document.querySelector("#newCustomer").onclick=()=>openCustomerEditor();
   document.querySelector("#searchBtn").onclick=()=>loadCustomerPage(true);
   document.querySelector("#searchCustomer").onkeydown=e=>{if(e.key==="Enter")loadCustomerPage(true)};
   if(document.querySelector("#ownerFilter"))document.querySelector("#ownerFilter").onchange=()=>loadCustomerPage(true);
+
+  document.querySelector("#activeCustomersBtn").onclick=()=>{
+    customerPageState.viewArchived=false;
+    document.querySelector("#activeCustomersBtn").className="btn small";
+    document.querySelector("#archivedCustomersBtn").className="btn ghost small";
+    loadCustomerPage(true);
+  };
+  document.querySelector("#archivedCustomersBtn").onclick=()=>{
+    customerPageState.viewArchived=true;
+    document.querySelector("#activeCustomersBtn").className="btn ghost small";
+    document.querySelector("#archivedCustomersBtn").className="btn small";
+    loadCustomerPage(true);
+  };
+
   await loadCustomerPage(true);
 }
-let customerPageState={cursor:null,loading:false,items:[]};
+
 async function loadCustomerPage(reset){
   if(customerPageState.loading)return;
   customerPageState.loading=true;
   const host=document.querySelector("#customerResults"); if(!host)return;
-  if(reset){customerPageState={cursor:null,loading:true,items:[]};host.innerHTML=`<div class="boot" style="height:30vh"><div class="spinner"></div></div>`;}
+  if(reset){
+    const archived=customerPageState.viewArchived;
+    customerPageState={cursor:null,loading:true,items:[],viewArchived:archived};
+    host.innerHTML=`<div class="boot" style="height:30vh"><div class="spinner"></div></div>`;
+  }
   const q=document.querySelector("#searchCustomer")?.value||"";
   const owner=document.querySelector("#ownerFilter")?.value||"";
   try{
-    const qs=new URLSearchParams({limit:"50"}); if(q)qs.set("q",q); if(owner)qs.set("owner",owner); if(customerPageState.cursor)qs.set("cursor",customerPageState.cursor);
+    const qs=new URLSearchParams({limit:"50",archived:customerPageState.viewArchived?"1":"0"});
+    if(q)qs.set("q",q);
+    if(owner)qs.set("owner",owner);
+    if(customerPageState.cursor)qs.set("cursor",customerPageState.cursor);
     const r=await api("/api/customers?"+qs.toString());
-    customerPageState.items.push(...r.items); customerPageState.cursor=r.nextCursor;
-    renderCustomerCards(host,customerPageState.items,r.visibleFields||[],!!r.nextCursor);
-  }catch(e){host.innerHTML=`<div class="notice urgent">${esc(e.message)}</div>`;}
+    customerPageState.items.push(...r.items);
+    customerPageState.cursor=r.nextCursor;
+    renderCustomerRows(host,customerPageState.items,!!r.nextCursor);
+  }catch(e){
+    host.innerHTML=`<div class="notice urgent">${esc(e.message)}</div>`;
+  }
   customerPageState.loading=false;
 }
-function renderCustomerCards(host,items,fields,hasMore){
-  if(!items.length){host.innerHTML=`<div class="empty card">还没有客户资料</div>`;return;}
-  host.innerHTML=`<div class="customer-grid">${items.map(c=>{
-    const meta=[];
+
+function renderCustomerRows(host,items,hasMore){
+  if(!items.length){
+    host.innerHTML=`<div class="empty card">${customerPageState.viewArchived?"还没有归档客户":"还没有客户资料"}</div>`;
+    return;
+  }
+
+  host.innerHTML=`<div class="customer-list">${items.map(c=>{
+    const details=[];
     for(const col of currentListColumns){
-      if(col.column_key==="name") continue;
+      if(col.column_key==="name")continue;
       if(col.column_key==="owner"){
-        if(state.user.role==="admin"&&c.ownerName)meta.push(`<div>${esc(col.label||"业务员")}：${esc(c.ownerName)}</div>`);
+        if(state.user.role==="admin") details.push(`<div class="customer-cell"><span>${esc(col.label||"业务员")}</span><strong>${esc(c.ownerName||"未分配")}</strong></div>`);
         continue;
       }
       if(col.column_key==="dynamic"&&col.field_id){
-        const v=c.values?.[col.field_id];
-        if(v)meta.push(`<div>${esc(col.label)}：${esc(v)}</div>`);
+        const v=c.values?.[col.field_id]||"";
+        details.push(`<div class="customer-cell"><span>${esc(col.label)}</span><strong>${esc(v||"—")}</strong></div>`);
       }
     }
-    return `<article class="customer-card" data-cid="${esc(c.id)}" style="--pct:${Number(c.progressPercent||0)}%;--progress-color:${progressTone(Number(c.progressPercent||0))}">
-      <h3>${esc(c.name)}</h3><div class="customer-meta">${meta.join("")||'<span class="muted">暂无其他列表字段</span>'}</div>
-      <div class="customer-progress"><span>${c.progressDone}/${c.progressTotal} 个步骤</span><span class="pct">${c.progressPercent}%</span></div>
+    const archiveLabel=customerPageState.viewArchived?"取消归档":"归档";
+    return `<article class="customer-row" style="--pct:${Number(c.progressPercent||0)}%;--progress-color:${progressTone(Number(c.progressPercent||0))}">
+      <div class="customer-main">
+        <strong class="customer-name">${esc(c.name)}</strong>
+        <div class="muted" style="font-size:12px">更新：${esc((c.updatedAt||"").replace("T"," ").slice(0,16))}</div>
+      </div>
+      <div class="customer-fields">${details.join("")||'<div class="muted">暂无其他列表字段</div>'}</div>
+      <div class="customer-row-progress">
+        <strong>${c.progressPercent}%</strong>
+        <span>${c.progressDone}/${c.progressTotal}</span>
+      </div>
+      <div class="customer-actions">
+        <button class="icon-action" title="预览" data-preview="${esc(c.id)}">👁 <span>预览</span></button>
+        <button class="icon-action" title="编辑" data-edit="${esc(c.id)}">✏ <span>编辑</span></button>
+        <button class="icon-action" title="复制全部信息" data-copy="${esc(c.id)}">📋 <span>复制</span></button>
+        <button class="icon-action" title="${archiveLabel}" data-archive="${esc(c.id)}">📦 <span>${archiveLabel}</span></button>
+        <button class="icon-action danger-action" title="删除" data-delete="${esc(c.id)}">🗑 <span>删除</span></button>
+      </div>
     </article>`;
-  }).join("")}</div>${hasMore?`<div style="text-align:center;margin:18px"><button class="btn secondary" id="loadMore">加载更多</button></div>`:""}`;
-  host.querySelectorAll("[data-cid]").forEach(x=>x.onclick=()=>location.hash=`#/${state.user.role}/customer/${x.dataset.cid}`);
+  }).join("")}</div>
+  ${hasMore?`<div style="text-align:center;margin:18px"><button class="btn secondary" id="loadMore">加载更多</button></div>`:""}`;
+
+  host.querySelectorAll("[data-preview]").forEach(b=>b.onclick=()=>openCustomerPreview(b.dataset.preview));
+  host.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>openCustomerEditor(b.dataset.edit));
+  host.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>copyCustomerAll(b.dataset.copy));
+  host.querySelectorAll("[data-archive]").forEach(b=>b.onclick=()=>setCustomerArchived(b.dataset.archive,!customerPageState.viewArchived));
+  host.querySelectorAll("[data-delete]").forEach(b=>b.onclick=()=>deleteCustomerRow(b.dataset.delete));
   const more=document.querySelector("#loadMore"); if(more)more.onclick=()=>loadCustomerPage(false);
 }
 
@@ -360,64 +424,159 @@ function inputForField(f,value=""){
   const type=({email:"email",phone:"tel",number:"number",date:"date",time:"time",url:"url"}[f.field_type]||"text");
   return `<input class="input dyn" data-field="${esc(f.id)}" type="${type}" value="${esc(value)}" ${f.required?"required":""}>`;
 }
-async function renderCustomerForm(view){
-  const [fr,sales]=await Promise.all([api("/api/fields"),state.user.role==="admin"?getSales():Promise.resolve([])]);
-  const fields=fr.items||[];
-  view.innerHTML=pageHead("登记客户","管理员以后新增的登记字段会自动出现在这里")+
-    `<div class="card"><form id="customerForm"><div class="form-grid">
-      <div class="field"><label>客户姓名 *</label><input class="input" name="name" required></div>
-      ${state.user.role==="admin"?`<div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${sales.map(x=>`<option value="${esc(x.id)}">${esc(x.display_name)}</option>`).join("")}</select></div>`:""}
-      ${fields.map(f=>`<div class="field ${f.field_type==="textarea"?"span2":""}"><label>${esc(f.label)}${f.required?" *":""}</label>${inputForField(f)}</div>`).join("")}
-      <div class="span2 row"><button class="btn" type="submit">保存客户</button><button class="btn ghost" type="button" id="cancelNew">取消</button></div>
-    </div></form></div>`;
-  document.querySelector("#cancelNew").onclick=()=>history.back();
-  document.querySelector("#customerForm").onsubmit=async e=>{
-    e.preventDefault();
-    const values={};e.currentTarget.querySelectorAll(".dyn").forEach(x=>values[x.dataset.field]=x.value);
-    try{
-      const r=await api("/api/customers",{method:"POST",body:{name:e.currentTarget.name.value,assignedUserId:e.currentTarget.owner?.value||null,values}});
-      toast("客户已保存");location.hash=`#/${state.user.role}/customer/${r.id}`;
-    }catch(err){toast(err.message)}
-  };
+
+function registrationSectionHtml(section,fieldMap,customer){
+  const items=(section.items||[]).map(key=>{
+    if(key==="name"){
+      return `<div class="field"><label>客户姓名 *</label><input class="input" name="name" value="${esc(customer?.name||"")}" required></div>`;
+    }
+    const f=fieldMap.get(key);
+    if(!f)return "";
+    const wide=f.field_type==="textarea"?"span2":"";
+    return `<div class="field ${wide}"><label>${esc(f.label)}${f.required?" *":""}</label>${inputForField(f,customer?.values?.[f.id]||"")}</div>`;
+  }).join("");
+  if(!items)return "";
+  return `<section class="form-section">
+    <div class="form-section-head">
+      <h3>${esc(section.title||"信息")}</h3>
+      ${section.description?`<p>${esc(section.description)}</p>`:""}
+    </div>
+    <div class="form-grid">${items}</div>
+  </section>`;
 }
-async function renderCustomerDetail(view,id){
-  const [r,sales]=await Promise.all([api("/api/customers/"+encodeURIComponent(id)),state.user.role==="admin"?getSales():Promise.resolve([])]);
-  const c=r.customer, fields=r.fields||[];
-  view.innerHTML=pageHead(c.name,`当前进度 ${c.progressPercent}%`,
-    state.user.role==="admin"?`<button class="btn danger small" id="deleteCustomer">删除客户</button>`:"")+
-    `<div class="split">
-      <div class="card">
-        <h3 style="margin-top:0">客户资料</h3>
-        <form id="editCustomer"><div class="form-grid">
-          <div class="field"><label>客户姓名</label><input class="input" name="name" value="${esc(c.name)}" required></div>
-          ${state.user.role==="admin"?`<div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${sales.map(x=>`<option value="${esc(x.id)}" ${x.id===c.ownerId?"selected":""}>${esc(x.display_name)}</option>`).join("")}</select></div>`:""}
-          ${fields.map(f=>`<div class="field ${f.field_type==="textarea"?"span2":""}"><label>${esc(f.label)}</label>${inputForField(f,c.values?.[f.id]||"")}</div>`).join("")}
-          <div class="span2"><button class="btn" type="submit">保存修改</button></div>
-        </div></form>
-      </div>
-      <div>
-        <div class="card">
-          <h3 style="margin-top:0">客户进度</h3>
-          <div class="capacity-bar" style="margin-bottom:14px"><div class="capacity-fill" style="width:${c.progressPercent}%"></div></div>
-          <div class="progress-list">
-            ${c.progress.map(p=>`<label class="progress-item"><input type="checkbox" data-progress="${esc(p.id)}" ${p.completed?"checked":""}><span><strong>${esc(p.label)}</strong>${p.description?`<div class="muted" style="font-size:12px">${esc(p.description)}</div>`:""}</span></label>`).join("")}
-          </div>
+
+async function openCustomerEditor(id=null){
+  try{
+    const [layout,sales,detail]=await Promise.all([
+      api("/api/registration-layout"),
+      state.user.role==="admin"?getSales():Promise.resolve([]),
+      id?api("/api/customers/"+encodeURIComponent(id)):Promise.resolve(null)
+    ]);
+    const customer=detail?.customer||null;
+    const fields=layout.fields||[];
+    const fieldMap=new Map(fields.map(x=>[x.id,x]));
+    const sections=(layout.sections||[]).map(s=>registrationSectionHtml(s,fieldMap,customer)).join("");
+
+    openDrawer(id?"编辑客户":"登记客户",`
+      <form id="customerDrawerForm">
+        ${state.user.role==="admin"?`<section class="form-section"><div class="form-section-head"><h3>负责人</h3></div><div class="form-grid"><div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${sales.map(x=>`<option value="${esc(x.id)}" ${customer?.ownerId===x.id?"selected":""}>${esc(x.display_name)}</option>`).join("")}</select></div></div></section>`:""}
+        ${sections}
+        <div class="drawer-actions">
+          <button class="btn" type="submit">${id?"保存修改":"保存客户"}</button>
+          <button class="btn ghost" type="button" id="drawerCancel">取消</button>
         </div>
+      </form>`,()=>{
+        document.querySelector("#drawerCancel").onclick=closeDrawer;
+        document.querySelector("#customerDrawerForm").onsubmit=async e=>{
+          e.preventDefault();
+          const form=e.currentTarget;
+          const values={};
+          form.querySelectorAll(".dyn").forEach(x=>values[x.dataset.field]=x.value);
+          const name=form.querySelector('[name="name"]')?.value?.trim()||"";
+          if(!name){toast("请输入客户姓名");return}
+          const body={name,values};
+          if(state.user.role==="admin") body.assignedUserId=form.querySelector('[name="owner"]')?.value||null;
+          try{
+            if(id) await api("/api/customers/"+encodeURIComponent(id),{method:"PATCH",body});
+            else await api("/api/customers",{method:"POST",body});
+            closeDrawer();
+            toast(id?"客户资料已保存":"客户已登记");
+            if(document.querySelector("#customerResults")) await loadCustomerPage(true);
+          }catch(err){toast(err.message)}
+        };
+      });
+  }catch(err){toast(err.message)}
+}
+
+async function openCustomerPreview(id){
+  try{
+    const [r,layout]=await Promise.all([
+      api("/api/customers/"+encodeURIComponent(id)),
+      api("/api/registration-layout")
+    ]);
+    const c=r.customer;
+    const fieldMap=new Map((r.fields||[]).map(x=>[x.id,x]));
+    const sections=(layout.sections||[]).map(section=>{
+      const rows=(section.items||[]).map(key=>{
+        if(key==="name") return `<div class="preview-item"><span>客户姓名</span><strong>${esc(c.name)}</strong></div>`;
+        const f=fieldMap.get(key); if(!f)return "";
+        return `<div class="preview-item"><span>${esc(f.label)}</span><strong>${esc(c.values?.[f.id]||"—")}</strong></div>`;
+      }).join("");
+      return rows?`<section class="preview-section"><h3>${esc(section.title||"信息")}</h3><div class="preview-grid">${rows}</div></section>`:"";
+    }).join("");
+
+    openDrawer("客户预览",`
+      <div class="preview-summary">
+        <div><span>业务员</span><strong>${esc(c.ownerName||"未分配")}</strong></div>
+        <div><span>当前进度</span><strong>${c.progressPercent}%</strong></div>
+        <div><span>创建时间</span><strong>${esc((c.createdAt||"").replace("T"," ").slice(0,19))}</strong></div>
+        <div><span>状态</span><strong>${c.archived?"已归档":"正常"}</strong></div>
       </div>
-    </div>`;
-  document.querySelector("#editCustomer").onsubmit=async e=>{
-    e.preventDefault();const values={};e.currentTarget.querySelectorAll(".dyn").forEach(x=>values[x.dataset.field]=x.value);
-    try{await api("/api/customers/"+encodeURIComponent(id),{method:"PATCH",body:{name:e.currentTarget.name.value,assignedUserId:e.currentTarget.owner?.value,values}});toast("修改已保存");}
-    catch(err){toast(err.message)}
-  };
-  document.querySelectorAll("[data-progress]").forEach(ch=>ch.onchange=async()=>{
-    try{const x=await api(`/api/customers/${encodeURIComponent(id)}/progress/${encodeURIComponent(ch.dataset.progress)}`,{method:"PUT",body:{completed:ch.checked}});toast(`进度已更新为 ${x.percent}%`);setTimeout(()=>renderCustomerDetail(view,id),250);}
-    catch(err){ch.checked=!ch.checked;toast(err.message)}
-  });
-  const del=document.querySelector("#deleteCustomer");if(del)del.onclick=async()=>{
-    if(!confirm("确认删除这个客户？系统采用软删除，数据不会立即永久消失。"))return;
-    try{await api("/api/customers/"+encodeURIComponent(id),{method:"DELETE"});toast("客户已移入删除状态");location.hash="#/admin/customers";}catch(err){toast(err.message)}
-  };
+      ${sections}
+      <section class="preview-section">
+        <h3>客户进度</h3>
+        <div class="progress-list">
+          ${c.progress.map(p=>`<div class="progress-item"><span style="font-size:18px">${p.completed?"☑":"☐"}</span><span><strong>${esc(p.label)}</strong>${p.description?`<div class="muted" style="font-size:12px">${esc(p.description)}</div>`:""}</span></div>`).join("")}
+        </div>
+      </section>
+      <div class="drawer-actions">
+        <button class="btn" id="previewEdit">编辑客户</button>
+        <button class="btn secondary" id="previewCopy">复制全部信息</button>
+        <button class="btn ghost" id="previewClose">关闭</button>
+      </div>`,()=>{
+        document.querySelector("#previewEdit").onclick=()=>{closeDrawer();openCustomerEditor(id)};
+        document.querySelector("#previewCopy").onclick=()=>copyCustomerAll(id);
+        document.querySelector("#previewClose").onclick=closeDrawer;
+      });
+  }catch(err){toast(err.message)}
+}
+
+async function copyCustomerAll(id){
+  try{
+    const r=await api("/api/customers/"+encodeURIComponent(id));
+    const c=r.customer;
+    const fields=r.fields||[];
+    const lines=[
+      `客户姓名：${c.name}`,
+      `业务员：${c.ownerName||"未分配"}`,
+      ...fields.map(f=>`${f.label}：${c.values?.[f.id]||""}`),
+      `客户进度：${c.progressPercent}%（${c.progressDone}/${c.progressTotal}）`,
+      ...c.progress.map(p=>`${p.completed?"✓":"□"} ${p.label}`),
+      `状态：${c.archived?"已归档":"正常"}`,
+      `创建时间：${(c.createdAt||"").replace("T"," ").slice(0,19)}`,
+      `更新时间：${(c.updatedAt||"").replace("T"," ").slice(0,19)}`
+    ];
+    const copyText=lines.join("\\n");
+    try{
+      await navigator.clipboard.writeText(copyText);
+    }catch{
+      const ta=document.createElement("textarea");ta.value=copyText;ta.style.position="fixed";ta.style.opacity="0";
+      document.body.appendChild(ta);ta.select();document.execCommand("copy");ta.remove();
+    }
+    toast("已复制此客户全部信息");
+  }catch(err){toast(err.message)}
+}
+
+async function setCustomerArchived(id,archived){
+  try{
+    await api("/api/customers/"+encodeURIComponent(id),{method:"PATCH",body:{archived}});
+    toast(archived?"客户已归档":"客户已取消归档");
+    await loadCustomerPage(true);
+  }catch(err){toast(err.message)}
+}
+
+async function deleteCustomerRow(id){
+  if(!confirm("确认删除这个客户？删除后会进入管理员回收站，不会立即永久消失。"))return;
+  try{
+    await api("/api/customers/"+encodeURIComponent(id),{method:"DELETE"});
+    toast("客户已移入回收站");
+    await loadCustomerPage(true);
+  }catch(err){toast(err.message)}
+}
+
+async function renderCustomerDetail(view,id){
+  await renderCustomers(view);
+  await openCustomerPreview(id);
 }
 
 async function renderSales(view){
@@ -549,19 +708,148 @@ function enableSidebarDrag(view,items){
 }
 
 
+async function renderRegistrationLayoutSettings(view){
+  const r=await api("/api/admin/registration-layout");
+  const fields=r.fields||[];
+  let sections=(r.layout?.sections||[]).map(s=>({
+    id:String(s.id||("sec_"+Date.now()+Math.random())),
+    title:String(s.title||"信息分组"),
+    description:String(s.description||""),
+    items:[...(Array.isArray(s.items)?s.items:[])]
+  }));
+  const allItems=[
+    {id:"name",label:"客户姓名",field_type:"text",fixed:true},
+    ...fields.map(f=>({id:f.id,label:f.label,field_type:f.field_type,fixed:false}))
+  ];
+  if(!sections.length)sections=[{id:"basic",title:"基本信息",description:"",items:["name"]}];
+
+  function usedSet(){return new Set(sections.flatMap(s=>s.items||[]))}
+  function syncInputs(){
+    document.querySelectorAll("[data-layout-section]").forEach(el=>{
+      const s=sections.find(x=>x.id===el.dataset.layoutSection);if(!s)return;
+      s.title=el.querySelector(".layout-title")?.value||s.title;
+      s.description=el.querySelector(".layout-desc")?.value||"";
+    });
+  }
+  function labelOf(id){return allItems.find(x=>x.id===id)?.label||id}
+  function renderEditor(){
+    view.innerHTML=pageHead("业务员登记面板设置","把登记条目分成不同区域。业务员打开“登记客户”时会按这里的分组和顺序显示。",
+      `<button class="btn" id="saveRegLayout">保存并同步</button>`)+
+      `<div class="notice" style="margin-bottom:16px">例如可以把“客户姓名、手机号、邮箱”放进“基本信息”区域，把其他登记内容放进其他区域。没有分组的字段不会消失，会自动放到“其他信息”。</div>
+      <div id="layoutSections" class="layout-section-list"></div>
+      <div class="row wrap" style="margin-top:16px">
+        <button class="btn secondary" id="addLayoutSection">＋ 添加区域栏</button>
+      </div>
+      <div class="card" style="margin-top:16px">
+        <h3 style="margin-top:0">未分组条目</h3>
+        <div id="unassignedFields" class="unassigned-fields"></div>
+      </div>`;
+
+    const host=document.querySelector("#layoutSections");
+    host.innerHTML=sections.map((s,si)=>{
+      const used=usedSet();
+      const available=allItems.filter(x=>!used.has(x.id));
+      return `<section class="layout-section-card" data-layout-section="${esc(s.id)}">
+        <div class="layout-section-toolbar">
+          <div class="layout-section-fields">
+            <input class="input layout-title" value="${esc(s.title)}" placeholder="区域名称">
+            <input class="input layout-desc" value="${esc(s.description)}" placeholder="区域说明（可留空）">
+          </div>
+          <div class="row">
+            <button class="btn ghost small" data-sec-up="${esc(s.id)}" ${si===0?"disabled":""}>↑</button>
+            <button class="btn ghost small" data-sec-down="${esc(s.id)}" ${si===sections.length-1?"disabled":""}>↓</button>
+            <button class="btn danger small" data-sec-delete="${esc(s.id)}">删除区域</button>
+          </div>
+        </div>
+        <div class="layout-items">
+          ${(s.items||[]).map((key,ii)=>`<div class="layout-item">
+            <span class="drag">⋮⋮</span>
+            <strong>${esc(labelOf(key))}</strong>
+            <span class="tag">${key==="name"?"固定字段":"登记字段"}</span>
+            <span class="grow"></span>
+            <button class="btn ghost small" data-item-up="${esc(s.id)}:${ii}" ${ii===0?"disabled":""}>↑</button>
+            <button class="btn ghost small" data-item-down="${esc(s.id)}:${ii}" ${ii===s.items.length-1?"disabled":""}>↓</button>
+            <select class="input move-target" data-move-select="${esc(s.id)}:${ii}" style="width:auto;min-width:130px">
+              <option value="">移动到...</option>
+              ${sections.filter(x=>x.id!==s.id).map(x=>`<option value="${esc(x.id)}">${esc(x.title)}</option>`).join("")}
+            </select>
+            <button class="btn ghost small" data-move-item="${esc(s.id)}:${ii}">移动</button>
+            <button class="btn danger small" data-remove-item="${esc(s.id)}:${ii}">移出</button>
+          </div>`).join("")||'<div class="muted">这个区域还没有登记条目</div>'}
+        </div>
+        <div class="row wrap" style="margin-top:12px">
+          <select class="input grow" data-add-select="${esc(s.id)}">
+            <option value="">选择要加入这个区域的登记条目</option>
+            ${available.map(x=>`<option value="${esc(x.id)}">${esc(x.label)}</option>`).join("")}
+          </select>
+          <button class="btn secondary small" data-add-item="${esc(s.id)}">加入区域</button>
+        </div>
+      </section>`;
+    }).join("");
+
+    const unused=allItems.filter(x=>!usedSet().has(x.id));
+    document.querySelector("#unassignedFields").innerHTML=unused.length
+      ? unused.map(x=>`<span class="tag">${esc(x.label)}</span>`).join(" ")
+      : '<span class="muted">所有登记条目都已经分组</span>';
+
+    document.querySelector("#addLayoutSection").onclick=()=>{
+      syncInputs();
+      sections.push({id:"sec_"+Date.now()+"_"+Math.random().toString(16).slice(2),title:"新区域",description:"",items:[]});
+      renderEditor();
+    };
+    document.querySelectorAll("[data-sec-up]").forEach(b=>b.onclick=()=>{
+      syncInputs();const i=sections.findIndex(x=>x.id===b.dataset.secUp);if(i>0)[sections[i-1],sections[i]]=[sections[i],sections[i-1]];renderEditor();
+    });
+    document.querySelectorAll("[data-sec-down]").forEach(b=>b.onclick=()=>{
+      syncInputs();const i=sections.findIndex(x=>x.id===b.dataset.secDown);if(i>=0&&i<sections.length-1)[sections[i+1],sections[i]]=[sections[i],sections[i+1]];renderEditor();
+    });
+    document.querySelectorAll("[data-sec-delete]").forEach(b=>b.onclick=()=>{
+      syncInputs();if(sections.length===1){toast("至少保留一个区域");return}
+      sections=sections.filter(x=>x.id!==b.dataset.secDelete);renderEditor();
+    });
+    document.querySelectorAll("[data-add-item]").forEach(b=>b.onclick=()=>{
+      syncInputs();const s=sections.find(x=>x.id===b.dataset.addItem);const sel=document.querySelector('[data-add-select="'+b.dataset.addItem+'"]');
+      if(s&&sel?.value){s.items.push(sel.value);renderEditor()}
+    });
+    document.querySelectorAll("[data-remove-item]").forEach(b=>b.onclick=()=>{
+      syncInputs();const [sid,idxRaw]=b.dataset.removeItem.split(":");const s=sections.find(x=>x.id===sid);if(s){s.items.splice(Number(idxRaw),1);renderEditor()}
+    });
+    document.querySelectorAll("[data-item-up]").forEach(b=>b.onclick=()=>{
+      syncInputs();const [sid,idxRaw]=b.dataset.itemUp.split(":");const s=sections.find(x=>x.id===sid),i=Number(idxRaw);if(s&&i>0)[s.items[i-1],s.items[i]]=[s.items[i],s.items[i-1]];renderEditor();
+    });
+    document.querySelectorAll("[data-item-down]").forEach(b=>b.onclick=()=>{
+      syncInputs();const [sid,idxRaw]=b.dataset.itemDown.split(":");const s=sections.find(x=>x.id===sid),i=Number(idxRaw);if(s&&i<s.items.length-1)[s.items[i+1],s.items[i]]=[s.items[i],s.items[i+1]];renderEditor();
+    });
+    document.querySelectorAll("[data-move-item]").forEach(b=>b.onclick=()=>{
+      syncInputs();const [sid,idxRaw]=b.dataset.moveItem.split(":");const s=sections.find(x=>x.id===sid),i=Number(idxRaw);
+      const targetId=document.querySelector('[data-move-select="'+b.dataset.moveItem+'"]')?.value;
+      const target=sections.find(x=>x.id===targetId);if(s&&target&&s.items[i]){const [item]=s.items.splice(i,1);target.items.push(item);renderEditor()}
+    });
+    document.querySelector("#saveRegLayout").onclick=async()=>{
+      syncInputs();
+      try{
+        await api("/api/admin/registration-layout",{method:"PUT",body:{sections}});
+        toast("业务员登记面板已保存并同步");
+        renderRegistrationLayoutSettings(view);
+      }catch(e){toast(e.message)}
+    };
+  }
+  renderEditor();
+}
+
 async function renderListSettings(view,audience="admin"){
   const r=await api("/api/admin/list-columns?audience="+audience);
   const fields=r.fields||[];
   let items=(r.items||[]).map(x=>({...x}));
   if(!items.some(x=>x.column_key==="name"))items.unshift({id:"fixed_name",column_key:"name",field_id:null,label:"客户姓名",enabled:1,sort_order:0});
   const titleAudience=audience==="admin"?"管理员":"业务员";
-  view.innerHTML=pageHead("客户列表显示设置","管理员统一决定客户卡片显示哪些资料以及显示顺序")+
+  view.innerHTML=pageHead("客户列表显示设置","管理员统一决定客户列表每一行显示哪些资料以及显示顺序")+
     `<div class="row" style="margin-bottom:14px">
       <button class="btn ${audience==="admin"?"":"ghost"} small" id="listAdmin">管理员列表</button>
       <button class="btn ${audience==="sales"?"":"ghost"} small" id="listSales">业务员列表</button>
     </div>
     <div class="card">
-      <h3 style="margin-top:0">${titleAudience}客户卡片内容</h3>
+      <h3 style="margin-top:0">${titleAudience}客户列表内容</h3>
       <p class="muted">客户姓名固定显示。其他内容可以添加、删除、改显示名称和拖动排序。</p>
       <div class="settings-list" id="listColumnRows"></div>
       <div class="row wrap" style="margin-top:14px">
@@ -789,6 +1077,19 @@ async function renderBackup(view){
     }catch(e){progress.textContent=`恢复中断：${e.message}`;toast(e.message)}
   };
 }
+
+function openDrawer(title,body,onReady){
+  closeDrawer();
+  const el=document.createElement("div");
+  el.className="drawer-back";
+  el.id="drawer";
+  el.innerHTML=`<aside class="drawer-panel"><div class="drawer-head"><div><h2>${esc(title)}</h2></div><button class="btn ghost small" id="drawerClose">关闭</button></div><div class="drawer-body">${body}</div></aside>`;
+  document.body.appendChild(el);
+  document.querySelector("#drawerClose").onclick=closeDrawer;
+  el.onclick=e=>{if(e.target===el)closeDrawer()};
+  onReady?.();
+}
+function closeDrawer(){document.querySelector("#drawer")?.remove()}
 
 function openModal(title,body,onReady){
   const el=document.createElement("div");el.className="modal-back";el.id="modal";
