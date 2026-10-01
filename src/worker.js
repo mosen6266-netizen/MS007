@@ -2931,93 +2931,257 @@ async function updateUser(request,env,admin,id){
 async function importChunk(request,env,user){
   const body=await readBody(request);
   if(body?.format!=="MS007-BUSINESS-BACKUP" || !body?.section || !Array.isArray(body.rows)) return fail("导入分片格式不正确");
-  const rows=body.rows.slice(0,100);
+  const rows=body.rows.slice(0,200);
   const section=String(body.section);
   const t=now();
   const stmts=[];
 
   if(section==="users"){
     for(const u of rows){
-      if(u.role!=="sales") continue;
-      const exists=await env.DB.prepare("SELECT id FROM users WHERE id=? OR username=?").bind(u.id,u.username).first();
-      if(!exists){
+      const role=u.role==="admin"?"admin":u.role==="sales"?"sales":"";
+      if(!role||!u.id||!u.username)continue;
+
+      const sameId=await env.DB.prepare("SELECT id,username,role FROM users WHERE id=?").bind(u.id).first();
+      const sameName=await env.DB.prepare("SELECT id,username,role FROM users WHERE username=?").bind(u.username).first();
+
+      if(sameId){
+        // Never import passwords or reactivate accounts. Keep the current role and
+        // credentials, but restore safe account metadata.
+        stmts.push(env.DB.prepare(
+          "UPDATE users SET display_name=?,updated_at=? WHERE id=?"
+        ).bind(String(u.display_name||u.username),t,sameId.id));
+      }else if(sameName){
+        if(normalizedRole(sameName.role)!==role)return fail("账号 "+u.username+" 在当前系统中的角色与备份不一致，请先解决冲突",409,"RESTORE_USER_ROLE_CONFLICT");
+        stmts.push(env.DB.prepare(
+          "UPDATE users SET display_name=?,updated_at=? WHERE id=?"
+        ).bind(String(u.display_name||u.username),t,sameName.id));
+      }else{
         const salt=newSalt(),hash=await derivePassword(uid("disabled_"),salt,100000);
         stmts.push(env.DB.prepare(
-          `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
-           VALUES(?,?,?,?,?,100000,'sales',0,?,?)`
-        ).bind(u.id,u.username,u.display_name,hash,salt,u.created_at||t,t));
+          `INSERT INTO users(
+            id,username,display_name,password_hash,password_salt,password_iterations,
+            role,active,created_at,updated_at
+           ) VALUES(?,?,?,?,?,100000,?,0,?,?)`
+        ).bind(u.id,u.username,String(u.display_name||u.username),hash,salt,role,u.created_at||t,t));
       }
     }
   } else if(section==="fieldDefinitions"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      `INSERT OR REPLACE INTO field_definitions(id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,sort_order,options_json,searchable,created_at,updated_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
-    ).bind(x.id,x.field_key,x.label,x.field_type,x.required,x.enabled,x.list_visible,x.list_sort_order,x.sort_order,x.options_json,x.searchable,x.created_at||t,x.updated_at||t));
+    for(const x of rows){
+      const sameKey=await env.DB.prepare(
+        "SELECT id FROM field_definitions WHERE field_key=?"
+      ).bind(x.field_key).first();
+      if(sameKey && sameKey.id!==x.id){
+        return fail("登记字段标识 "+x.field_key+" 与当前系统已有字段冲突，请先解决冲突",409,"RESTORE_FIELD_KEY_CONFLICT");
+      }
+      stmts.push(env.DB.prepare(
+        `INSERT INTO field_definitions(
+          id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,
+          sort_order,options_json,searchable,created_at,updated_at
+         ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+          field_key=excluded.field_key,label=excluded.label,field_type=excluded.field_type,
+          required=excluded.required,enabled=excluded.enabled,list_visible=excluded.list_visible,
+          list_sort_order=excluded.list_sort_order,sort_order=excluded.sort_order,
+          options_json=excluded.options_json,searchable=excluded.searchable,updated_at=excluded.updated_at`
+      ).bind(
+        x.id,x.field_key,x.label,x.field_type,x.required,x.enabled,x.list_visible,
+        x.list_sort_order,x.sort_order,x.options_json||"[]",x.searchable,
+        x.created_at||t,x.updated_at||t
+      ));
+    }
   } else if(section==="progressDefinitions"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      `INSERT OR REPLACE INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at)
-       VALUES(?,?,?,?,?,?,?,?)`
-    ).bind(x.id,x.label,x.description,x.enabled,x.sort_order,x.color,x.created_at||t,x.updated_at||t));
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET
+        label=excluded.label,description=excluded.description,enabled=excluded.enabled,
+        sort_order=excluded.sort_order,color=excluded.color,updated_at=excluded.updated_at`
+    ).bind(x.id,x.label,x.description||"",x.enabled,x.sort_order,x.color||"#2563eb",x.created_at||t,x.updated_at||t));
   } else if(section==="customers"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      `INSERT OR REPLACE INTO customers(
-        id,assigned_user_id,name,progress_done,progress_total,progress_percent,archived,deleted_at,created_by_id,created_at,updated_at
-       ) VALUES(
-        ?,
-        CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM users WHERE id=?) THEN ? ELSE NULL END,
-        ?,?,?,?,?,?,
-        CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM users WHERE id=?) THEN ? ELSE ? END,
-        ?,?
-       )`
-    ).bind(
-      x.id,
-      x.assigned_user_id,x.assigned_user_id,x.assigned_user_id,
-      x.name,x.progress_done||0,x.progress_total||0,x.progress_percent||0,x.archived||0,x.deleted_at||null,
-      x.created_by_id,x.created_by_id,x.created_by_id,user.id,
-      x.created_at||t,x.updated_at||t
-    ));
+    for(const x of rows){
+      const ownerId=x.assigned_user_id||null;
+      const ownerUsername=String(x.assigned_username||"");
+      const creatorId=x.created_by_id||null;
+      const creatorUsername=String(x.created_by_username||"");
+      stmts.push(env.DB.prepare(
+        `INSERT INTO customers(
+          id,assigned_user_id,name,progress_done,progress_total,progress_percent,
+          archived,deleted_at,created_by_id,created_at,updated_at,edit_version
+         ) VALUES(
+          ?,
+          COALESCE(
+            (SELECT id FROM users WHERE id=? AND role='sales'),
+            (SELECT id FROM users WHERE username=? AND role='sales')
+          ),
+          ?,?,?,?,?,?,
+          COALESCE(
+            (SELECT id FROM users WHERE id=?),
+            (SELECT id FROM users WHERE username=?),
+            ?
+          ),
+          ?,?,?
+         )
+         ON CONFLICT(id) DO UPDATE SET
+          assigned_user_id=excluded.assigned_user_id,
+          name=excluded.name,
+          progress_done=excluded.progress_done,
+          progress_total=excluded.progress_total,
+          progress_percent=excluded.progress_percent,
+          archived=excluded.archived,
+          deleted_at=excluded.deleted_at,
+          created_by_id=excluded.created_by_id,
+          updated_at=excluded.updated_at,
+          edit_version=MAX(customers.edit_version,excluded.edit_version)`
+      ).bind(
+        x.id,
+        ownerId,ownerUsername,
+        x.name,x.progress_done||0,x.progress_total||0,x.progress_percent||0,x.archived||0,x.deleted_at||null,
+        creatorId,creatorUsername,user.id,
+        x.created_at||t,x.updated_at||t,Math.max(1,Number(x.edit_version||1))
+      ));
+    }
   } else if(section==="customerValues"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      "INSERT OR REPLACE INTO customer_values(customer_id,field_id,value,updated_at) VALUES(?,?,?,?)"
-    ).bind(x.customer_id,x.field_id,x.value,x.updated_at||t));
+    for(const x of rows){
+      stmts.push(env.DB.prepare(
+        `INSERT INTO customer_values(customer_id,field_id,value,updated_at)
+         SELECT ?,
+           COALESCE(
+             (SELECT id FROM field_definitions WHERE id=?),
+             (SELECT id FROM field_definitions WHERE field_key=?)
+           ),
+           ?,?
+         WHERE EXISTS(SELECT 1 FROM customers WHERE id=?)
+           AND COALESCE(
+             (SELECT id FROM field_definitions WHERE id=?),
+             (SELECT id FROM field_definitions WHERE field_key=?)
+           ) IS NOT NULL
+         ON CONFLICT(customer_id,field_id) DO UPDATE SET
+           value=excluded.value,updated_at=excluded.updated_at`
+      ).bind(
+        x.customer_id,x.field_id,String(x.field_key||""),String(x.value??""),x.updated_at||t,
+        x.customer_id,x.field_id,String(x.field_key||"")
+      ));
+    }
   } else if(section==="customerProgress"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      `INSERT OR REPLACE INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
-       VALUES(?,?,?,CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM users WHERE id=?) THEN ? ELSE NULL END,?)`
-    ).bind(x.customer_id,x.progress_id,x.completed,x.completed_by,x.completed_by,x.completed_by,x.completed_at));
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
+       SELECT ?,?,?,COALESCE(
+         (SELECT id FROM users WHERE id=?),
+         (SELECT id FROM users WHERE username=?)
+       ),?
+       WHERE EXISTS(SELECT 1 FROM customers WHERE id=?)
+         AND EXISTS(SELECT 1 FROM progress_definitions WHERE id=?)
+       ON CONFLICT(customer_id,progress_id) DO UPDATE SET
+         completed=excluded.completed,
+         completed_by=excluded.completed_by,
+         completed_at=excluded.completed_at`
+    ).bind(
+      x.customer_id,x.progress_id,x.completed,
+      x.completed_by,String(x.completed_by_username||""),x.completed_at||null,
+      x.customer_id,x.progress_id
+    ));
   } else if(section==="sidebarCategories"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      `INSERT OR REPLACE INTO sidebar_categories(id,audience,label,sort_order,created_at,updated_at)
-       VALUES(?,?,?,?,?,?)`
-    ).bind(x.id,x.audience,x.label,x.sort_order,x.created_at||t,x.updated_at||t));
+    for(const x of rows){
+      const sameLabel=await env.DB.prepare(
+        "SELECT id FROM sidebar_categories WHERE audience=? AND label=?"
+      ).bind(x.audience,x.label).first();
+      if(sameLabel&&sameLabel.id!==x.id)return fail("左侧栏分类 "+x.label+" 与当前系统分类冲突",409,"RESTORE_SIDEBAR_CATEGORY_CONFLICT");
+      stmts.push(env.DB.prepare(
+        `INSERT INTO sidebar_categories(id,audience,label,sort_order,created_at,updated_at)
+         VALUES(?,?,?,?,?,?)
+         ON CONFLICT(id) DO UPDATE SET
+          audience=excluded.audience,label=excluded.label,sort_order=excluded.sort_order,updated_at=excluded.updated_at`
+      ).bind(x.id,x.audience,x.label,x.sort_order,x.created_at||t,x.updated_at||t));
+    }
   } else if(section==="sidebarItems"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      `INSERT OR REPLACE INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?)`
-    ).bind(x.id,x.audience,x.label,x.icon,x.url,x.target,x.enabled,x.sort_order,x.group_label,x.created_at||t,x.updated_at||t));
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET
+        audience=excluded.audience,label=excluded.label,icon=excluded.icon,url=excluded.url,
+        target=excluded.target,enabled=excluded.enabled,sort_order=excluded.sort_order,
+        group_label=excluded.group_label,updated_at=excluded.updated_at`
+    ).bind(x.id,x.audience,x.label,x.icon,x.url,x.target,x.enabled,x.sort_order,x.group_label||"",x.created_at||t,x.updated_at||t));
   } else if(section==="sidebarItemCategories"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      "INSERT OR REPLACE INTO sidebar_item_categories(item_id,audience,category_id) VALUES(?,?,?)"
-    ).bind(x.item_id,x.audience,x.category_id));
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO sidebar_item_categories(item_id,audience,category_id)
+       SELECT ?,?,?
+       WHERE EXISTS(SELECT 1 FROM sidebar_items WHERE id=?)
+         AND EXISTS(SELECT 1 FROM sidebar_categories WHERE id=? AND audience=?)
+       ON CONFLICT(item_id,audience) DO UPDATE SET category_id=excluded.category_id`
+    ).bind(x.item_id,x.audience,x.category_id,x.item_id,x.category_id,x.audience));
   } else if(section==="listColumns"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      "INSERT OR REPLACE INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order) VALUES(?,?,?,?,?,?,?)"
-    ).bind(x.id,x.audience,x.column_key,x.field_id,x.label,x.enabled,x.sort_order));
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order)
+       SELECT ?,?,?,CASE WHEN ? IS NULL OR EXISTS(SELECT 1 FROM field_definitions WHERE id=?) THEN ? ELSE NULL END,?,?,?
+       ON CONFLICT(id) DO UPDATE SET
+        audience=excluded.audience,column_key=excluded.column_key,field_id=excluded.field_id,
+        label=excluded.label,enabled=excluded.enabled,sort_order=excluded.sort_order`
+    ).bind(x.id,x.audience,x.column_key,x.field_id,x.field_id,x.field_id,x.label,x.enabled,x.sort_order));
   } else if(section==="dashboardWidgets"){
-    for(const x of rows) stmts.push(env.DB.prepare(
-      "INSERT OR REPLACE INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json)
+       VALUES(?,?,?,?,?,?,?)
+       ON CONFLICT(id) DO UPDATE SET
+        audience=excluded.audience,widget_type=excluded.widget_type,title=excluded.title,
+        enabled=excluded.enabled,sort_order=excluded.sort_order,config_json=excluded.config_json`
     ).bind(x.id,x.audience,x.widget_type,x.title,x.enabled,x.sort_order,x.config_json||"{}"));
   } else if(section==="systemSettings"){
-    for(const x of rows) stmts.push(env.DB.prepare(
+    for(const x of rows)stmts.push(env.DB.prepare(
       `INSERT INTO system_settings(setting_key,value_json,updated_at) VALUES(?,?,?)
        ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
     ).bind(x.setting_key,x.value_json,x.updated_at||t));
+  } else if(section==="telegramSettings"){
+    for(const x of rows){
+      stmts.push(env.DB.prepare(
+        `UPDATE telegram_settings SET
+          enabled=CASE WHEN bot_token_enc<>'' THEN ? ELSE 0 END,
+          chat_id=?,fields_json=?,notify_admin=?,link_label=?,updated_at=?
+         WHERE id=1`
+      ).bind(x.enabled?1:0,String(x.chat_id||""),x.fields_json||"[]",x.notify_admin?1:0,String(x.link_label||"查看客户详情"),t));
+    }
+  } else if(section==="telegramProgressRoutes"){
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO telegram_progress_routes(progress_id,route_mode,chat_id,updated_at)
+       SELECT ?,?,?,?
+       WHERE EXISTS(SELECT 1 FROM progress_definitions WHERE id=?)
+       ON CONFLICT(progress_id) DO UPDATE SET
+        route_mode=excluded.route_mode,chat_id=excluded.chat_id,updated_at=excluded.updated_at`
+    ).bind(x.progress_id,x.route_mode,x.chat_id,x.updated_at||t,x.progress_id));
+  } else if(section==="auditLogs"){
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO audit_logs(id,actor_user_id,action,entity_type,entity_id,detail_json,created_at)
+       VALUES(
+         ?,COALESCE((SELECT id FROM users WHERE id=?),(SELECT id FROM users WHERE username=?)),
+         ?,?,?,?,?
+       )
+       ON CONFLICT(id) DO NOTHING`
+    ).bind(
+      x.id,x.actor_user_id,String(x.actor_username||""),x.action,x.entity_type,
+      x.entity_id||null,x.detail_json||"{}",x.created_at||t
+    ));
+  } else if(section==="telegramDeliveryLogs"){
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO telegram_delivery_logs(id,customer_id,actor_user_id,progress_id,status,error_text,created_at)
+       VALUES(
+         ?,
+         CASE WHEN ? IS NULL OR EXISTS(SELECT 1 FROM customers WHERE id=?) THEN ? ELSE NULL END,
+         COALESCE((SELECT id FROM users WHERE id=?),(SELECT id FROM users WHERE username=?)),
+         ?,?,?,?
+       )
+       ON CONFLICT(id) DO NOTHING`
+    ).bind(
+      x.id,
+      x.customer_id,x.customer_id,x.customer_id,
+      x.actor_user_id,String(x.actor_username||""),
+      x.progress_id||null,x.status,x.error_text||"",x.created_at||t
+    ));
   } else {
     return fail("未知的备份数据部分");
   }
 
   if(stmts.length) await env.DB.batch(stmts);
-  return responseJson({ok:true,section,processed:rows.length});
+  return responseJson({ok:true,section,processed:rows.length,version:Number(body.version||2)});
 }
 
 async function finishImport(env,user){
@@ -3214,7 +3378,10 @@ function backupSectionSpec(section){
     },
     customerValues:{
       count:"SELECT COUNT(*) n FROM customer_values",
-      sql:"SELECT * FROM customer_values ORDER BY customer_id,field_id LIMIT ? OFFSET ?"
+      sql:`SELECT cv.*,fd.field_key
+           FROM customer_values cv
+           LEFT JOIN field_definitions fd ON fd.id=cv.field_id
+           ORDER BY cv.customer_id,cv.field_id LIMIT ? OFFSET ?`
     },
     progressDefinitions:{
       count:"SELECT COUNT(*) n FROM progress_definitions",
@@ -3386,7 +3553,16 @@ async function importPreviewChunk(request,env){
       const sameId=existing.find(x=>x.id===row.id);
       const sameName=existing.find(x=>x.username===row.username);
       if(sameName && sameName.id!==row.id){
-        result.conflicts.push({type:"username",value:row.username,backupId:row.id,currentId:sameName.id});
+        if(String(sameName.role||"")===String(row.role||"")){
+          result.mergeCount++;
+          result.warnings.push({
+            type:"user_identity_map",username:row.username,
+            backupId:row.id,currentId:sameName.id,
+            message:"同名同角色账号会映射到当前系统账号，密码不会恢复。"
+          });
+        }else{
+          result.conflicts.push({type:"username_role",value:row.username,backupId:row.id,currentId:sameName.id});
+        }
       }else if(sameId)result.updateCount++;
       else result.newCount++;
     }
