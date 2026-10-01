@@ -619,6 +619,79 @@ async function telegramRecentActivity(env,limit=20){
   return r.results||[];
 }
 
+async function telegramUnresolvedItems(env,limit=200){
+  const safeLimit=Math.max(1,Math.min(500,Number(limit)||200));
+  const r=await env.DB.prepare(
+    `SELECT * FROM (
+       SELECT
+         q.id,'queue' source,
+         CASE
+           WHEN COALESCE(q.requires_admin,0)=1 THEN 'needs_admin'
+           WHEN q.status='retry' THEN 'retry'
+           WHEN q.status='sending' THEN 'sending'
+           ELSE 'pending'
+         END AS status,
+         q.status raw_status,
+         q.last_error error_text,
+         q.created_at,q.updated_at,q.chat_id,q.next_attempt_at,q.attempts,q.requires_admin,
+         c.name customer_name,u.display_name actor_name,p.label progress_name,
+         q.customer_id,q.actor_user_id,q.progress_id
+       FROM telegram_send_queue q
+       LEFT JOIN customers c ON c.id=q.customer_id
+       LEFT JOIN users u ON u.id=q.actor_user_id
+       LEFT JOIN progress_definitions p ON p.id=q.progress_id
+
+       UNION ALL
+
+       SELECT
+         l.id,'delivery' source,l.status,l.status raw_status,
+         l.error_text,l.created_at,l.created_at updated_at,
+         NULL chat_id,NULL next_attempt_at,NULL attempts,0 requires_admin,
+         c.name customer_name,u.display_name actor_name,p.label progress_name,
+         l.customer_id,l.actor_user_id,l.progress_id
+       FROM telegram_delivery_logs l
+       LEFT JOIN customers c ON c.id=l.customer_id
+       LEFT JOIN users u ON u.id=l.actor_user_id
+       LEFT JOIN progress_definitions p ON p.id=l.progress_id
+       WHERE l.status IN ('failed','skipped')
+         AND l.customer_id IS NOT NULL
+         AND l.progress_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM telegram_send_queue q2
+           WHERE q2.customer_id IS l.customer_id
+             AND q2.progress_id IS l.progress_id
+             AND q2.created_at>=l.created_at
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM telegram_delivery_logs s
+           WHERE s.status='success'
+             AND s.customer_id IS l.customer_id
+             AND s.progress_id IS l.progress_id
+             AND s.created_at>l.created_at
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM telegram_delivery_logs newer
+           WHERE newer.status IN ('failed','skipped')
+             AND newer.customer_id IS l.customer_id
+             AND newer.progress_id IS l.progress_id
+             AND (
+               newer.created_at>l.created_at
+               OR (newer.created_at=l.created_at AND newer.id>l.id)
+             )
+         )
+     ) unresolved
+     ORDER BY unresolved.updated_at DESC,unresolved.created_at DESC,unresolved.id DESC
+     LIMIT ?`
+  ).bind(safeLimit).all();
+  const items=r.results||[];
+  return {
+    items,
+    count:items.length,
+    truncated:items.length>=safeLimit,
+    limit:safeLimit
+  };
+}
+
 async function telegramQueueMonitor(env){
   const cutoff=new Date(Date.now()-24*60*60*1000).toISOString();
   const [queue,delivery]=await Promise.all([
@@ -659,30 +732,38 @@ async function telegramQueueMonitor(env){
 
 async function retryTelegramQueueItem(env,user,id,ctx){
   const row=await env.DB.prepare(
-    "SELECT id,status,requires_admin,last_error FROM telegram_send_queue WHERE id=?"
+    "SELECT id,status,requires_admin,last_error,locked_until FROM telegram_send_queue WHERE id=?"
   ).bind(id).first();
   if(!row)return fail("这条 Telegram 消息已经不存在，可能已经发送成功",404);
-  if(!Number(row.requires_admin||0))return fail("这条消息当前不需要管理员手动重试",409);
+  if(row.status==="sending" && row.locked_until && Date.parse(String(row.locked_until))>Date.now()){
+    return fail("这条消息正在发送中，请稍后刷新",409);
+  }
   const t=now();
+  const wasAdmin=Number(row.requires_admin||0)===1;
   const result=await env.DB.prepare(
     `UPDATE telegram_send_queue
-     SET status='retry',attempts=0,next_attempt_at=?,locked_until=NULL,
+     SET status='retry',
+         attempts=CASE WHEN requires_admin=1 THEN 0 ELSE attempts END,
+         next_attempt_at=?,locked_until=NULL,
          requires_admin=0,dead_lettered_at=NULL,
          last_error=?,updated_at=?
-     WHERE id=? AND requires_admin=1`
+     WHERE id=? AND status IN ('pending','retry','sending')`
   ).bind(
     t,
-    ("管理员已手动重试；之前原因："+String(row.last_error||"")).slice(0,1000),
+    (wasAdmin?"管理员已手动重新发送；之前原因：":"管理员要求立即重试；当前状态：")+String(row.last_error||"").slice(0,850),
     t,
     id
   ).run();
   if(Number(result?.meta?.changes||0)!==1)return fail("这条消息状态刚刚发生变化，请刷新后重试",409);
   await audit(env,user,"retry","telegram_queue",id,{
+    previousStatus:row.status,
+    previousRequiresAdmin:wasAdmin,
     previousError:String(row.last_error||"").slice(0,500)
   });
   const job=processTelegramQueue(env,{maxItems:2,maxRunMs:8000,allowShortWait:false}).catch(()=>{});
   if(ctx?.waitUntil)ctx.waitUntil(job);
-  return responseJson({ok:true,id,message:"已重新进入发送队列"});
+  else await job;
+  return responseJson({ok:true,id,message:"已立即重新进入发送流程"});
 }
 
 async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWait=false}={}){
@@ -868,7 +949,7 @@ async function telegramAdminGet(env){
     const parsed=JSON.parse(row.fields_json||"[]");
     if(Array.isArray(parsed))fields=parsed;
   }catch{}
-  const [availableFields,logs,progressDefs,routes,templateVariables,queueMonitor]=await Promise.all([
+  const [availableFields,logs,progressDefs,routes,templateVariables,queueMonitor,unresolved]=await Promise.all([
     telegramAvailableFields(env),
     telegramRecentActivity(env,20).then(results=>({results})),
     env.DB.prepare(
@@ -878,7 +959,8 @@ async function telegramAdminGet(env){
       "SELECT progress_id,route_mode,chat_id FROM telegram_progress_routes"
     ).all(),
     telegramTemplateVariables(env),
-    telegramQueueMonitor(env)
+    telegramQueueMonitor(env),
+    telegramUnresolvedItems(env,200)
   ]);
   const messageTemplate=normalizedTemplate;
   return responseJson({
@@ -898,6 +980,7 @@ async function telegramAdminGet(env){
     progressDefs:progressDefs.results||[],
     routes:routes.results||[],
     queueMonitor,
+    unresolved,
     logs:logs.results||[]
   });
 }
@@ -1131,13 +1214,14 @@ async function logTelegramDelivery(env,{customerId,actorUserId,progressId,status
   }catch{}
 }
 
-async function sendTelegramProgressNotification(request,env,user,customerId,progressDef,summary,eventId=""){
+async function sendTelegramProgressNotification(request,env,user,customerId,progressDef,summary,eventId="",options={}){
   const row=await telegramSettingsRow(env);
-  if(!row.enabled)return;
-  if(normalizedRole(user.role)==="admin"&&!row.notify_admin)return;
+  const manual=!!options?.manual;
+  if(!row.enabled)return {ok:false,reason:"disabled",queued:0};
+  if(normalizedRole(user.role)==="admin"&&!row.notify_admin&&!manual)return {ok:false,reason:"admin_disabled",queued:0};
   if(!row.bot_token_enc){
-    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"Telegram Bot Token 未设置"});
-    return;
+    if(!manual)await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"Telegram Bot Token 未设置"});
+    return {ok:false,reason:"token_missing",queued:0};
   }
 
   const route=await env.DB.prepare(
@@ -1156,8 +1240,8 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
   targetChatIds=[...new Set(targetChatIds.filter(Boolean))];
 
   if(!targetChatIds.length){
-    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"这个进度没有可用的通知群"});
-    return;
+    if(!manual)await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"这个进度没有可用的通知群"});
+    return {ok:false,reason:"no_target",queued:0};
   }
 
   const customer=await env.DB.prepare(
@@ -1165,7 +1249,7 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
      FROM customers c LEFT JOIN users u ON u.id=c.assigned_user_id
      WHERE c.id=?`
   ).bind(customerId).first();
-  if(!customer)return;
+  if(!customer)return {ok:false,reason:"customer_missing",queued:0};
 
   const status=await telegramProgressStatus(env,customerId);
   const template=await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
@@ -1209,8 +1293,9 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
   );
 
   const eventKey=String(eventId||now());
+  let queued=0;
   for(const targetChatId of targetChatIds){
-    await enqueueTelegramMessage(env,{
+    const result=await enqueueTelegramMessage(env,{
       dedupeKey:[customerId,progressDef.id,eventKey,targetChatId].join(":"),
       customerId,
       actorUserId:user.id,
@@ -1218,12 +1303,95 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
       chatId:targetChatId,
       messageText
     });
+    if(result.inserted)queued++;
   }
 
   // Try to deliver immediately. Per-chat leases prevent concurrent Worker
   // requests from exceeding the safe pace; cron continues anything left queued.
   await processTelegramQueue(env,{maxItems:4,maxRunMs:2500,allowShortWait:false});
+  return {ok:queued>0,reason:queued>0?"queued":"duplicate",queued,targetCount:targetChatIds.length};
 }
+async function retryTelegramDeliveryLog(request,env,user,id,ctx){
+  const log=await env.DB.prepare(
+    `SELECT l.id,l.customer_id,l.actor_user_id,l.progress_id,l.status,l.error_text,l.created_at
+     FROM telegram_delivery_logs l
+     WHERE l.id=? AND l.status IN ('failed','skipped')`
+  ).bind(id).first();
+  if(!log)return fail("这条未发送记录已经不存在或已经不是失败状态",404);
+
+  const laterSuccess=await env.DB.prepare(
+    `SELECT id FROM telegram_delivery_logs
+     WHERE status='success'
+       AND customer_id IS ?
+       AND progress_id IS ?
+       AND created_at>?
+     ORDER BY created_at DESC LIMIT 1`
+  ).bind(log.customer_id,log.progress_id,log.created_at).first();
+  if(laterSuccess)return fail("这条通知后续已经发送成功，请刷新列表",409);
+
+  const existingQueue=await env.DB.prepare(
+    `SELECT id FROM telegram_send_queue
+     WHERE customer_id IS ? AND progress_id IS ? AND created_at>=?
+     ORDER BY created_at DESC LIMIT 1`
+  ).bind(log.customer_id,log.progress_id,log.created_at).first();
+  if(existingQueue)return retryTelegramQueueItem(env,user,existingQueue.id,ctx);
+
+  if(!log.customer_id||!log.progress_id)return fail("这条历史记录缺少客户或进度信息，无法重新生成通知",409);
+
+  const [settings,customer,progress,actor]=await Promise.all([
+    telegramSettingsRow(env),
+    env.DB.prepare(
+      "SELECT id,progress_done,progress_total,progress_percent FROM customers WHERE id=?"
+    ).bind(log.customer_id).first(),
+    env.DB.prepare(
+      "SELECT id,label,description,color,sort_order FROM progress_definitions WHERE id=?"
+    ).bind(log.progress_id).first(),
+    log.actor_user_id
+      ?env.DB.prepare("SELECT * FROM users WHERE id=?").bind(log.actor_user_id).first()
+      :Promise.resolve(null)
+  ]);
+
+  if(!settings?.enabled)return fail("Telegram 自动通知当前已关闭，请先启用后再重新发送",409);
+  if(!settings?.bot_token_enc)return fail("Telegram Bot Token 未设置，请先保存 Token 后再重新发送",409);
+  if(!customer)return fail("对应客户已经不存在，无法重新发送",409);
+  if(!progress)return fail("对应客户进度已经不存在，无法重新发送",409);
+
+  const actorUser=actor||user;
+  const summary={
+    done:Number(customer.progress_done||0),
+    total:Number(customer.progress_total||0),
+    percent:Number(customer.progress_percent||0)
+  };
+  const result=await sendTelegramProgressNotification(
+    request,env,actorUser,log.customer_id,progress,summary,
+    "manual:"+id+":"+now(),
+    {manual:true}
+  );
+
+  const reasonMap={
+    disabled:"Telegram 自动通知当前已关闭，请先启用",
+    token_missing:"Telegram Bot Token 未设置，请先保存 Token",
+    no_target:"这个进度没有可用的通知群，请先设置默认群或指定群",
+    customer_missing:"对应客户已经不存在",
+    duplicate:"这条消息已经重新进入发送流程"
+  };
+  if(!result?.ok){
+    return fail(reasonMap[result?.reason]||"当前无法重新发送这条通知，请检查 Telegram 设置",409);
+  }
+
+  await audit(env,user,"retry","telegram_delivery",id,{
+    originalStatus:log.status,
+    originalError:String(log.error_text||"").slice(0,500),
+    customerId:log.customer_id,
+    progressId:log.progress_id
+  });
+
+  const job=processTelegramQueue(env,{maxItems:2,maxRunMs:8000,allowShortWait:false}).catch(()=>{});
+  if(ctx?.waitUntil)ctx.waitUntil(job);
+  else await job;
+  return responseJson({ok:true,id,message:"已重新进入发送流程"});
+}
+
 async function bumpVersion(env, key) {
   const t = now();
   await env.DB.prepare(
@@ -4158,9 +4326,12 @@ async function api(request, env, ctx) {
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
   if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
+  if (path === "/api/admin/telegram/unresolved" && method === "GET") return responseJson({ok:true,...await telegramUnresolvedItems(env,200)});
   if (path === "/api/admin/telegram/logs" && method === "GET") return telegramLogs(request,env);
   m=path.match(/^\/api\/admin\/telegram\/queue\/([^/]+)\/retry$/);
   if(m && method==="POST") return retryTelegramQueueItem(env,user,m[1],ctx);
+  m=path.match(/^\/api\/admin\/telegram\/delivery\/([^/]+)\/retry$/);
+  if(m && method==="POST") return retryTelegramDeliveryLog(request,env,user,m[1],ctx);
   if (path === "/api/admin/telegram" && method === "PUT") return telegramAdminSave(request,env,user);
   if (path === "/api/admin/telegram/test" && method === "POST") return telegramAdminTest(request,env,user);
   if (path === "/api/admin/registration-layout" && method === "GET") return adminRegistrationLayout(env);
