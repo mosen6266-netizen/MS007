@@ -626,11 +626,12 @@ async function renderFields(view){
   view.innerHTML=pageHead("登记字段管理","添加、编辑、排序并决定哪些字段显示在客户列表",`<button class="btn" id="addField">＋ 添加字段</button>`)+
     `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>名称</th><th>类型</th><th>必填</th><th>列表显示</th><th>可搜索</th><th>状态</th><th>操作</th></tr></thead><tbody>
     ${items.map(f=>`<tr><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(fieldTypeName[f.field_type]||f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button> <button class="btn danger small" data-del-field="${esc(f.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
-  document.querySelector("#addField").onclick=()=>fieldModal(view,null);
+  const nextFieldSort=(items.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0))+1;
+  document.querySelector("#addField").onclick=()=>fieldModal(view,null,nextFieldSort);
   document.querySelectorAll("[data-edit-field]").forEach(b=>b.onclick=()=>fieldModal(view,items.find(x=>x.id===b.dataset.editField)));
   document.querySelectorAll("[data-del-field]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/fields/"+b.dataset.delField,{method:"DELETE"});toast("字段已停用");renderFields(view)}catch(e){toast(e.message)}});
 }
-function fieldModal(view,f){
+function fieldModal(view,f,nextSort=1){
   let fieldOptions=[];
   try{
     const parsed=JSON.parse(f?.options_json||"[]");
@@ -660,7 +661,7 @@ function fieldModal(view,f){
       <label><input type="checkbox" id="fSearch" ${f?.searchable!==0?"checked":""}> 可搜索</label>
       <label><input type="checkbox" id="fEnabled" ${f?.enabled!==0?"checked":""}> 启用</label>
     </div>
-    <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="fSort" type="number" value="${f?.sort_order??100}"></div>
+    <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="fSort" type="number" value="${f?.sort_order??nextSort}"></div>
     <button class="btn full" id="fSave">保存</button>`,()=>{
       const typeEl=document.querySelector("#fType");
       const box=document.querySelector("#fOptionsBox");
