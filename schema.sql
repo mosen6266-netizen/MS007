@@ -262,3 +262,7 @@ CREATE INDEX IF NOT EXISTS idx_telegram_delivery_created ON telegram_delivery_lo
 INSERT OR IGNORE INTO sidebar_items
 (id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
 ('sa_telegram','admin','Telegram 通知','link','#/admin/telegram','same',1,75,'通知',datetime('now'),datetime('now'));
+
+
+CREATE INDEX IF NOT EXISTS idx_customer_progress_progress_completed
+ON customer_progress(progress_id, completed, completed_at);
