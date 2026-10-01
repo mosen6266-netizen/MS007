@@ -78,19 +78,42 @@ async function readBody(request) {
 }
 
 async function authUser(request, env) {
-  const sid = parseCookies(request).sid;
-  if (!sid) return null;
-  const tokenHash = await sha256Hex(sid);
-  const row = await env.DB.prepare(
-    `SELECT u.id,u.username,u.display_name,u.role,u.active,s.expires_at
-     FROM sessions s JOIN users u ON u.id=s.user_id
-     WHERE s.token_hash=? AND s.expires_at > ? AND u.active=1`
-  ).bind(tokenHash, now()).first();
-  return row || null;
+  const cookies=parseCookies(request);
+  const requestedRole=normalizedRole(request.headers.get("x-ms007-role"));
+  const candidates=[];
+
+  if(requestedRole){
+    if(cookies["sid_"+requestedRole]) candidates.push(cookies["sid_"+requestedRole]);
+    // Backward compatibility with sessions created before role-separated cookies.
+    if(cookies.sid) candidates.push(cookies.sid);
+  }else{
+    if(cookies.sid_admin) candidates.push(cookies.sid_admin);
+    if(cookies.sid_sales) candidates.push(cookies.sid_sales);
+    if(cookies.sid) candidates.push(cookies.sid);
+  }
+
+  for(const sid of [...new Set(candidates.filter(Boolean))]){
+    const tokenHash=await sha256Hex(sid);
+    const row=await env.DB.prepare(
+      `SELECT u.id,u.username,u.display_name,u.role,u.active,s.expires_at
+       FROM sessions s JOIN users u ON u.id=s.user_id
+       WHERE s.token_hash=? AND s.expires_at > ? AND u.active=1`
+    ).bind(tokenHash,now()).first();
+    if(!row)continue;
+    row.role=normalizedRole(row.role);
+    if(requestedRole && row.role!==requestedRole)continue;
+    return row;
+  }
+  return null;
+}
+
+function normalizedRole(value) {
+  const role=String(value||"").trim().toLowerCase();
+  return role==="admin"?"admin":role==="sales"?"sales":"";
 }
 
 function requireRole(user, role) {
-  return user && user.role === role;
+  return !!user && normalizedRole(user.role)===normalizedRole(role);
 }
 
 async function audit(env, user, action, entityType, entityId = null, detail = {}) {
@@ -348,7 +371,7 @@ async function logTelegramDelivery(env,{customerId,actorUserId,progressId,status
 async function sendTelegramProgressNotification(request,env,user,customerId,progressDef,summary){
   const row=await telegramSettingsRow(env);
   if(!row.enabled)return;
-  if(user.role==="admin"&&!row.notify_admin)return;
+  if(normalizedRole(user.role)==="admin"&&!row.notify_admin)return;
   if(!row.bot_token_enc||!row.chat_id){
     await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"Telegram 设置不完整"});
     return;
@@ -561,14 +584,15 @@ async function handleLogin(request, env) {
   const body = await readBody(request);
   const username = String(body.username || "").trim();
   const password = String(body.password || "");
-  const wantedRole = body.role === "admin" ? "admin" : body.role === "sales" ? "sales" : null;
+  const wantedRole = normalizedRole(body.role) || null;
   const u = await env.DB.prepare(
     "SELECT * FROM users WHERE username=? AND active=1"
   ).bind(username).first();
   if (!u) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
   const hash = await derivePassword(password, u.password_salt, Number(u.password_iterations || 100000));
   if (hash !== u.password_hash) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
-  if (wantedRole && u.role !== wantedRole) return fail("该账号没有这个入口的权限", 403, "WRONG_ROLE");
+  const actualRole=normalizedRole(u.role);
+  if (wantedRole && actualRole !== wantedRole) return fail("该账号没有这个入口的权限", 403, "WRONG_ROLE");
 
   const rawToken = newSessionToken();
   const tokenHash = await sha256Hex(rawToken);
@@ -578,22 +602,26 @@ async function handleLogin(request, env) {
     "INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)"
   ).bind(tokenHash, u.id, expires, now()).run();
   await audit(env, u, "login", "session", null, {});
-  const cookie = `sid=${encodeURIComponent(rawToken)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${days * 86400}`;
+  const cookieName=actualRole==="admin"?"sid_admin":"sid_sales";
+  const cookie = `${cookieName}=${encodeURIComponent(rawToken)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${days * 86400}`;
   return responseJson({
     ok: true,
-    user: { id: u.id, username: u.username, displayName: u.display_name, role: u.role }
+    user: { id: u.id, username: u.username, displayName: u.display_name, role: actualRole }
   }, 200, { "set-cookie": cookie });
 }
 
 async function handleLogout(request, env, user) {
-  const sid = parseCookies(request).sid;
-  if (sid) {
-    const hash = await sha256Hex(sid);
+  const cookies=parseCookies(request);
+  const role=normalizedRole(user?.role);
+  const cookieName=role==="admin"?"sid_admin":"sid_sales";
+  const sid=cookies[cookieName]||cookies.sid;
+  if(sid){
+    const hash=await sha256Hex(sid);
     await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(hash).run();
   }
-  await audit(env, user, "logout", "session", null, {});
-  return responseJson({ ok: true }, 200, {
-    "set-cookie": "sid=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
+  await audit(env,user,"logout","session",null,{});
+  return responseJson({ok:true},200,{
+    "set-cookie":cookieName+"=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
   });
 }
 
@@ -608,7 +636,7 @@ async function listCustomers(request, env, user) {
   const where = ["c.deleted_at IS NULL", "c.archived=?"];
   const binds = [archived];
 
-  if (user.role === "sales") {
+  if (normalizedRole(user.role) === "sales") {
     where.push("c.assigned_user_id=?");
     binds.push(user.id);
   } else if (owner) {
@@ -723,7 +751,7 @@ async function getCustomer(env, user, id) {
      WHERE c.id=? AND c.deleted_at IS NULL`
   ).bind(id).first();
   if (!row) return fail("客户不存在", 404, "NOT_FOUND");
-  if (user.role === "sales" && row.assigned_user_id !== user.id) return fail("无权查看该客户", 403, "FORBIDDEN");
+  if (normalizedRole(user.role) === "sales" && row.assigned_user_id !== user.id) return fail("无权查看该客户", 403, "FORBIDDEN");
 
   const fields = await env.DB.prepare(
     "SELECT * FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
@@ -765,7 +793,7 @@ async function createCustomer(request, env, user) {
   const body = await readBody(request);
   const name = String(body.name || "").trim();
   if (!name) return fail("请输入客户姓名");
-  let assigned = user.role === "sales" ? user.id : String(body.assignedUserId || "").trim() || null;
+  let assigned = normalizedRole(user.role) === "sales" ? user.id : String(body.assignedUserId || "").trim() || null;
   if (assigned) {
     const owner = await env.DB.prepare("SELECT id FROM users WHERE id=? AND role='sales' AND active=1").bind(assigned).first();
     if (!owner) return fail("指定的业务员不存在");
@@ -794,12 +822,12 @@ async function createCustomer(request, env, user) {
 async function updateCustomer(request, env, user, id) {
   const current = await env.DB.prepare("SELECT * FROM customers WHERE id=? AND deleted_at IS NULL").bind(id).first();
   if (!current) return fail("客户不存在", 404);
-  if (user.role === "sales" && current.assigned_user_id !== user.id) return fail("无权修改该客户", 403);
+  if (normalizedRole(user.role) === "sales" && current.assigned_user_id !== user.id) return fail("无权修改该客户", 403);
 
   const body = await readBody(request);
   const name = body.name !== undefined ? String(body.name).trim() : current.name;
   let assigned = current.assigned_user_id;
-  if (user.role === "admin" && body.assignedUserId !== undefined) assigned = body.assignedUserId || null;
+  if (normalizedRole(user.role) === "admin" && body.assignedUserId !== undefined) assigned = body.assignedUserId || null;
   const archived = body.archived !== undefined ? (body.archived ? 1 : 0) : current.archived;
   const t = now();
   await env.DB.prepare(
@@ -823,7 +851,7 @@ async function updateCustomer(request, env, user, id) {
 async function toggleProgress(request, env, user, customerId, progressId, ctx) {
   const customer = await env.DB.prepare("SELECT * FROM customers WHERE id=? AND deleted_at IS NULL").bind(customerId).first();
   if (!customer) return fail("客户不存在", 404);
-  if (user.role === "sales" && customer.assigned_user_id !== user.id) return fail("无权修改该客户", 403);
+  if (normalizedRole(user.role) === "sales" && customer.assigned_user_id !== user.id) return fail("无权修改该客户", 403);
 
   const pd = await env.DB.prepare("SELECT id,label,description,color,sort_order FROM progress_definitions WHERE id=? AND enabled=1").bind(progressId).first();
   if (!pd) return fail("进度项目不存在", 404);
@@ -854,7 +882,7 @@ async function toggleProgress(request, env, user, customerId, progressId, ctx) {
 }
 
 async function listFields(env, user) {
-  const sql = user.role === "admin"
+  const sql = normalizedRole(user.role) === "admin"
     ? "SELECT * FROM field_definitions ORDER BY sort_order,label"
     : "SELECT * FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label";
   const r = await env.DB.prepare(sql).all();
@@ -906,7 +934,7 @@ async function updateField(request, env, user, id) {
 }
 
 async function listProgressDefs(env, user) {
-  const sql = user.role==="admin"
+  const sql = normalizedRole(user.role)==="admin"
     ? "SELECT * FROM progress_definitions ORDER BY sort_order,label"
     : "SELECT * FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label";
   const r=await env.DB.prepare(sql).all();
@@ -1186,8 +1214,8 @@ async function updateSidebarItem(request, env, user, id) {
 }
 
 async function stats(env, user) {
-  const where=user.role==="sales"?"deleted_at IS NULL AND assigned_user_id=?":"deleted_at IS NULL";
-  const bind=user.role==="sales"?[user.id]:[];
+  const where=normalizedRole(user.role)==="sales"?"deleted_at IS NULL AND assigned_user_id=?":"deleted_at IS NULL";
+  const bind=normalizedRole(user.role)==="sales"?[user.id]:[];
   const base=await env.DB.prepare(
     `SELECT COUNT(*) total,
       SUM(CASE WHEN date(created_at)=date('now') THEN 1 ELSE 0 END) today,
@@ -1196,7 +1224,7 @@ async function stats(env, user) {
      FROM customers WHERE ${where}`
   ).bind(...bind).first();
   let sales=[];
-  if(user.role==="admin"){
+  if(normalizedRole(user.role)==="admin"){
     const r=await env.DB.prepare(
       `SELECT u.id,u.display_name,COUNT(c.id) customer_count,
        COALESCE(ROUND(AVG(c.progress_percent)),0) avg_progress
@@ -1383,7 +1411,7 @@ async function finishImport(env,user){
 async function softDeleteCustomer(env,user,id){
   const row=await env.DB.prepare("SELECT id,assigned_user_id FROM customers WHERE id=? AND deleted_at IS NULL").bind(id).first();
   if(!row)return fail("客户不存在",404);
-  if(user.role==="sales" && row.assigned_user_id!==user.id) return fail("无权删除该客户",403);
+  if(normalizedRole(user.role)==="sales" && row.assigned_user_id!==user.id) return fail("无权删除该客户",403);
   await env.DB.prepare("UPDATE customers SET deleted_at=?,updated_at=? WHERE id=?").bind(now(),now(),id).run();
   await audit(env,user,"delete","customer",id,{soft:true});
   return responseJson({ok:true});
@@ -1540,7 +1568,7 @@ async function api(request, env, ctx) {
   if (!user) return fail("请先登录", 401, "UNAUTHENTICATED");
 
   if (path === "/api/me" && method === "GET") return responseJson({ok:true,user:{
-    id:user.id,username:user.username,displayName:user.display_name,role:user.role
+    id:user.id,username:user.username,displayName:user.display_name,role:normalizedRole(user.role)
   }});
   if (path === "/api/logout" && method === "POST") return handleLogout(request, env, user);
   if (path === "/api/sidebar" && method === "GET") return listSidebar(env,user);
