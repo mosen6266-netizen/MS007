@@ -222,3 +222,8 @@ INSERT OR IGNORE INTO sidebar_items
 ('sa_audit','admin','操作记录','list-plus','#/admin/audit','same',1,80,'系统',datetime('now'),datetime('now')),
 ('sa_recycle','admin','回收站','database','#/admin/recycle','same',1,90,'系统',datetime('now'),datetime('now')),
 ('sa_backup','admin','数据备份','database','#/admin/backup','same',1,100,'系统',datetime('now'),datetime('now'));
+
+
+INSERT OR IGNORE INTO sidebar_items
+(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
+('sa_reglayout','admin','登记面板设置','list-plus','#/admin/registration-layout','same',1,58,'管理',datetime('now'),datetime('now'));
