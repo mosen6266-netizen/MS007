@@ -155,3 +155,14 @@ jobs:
           done
           cat /tmp/health.json
           curl -fsS "$URL/api/bootstrap-status"
+          echo
+          curl -fsS -H "x-bootstrap-token: $BOOTSTRAP_TOKEN" "$URL/api/bootstrap-token-check" > /tmp/bootstrap-token-check.json
+          cat /tmp/bootstrap-token-check.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const x=JSON.parse(fs.readFileSync('/tmp/bootstrap-token-check.json','utf8'));
+          if(!x.configured || !x.valid){
+            console.error("BOOTSTRAP_TOKEN is not configured or does not match the GitHub secret.");
+            process.exit(1);
+          }
+          NODE
