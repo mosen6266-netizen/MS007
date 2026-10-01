@@ -845,3 +845,48 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
 @media(max-width:620px){
   .audit-detail-meta{grid-template-columns:1fr}
 }
+
+
+/* MS007 brand assets */
+.boot-logo{
+  width:64px;
+  height:64px;
+  object-fit:contain;
+  display:block;
+  margin:0 auto 2px;
+}
+.brand-logo-home{
+  width:min(360px,78vw);
+  height:auto;
+  display:block;
+  margin:0 auto 10px;
+}
+.brand-system-name{
+  font-size:26px;
+  line-height:1.2;
+  font-weight:800;
+  margin:0 0 10px;
+}
+.login-brand-logo{
+  width:190px;
+  max-width:62%;
+  height:auto;
+  display:block;
+  margin:0 auto 22px;
+}
+.sidebar-brand-logo{
+  width:150px;
+  max-width:100%;
+  height:auto;
+  display:block;
+  margin:0 0 7px;
+  filter:brightness(0) invert(1);
+}
+.sidebar .logo small{
+  margin-top:2px;
+}
+@media(max-width:620px){
+  .brand-logo-home{width:min(300px,82vw)}
+  .brand-system-name{font-size:22px}
+  .login-brand-logo{width:170px;max-width:68%}
+}
