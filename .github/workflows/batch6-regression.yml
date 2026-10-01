@@ -1,0 +1,25 @@
+name: MS007 Batch 6 Regression
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - upgrade/batch6-governance
+    paths:
+      - "tests/**"
+      - ".github/workflows/batch6-regression.yml"
+
+jobs:
+  batch6-regression:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run Batch 6 business regression
+        run: python tests/batch6_business_regression.py
