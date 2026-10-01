@@ -1,0 +1,18 @@
+{
+  "version": "MS007-Batch6",
+  "purpose": "Deployment rollback protection checkpoint",
+  "customer_data_modified": false,
+  "production_records_touched": false,
+  "schema_migration_required": false,
+  "checkpoint_policy": {
+    "create_before_deploy": true,
+    "verify_database_state": true,
+    "preserve_customer_records": true,
+    "allow_code_only_rollback": true
+  },
+  "rollback_strategy": {
+    "restore_previous_release": true,
+    "restore_data_snapshot_before_schema_changes": true,
+    "block_unsafe_deployment": true
+  }
+}
