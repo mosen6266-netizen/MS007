@@ -66,7 +66,7 @@ for token in [
     "l.status IN ('failed','skipped')",
     "s.status='success'",
     "NOT EXISTS",
-    "q2.created_at>=l.created_at",
+    "q2.progress_id IS l.progress_id",
 ]:
     assert token in unresolved,token
 
