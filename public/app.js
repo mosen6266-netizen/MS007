@@ -1,0 +1,533 @@
+
+const app = document.querySelector("#app");
+const toastEl = document.querySelector("#toast");
+
+const state = {
+  user: null,
+  sidebar: [],
+  sidebarVersion: 0,
+  fields: [],
+  sales: [],
+  sidebarTimer: null,
+};
+
+const iconMap = {
+  "layout-dashboard":"▦","users":"👥","user-cog":"⚙","list-plus":"☷","check-circle":"✓",
+  "panel-left":"☰","database":"◫","user-plus":"＋","link":"↗","circle":"•"
+};
+
+function esc(v=""){
+  return String(v).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[c]));
+}
+function toast(msg){
+  toastEl.textContent=msg; toastEl.classList.add("show");
+  clearTimeout(toastEl._t); toastEl._t=setTimeout(()=>toastEl.classList.remove("show"),2200);
+}
+async function api(path, options={}){
+  const opts={credentials:"same-origin",...options};
+  if(opts.body && typeof opts.body!=="string"){
+    opts.headers={...(opts.headers||{}),"content-type":"application/json"};
+    opts.body=JSON.stringify(opts.body);
+  }
+  const res=await fetch(path,opts);
+  const data=await res.json().catch(()=>({message:"系统返回了无法识别的内容"}));
+  if(!res.ok){
+    const e=new Error(data.message||"操作失败"); e.status=res.status; e.code=data.code; throw e;
+  }
+  return data;
+}
+function pageHead(title, sub="", right=""){
+  return `<div class="page-head"><div><h1>${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:""}</div><div>${right}</div></div>`;
+}
+function progressTone(p){
+  if(p>=100)return "#dcfce7";
+  if(p>=80)return "#ede9fe";
+  if(p>=60)return "#dbeafe";
+  if(p>=40)return "#fef3c7";
+  if(p>=20)return "#ffedd5";
+  return "#fee2e2";
+}
+function money(v){ return new Intl.NumberFormat("zh-CN").format(Number(v||0)); }
+
+async function bootstrap(){
+  try{
+    const me=await api("/api/me");
+    state.user=me.user;
+    await enterApp();
+  }catch(e){
+    renderHome();
+  }
+}
+function renderHome(){
+  stopSidebarSync();
+  state.user=null;
+  app.innerHTML=`
+    <main class="home">
+      <div class="home-box">
+        <div class="brand">
+          <h1>MS007 客户登记系统</h1>
+          <p>请选择你的入口</p>
+        </div>
+        <div class="entry-grid">
+          <section class="entry-card">
+            <div class="entry-icon">👤</div>
+            <h2>业务员入口</h2>
+            <p>登记和管理自己的客户，查看客户进度并完成每个步骤。</p>
+            <button class="btn full" data-login="sales">进入业务员系统</button>
+          </section>
+          <section class="entry-card">
+            <div class="entry-icon">🛡️</div>
+            <h2>管理员入口</h2>
+            <p>查看全部客户、业务员、仪表盘和系统配置。</p>
+            <button class="btn full" data-login="admin">进入管理员后台</button>
+          </section>
+        </div>
+      </div>
+    </main>`;
+  app.querySelectorAll("[data-login]").forEach(b=>b.onclick=()=>renderLogin(b.dataset.login));
+}
+async function renderLogin(role){
+  let needsBootstrap=false;
+  try{ needsBootstrap=(await api("/api/bootstrap-status")).needsBootstrap; }catch{}
+  const roleName=role==="admin"?"管理员":"业务员";
+  app.innerHTML=`
+    <main class="login-wrap">
+      <section class="login-card">
+        <button class="back" id="backHome">← 返回入口</button>
+        <h2>${roleName}登录</h2>
+        <div class="sub">使用你的 ${roleName} 账号进入系统</div>
+        ${needsBootstrap&&role==="admin"?`<div class="notice warning" style="margin-bottom:14px">系统尚未完成首次管理员初始化。部署完成后会由系统配置，不需要你写代码。</div>`:""}
+        <form id="loginForm">
+          <div class="field"><label>账号</label><input class="input" name="username" autocomplete="username" required></div>
+          <div class="field"><label>密码</label><input class="input" type="password" name="password" autocomplete="current-password" required></div>
+          <button class="btn full" type="submit">登录</button>
+        </form>
+      </section>
+    </main>`;
+  document.querySelector("#backHome").onclick=renderHome;
+  document.querySelector("#loginForm").onsubmit=async e=>{
+    e.preventDefault();
+    const fd=new FormData(e.currentTarget);
+    try{
+      const r=await api("/api/login",{method:"POST",body:{username:fd.get("username"),password:fd.get("password"),role}});
+      state.user=r.user; location.hash=`#/${role}/dashboard`; await enterApp();
+    }catch(err){toast(err.message);}
+  };
+}
+async function enterApp(){
+  await refreshSidebar(true);
+  startSidebarSync();
+  if(!location.hash.startsWith("#/")){
+    location.hash=`#/${state.user.role}/dashboard`;
+  }
+  await renderShell();
+}
+async function refreshSidebar(force=false){
+  if(!state.user)return;
+  try{
+    const r=await api("/api/sidebar");
+    if(force || Number(r.version)!==Number(state.sidebarVersion)){
+      state.sidebar=r.items||[]; state.sidebarVersion=Number(r.version||0);
+      if(!force && document.querySelector(".sidebar")) renderSidebarOnly();
+    }
+  }catch{}
+}
+function startSidebarSync(){
+  stopSidebarSync();
+  state.sidebarTimer=setInterval(()=>{ if(document.visibilityState==="visible")refreshSidebar(false); },60000);
+  document.addEventListener("visibilitychange",onVisible);
+}
+function stopSidebarSync(){
+  if(state.sidebarTimer)clearInterval(state.sidebarTimer);
+  state.sidebarTimer=null; document.removeEventListener("visibilitychange",onVisible);
+}
+function onVisible(){ if(document.visibilityState==="visible")refreshSidebar(false); }
+
+function sideHtml(){
+  let currentGroup=null, html="";
+  for(const item of state.sidebar){
+    const g=item.group_label||"";
+    if(g!==currentGroup){ currentGroup=g; if(g)html+=`<div class="side-group">${esc(g)}</div>`; }
+    const icon=iconMap[item.icon]||"•";
+    const active=item.url.startsWith("#/")&&location.hash===item.url?"active":"";
+    html+=`<a class="side-link ${active}" href="${esc(item.url)}" ${item.target==="new"?'target="_blank" rel="noopener"':""}>
+      <span class="side-icon">${esc(icon)}</span><span>${esc(item.label)}</span></a>`;
+  }
+  return html;
+}
+function renderSidebarOnly(){
+  const box=document.querySelector("#sideNav"); if(box)box.innerHTML=sideHtml();
+}
+async function renderShell(){
+  const roleLabel=state.user.role==="admin"?"管理员":"业务员";
+  app.innerHTML=`
+    <div class="shell">
+      <aside class="sidebar">
+        <div class="logo"><strong>MS007</strong><small>${roleLabel}系统</small></div>
+        <nav id="sideNav">${sideHtml()}</nav>
+        <div class="side-footer"><button class="btn ghost small full" id="logoutBtn">退出登录</button></div>
+      </aside>
+      <section class="main">
+        <header class="topbar">
+          <div id="systemMini"></div>
+          <div class="user-chip"><div class="avatar">${esc((state.user.displayName||"U").slice(0,1))}</div><div><strong>${esc(state.user.displayName)}</strong><div class="muted" style="font-size:12px">${roleLabel}</div></div></div>
+        </header>
+        <div class="content" id="view"><div class="boot" style="height:50vh"><div class="spinner"></div></div></div>
+      </section>
+    </div>`;
+  document.querySelector("#logoutBtn").onclick=logout;
+  if(state.user.role==="admin") refreshMiniStatus();
+  await renderRoute();
+}
+async function refreshMiniStatus(){
+  try{
+    const r=await api("/api/admin/capacity");
+    const cls=r.level==="normal"?"":r.level==="warning"?"warn":"bad";
+    document.querySelector("#systemMini").innerHTML=`<a href="#/admin/capacity" class="status-pill ${cls}" style="text-decoration:none">● 系统状态：${r.level==="normal"?"正常":"需要关注"}</a>`;
+  }catch{}
+}
+async function logout(){
+  try{await api("/api/logout",{method:"POST"});}catch{}
+  location.hash=""; renderHome();
+}
+window.addEventListener("hashchange",()=>{ if(state.user){renderSidebarOnly();renderRoute();} });
+
+async function renderRoute(){
+  const view=document.querySelector("#view"); if(!view)return;
+  const parts=location.hash.replace(/^#\//,"").split("/");
+  const role=parts[0], page=parts[1]||"dashboard", id=parts[2];
+  if(role!==state.user.role){
+    location.hash=`#/${state.user.role}/dashboard`; return;
+  }
+  view.innerHTML=`<div class="boot" style="height:50vh"><div class="spinner"></div></div>`;
+  try{
+    if(page==="dashboard")return renderDashboard(view);
+    if(page==="customers")return renderCustomers(view);
+    if(page==="new")return renderCustomerForm(view);
+    if(page==="customer"&&id)return renderCustomerDetail(view,id);
+    if(role==="admin"&&page==="sales")return renderSales(view);
+    if(role==="admin"&&page==="fields")return renderFields(view);
+    if(role==="admin"&&page==="progress")return renderProgressAdmin(view);
+    if(role==="admin"&&page==="sidebar")return renderSidebarAdmin(view);
+    if(role==="admin"&&page==="capacity")return renderCapacity(view);
+    view.innerHTML=pageHead("页面不存在");
+  }catch(err){
+    if(err.status===401){renderHome();return;}
+    view.innerHTML=`<div class="notice urgent">${esc(err.message)}</div>`;
+  }
+}
+
+async function renderDashboard(view){
+  const r=await api("/api/stats");
+  const s=r.summary;
+  let capacityHtml="";
+  if(state.user.role==="admin"){
+    const c=await api("/api/admin/capacity");
+    if(c.level!=="normal"){
+      capacityHtml=`<div class="notice ${c.level==="warning"?"warning":"urgent"}" style="margin-bottom:16px"><strong>系统容量提醒：</strong> ${esc(c.message)} <a href="#/admin/capacity">查看详情</a></div>`;
+    }
+  }
+  view.innerHTML=
+    pageHead("仪表盘",state.user.role==="admin"?"查看整个团队的客户情况":"查看你的客户情况")+
+    capacityHtml+
+    `<div class="grid metrics">
+      <div class="card metric"><div class="label">${state.user.role==="admin"?"客户总数":"我的客户"}</div><div class="value">${money(s.total)}</div></div>
+      <div class="card metric"><div class="label">今日新增</div><div class="value">${money(s.today)}</div></div>
+      <div class="card metric"><div class="label">已完成</div><div class="value">${money(s.completed)}</div></div>
+      <div class="card metric"><div class="label">已归档</div><div class="value">${money(s.archived)}</div></div>
+    </div>
+    ${state.user.role==="admin"?`
+      <div class="card" style="margin-top:18px">
+        <h3 style="margin-top:0">业务员客户分布</h3>
+        <div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead>
+        <tbody>${(r.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">还没有业务员</td></tr>`}</tbody></table></div>
+      </div>`:""}`;
+}
+
+async function getSales(){
+  if(state.user.role!=="admin")return[];
+  const r=await api("/api/admin/users");
+  state.sales=(r.items||[]).filter(x=>x.role==="sales"&&x.active);
+  return state.sales;
+}
+async function renderCustomers(view){
+  const sales=state.user.role==="admin"?await getSales():[];
+  view.innerHTML=
+    pageHead(state.user.role==="admin"?"全部客户":"我的客户","每次只读取当前需要的数据，避免客户数量增加后卡顿",
+      `<button class="btn" id="newCustomer">＋ 登记客户</button>`)+
+    `<div class="toolbar">
+      <input class="input" id="searchCustomer" placeholder="搜索姓名、案件编号或其他可搜索字段">
+      ${state.user.role==="admin"?`<select class="input" id="ownerFilter"><option value="">全部业务员</option>${sales.map(x=>`<option value="${esc(x.id)}">${esc(x.display_name)}</option>`).join("")}</select>`:""}
+      <button class="btn secondary" id="searchBtn">搜索</button>
+    </div>
+    <div id="customerResults"></div>`;
+  document.querySelector("#newCustomer").onclick=()=>location.hash=`#/${state.user.role}/new`;
+  document.querySelector("#searchBtn").onclick=()=>loadCustomerPage(true);
+  document.querySelector("#searchCustomer").onkeydown=e=>{if(e.key==="Enter")loadCustomerPage(true)};
+  if(document.querySelector("#ownerFilter"))document.querySelector("#ownerFilter").onchange=()=>loadCustomerPage(true);
+  await loadCustomerPage(true);
+}
+let customerPageState={cursor:null,loading:false,items:[]};
+async function loadCustomerPage(reset){
+  if(customerPageState.loading)return;
+  customerPageState.loading=true;
+  const host=document.querySelector("#customerResults"); if(!host)return;
+  if(reset){customerPageState={cursor:null,loading:true,items:[]};host.innerHTML=`<div class="boot" style="height:30vh"><div class="spinner"></div></div>`;}
+  const q=document.querySelector("#searchCustomer")?.value||"";
+  const owner=document.querySelector("#ownerFilter")?.value||"";
+  try{
+    const qs=new URLSearchParams({limit:"50"}); if(q)qs.set("q",q); if(owner)qs.set("owner",owner); if(customerPageState.cursor)qs.set("cursor",customerPageState.cursor);
+    const r=await api("/api/customers?"+qs.toString());
+    customerPageState.items.push(...r.items); customerPageState.cursor=r.nextCursor;
+    renderCustomerCards(host,customerPageState.items,r.visibleFields||[],!!r.nextCursor);
+  }catch(e){host.innerHTML=`<div class="notice urgent">${esc(e.message)}</div>`;}
+  customerPageState.loading=false;
+}
+function renderCustomerCards(host,items,fields,hasMore){
+  if(!items.length){host.innerHTML=`<div class="empty card">还没有客户资料</div>`;return;}
+  host.innerHTML=`<div class="customer-grid">${items.map(c=>{
+    const meta=[];
+    if(state.user.role==="admin"&&c.ownerName)meta.push(`<div>业务员：${esc(c.ownerName)}</div>`);
+    for(const f of fields){const v=c.values?.[f.id];if(v)meta.push(`<div>${esc(f.label)}：${esc(v)}</div>`);}
+    return `<article class="customer-card" data-cid="${esc(c.id)}" style="--pct:${Number(c.progressPercent||0)}%;--progress-color:${progressTone(Number(c.progressPercent||0))}">
+      <h3>${esc(c.name)}</h3><div class="customer-meta">${meta.join("")||'<span class="muted">暂无其他列表字段</span>'}</div>
+      <div class="customer-progress"><span>${c.progressDone}/${c.progressTotal} 个步骤</span><span class="pct">${c.progressPercent}%</span></div>
+    </article>`;
+  }).join("")}</div>${hasMore?`<div style="text-align:center;margin:18px"><button class="btn secondary" id="loadMore">加载更多</button></div>`:""}`;
+  host.querySelectorAll("[data-cid]").forEach(x=>x.onclick=()=>location.hash=`#/${state.user.role}/customer/${x.dataset.cid}`);
+  const more=document.querySelector("#loadMore"); if(more)more.onclick=()=>loadCustomerPage(false);
+}
+
+function inputForField(f,value=""){
+  let options=[];try{options=JSON.parse(f.options_json||"[]")}catch{}
+  if(f.field_type==="textarea")return `<textarea class="input dyn" data-field="${esc(f.id)}">${esc(value)}</textarea>`;
+  if(["select","single"].includes(f.field_type))return `<select class="input dyn" data-field="${esc(f.id)}"><option value="">请选择</option>${options.map(o=>`<option ${String(o)===String(value)?"selected":""}>${esc(o)}</option>`).join("")}</select>`;
+  const type=({email:"email",phone:"tel",number:"number",date:"date",time:"time",url:"url"}[f.field_type]||"text");
+  return `<input class="input dyn" data-field="${esc(f.id)}" type="${type}" value="${esc(value)}" ${f.required?"required":""}>`;
+}
+async function renderCustomerForm(view){
+  const [fr,sales]=await Promise.all([api("/api/fields"),state.user.role==="admin"?getSales():Promise.resolve([])]);
+  const fields=fr.items||[];
+  view.innerHTML=pageHead("登记客户","管理员以后新增的登记字段会自动出现在这里")+
+    `<div class="card"><form id="customerForm"><div class="form-grid">
+      <div class="field"><label>客户姓名 *</label><input class="input" name="name" required></div>
+      ${state.user.role==="admin"?`<div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${sales.map(x=>`<option value="${esc(x.id)}">${esc(x.display_name)}</option>`).join("")}</select></div>`:""}
+      ${fields.map(f=>`<div class="field ${f.field_type==="textarea"?"span2":""}"><label>${esc(f.label)}${f.required?" *":""}</label>${inputForField(f)}</div>`).join("")}
+      <div class="span2 row"><button class="btn" type="submit">保存客户</button><button class="btn ghost" type="button" id="cancelNew">取消</button></div>
+    </div></form></div>`;
+  document.querySelector("#cancelNew").onclick=()=>history.back();
+  document.querySelector("#customerForm").onsubmit=async e=>{
+    e.preventDefault();
+    const values={};e.currentTarget.querySelectorAll(".dyn").forEach(x=>values[x.dataset.field]=x.value);
+    try{
+      const r=await api("/api/customers",{method:"POST",body:{name:e.currentTarget.name.value,assignedUserId:e.currentTarget.owner?.value||null,values}});
+      toast("客户已保存");location.hash=`#/${state.user.role}/customer/${r.id}`;
+    }catch(err){toast(err.message)}
+  };
+}
+async function renderCustomerDetail(view,id){
+  const [r,sales]=await Promise.all([api("/api/customers/"+encodeURIComponent(id)),state.user.role==="admin"?getSales():Promise.resolve([])]);
+  const c=r.customer, fields=r.fields||[];
+  view.innerHTML=pageHead(c.name,`当前进度 ${c.progressPercent}%`,
+    state.user.role==="admin"?`<button class="btn danger small" id="deleteCustomer">删除客户</button>`:"")+
+    `<div class="split">
+      <div class="card">
+        <h3 style="margin-top:0">客户资料</h3>
+        <form id="editCustomer"><div class="form-grid">
+          <div class="field"><label>客户姓名</label><input class="input" name="name" value="${esc(c.name)}" required></div>
+          ${state.user.role==="admin"?`<div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${sales.map(x=>`<option value="${esc(x.id)}" ${x.id===c.ownerId?"selected":""}>${esc(x.display_name)}</option>`).join("")}</select></div>`:""}
+          ${fields.map(f=>`<div class="field ${f.field_type==="textarea"?"span2":""}"><label>${esc(f.label)}</label>${inputForField(f,c.values?.[f.id]||"")}</div>`).join("")}
+          <div class="span2"><button class="btn" type="submit">保存修改</button></div>
+        </div></form>
+      </div>
+      <div>
+        <div class="card">
+          <h3 style="margin-top:0">客户进度</h3>
+          <div class="capacity-bar" style="margin-bottom:14px"><div class="capacity-fill" style="width:${c.progressPercent}%"></div></div>
+          <div class="progress-list">
+            ${c.progress.map(p=>`<label class="progress-item"><input type="checkbox" data-progress="${esc(p.id)}" ${p.completed?"checked":""}><span><strong>${esc(p.label)}</strong>${p.description?`<div class="muted" style="font-size:12px">${esc(p.description)}</div>`:""}</span></label>`).join("")}
+          </div>
+        </div>
+      </div>
+    </div>`;
+  document.querySelector("#editCustomer").onsubmit=async e=>{
+    e.preventDefault();const values={};e.currentTarget.querySelectorAll(".dyn").forEach(x=>values[x.dataset.field]=x.value);
+    try{await api("/api/customers/"+encodeURIComponent(id),{method:"PATCH",body:{name:e.currentTarget.name.value,assignedUserId:e.currentTarget.owner?.value,values}});toast("修改已保存");}
+    catch(err){toast(err.message)}
+  };
+  document.querySelectorAll("[data-progress]").forEach(ch=>ch.onchange=async()=>{
+    try{const x=await api(`/api/customers/${encodeURIComponent(id)}/progress/${encodeURIComponent(ch.dataset.progress)}`,{method:"PUT",body:{completed:ch.checked}});toast(`进度已更新为 ${x.percent}%`);setTimeout(()=>renderCustomerDetail(view,id),250);}
+    catch(err){ch.checked=!ch.checked;toast(err.message)}
+  });
+  const del=document.querySelector("#deleteCustomer");if(del)del.onclick=async()=>{
+    if(!confirm("确认删除这个客户？系统采用软删除，数据不会立即永久消失。"))return;
+    try{await api("/api/customers/"+encodeURIComponent(id),{method:"DELETE"});toast("客户已移入删除状态");location.hash="#/admin/customers";}catch(err){toast(err.message)}
+  };
+}
+
+async function renderSales(view){
+  const r=await api("/api/admin/users");const items=r.items||[];
+  view.innerHTML=pageHead("业务员管理","业务员只能看到分配给自己的客户",`<button class="btn" id="addSales">＋ 添加业务员</button>`)+
+    `<div class="table-wrap"><table><thead><tr><th>姓名</th><th>账号</th><th>角色</th><th>状态</th><th>创建时间</th></tr></thead><tbody>
+    ${items.map(x=>`<tr><td>${esc(x.display_name)}</td><td>${esc(x.username)}</td><td>${x.role==="admin"?"管理员":"业务员"}</td><td>${x.active?"启用":"停用"}</td><td>${esc((x.created_at||"").slice(0,10))}</td></tr>`).join("")}</tbody></table></div>`;
+  document.querySelector("#addSales").onclick=()=>openModal("添加业务员",`
+    <div class="field"><label>业务员姓名</label><input class="input" id="mName"></div>
+    <div class="field"><label>登录账号</label><input class="input" id="mUser"></div>
+    <div class="field"><label>初始密码（至少8位）</label><input class="input" type="password" id="mPass"></div>
+    <button class="btn full" id="mSave">创建业务员</button>`,()=>{
+      document.querySelector("#mSave").onclick=async()=>{try{await api("/api/admin/users",{method:"POST",body:{displayName:val("mName"),username:val("mUser"),password:val("mPass")}});closeModal();toast("业务员已创建");renderSales(view);}catch(e){toast(e.message)}};
+    });
+}
+
+async function renderFields(view){
+  const r=await api("/api/fields");const items=r.items||[];
+  view.innerHTML=pageHead("登记字段管理","添加、编辑、排序并决定哪些字段显示在客户列表",`<button class="btn" id="addField">＋ 添加字段</button>`)+
+    `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>名称</th><th>类型</th><th>必填</th><th>列表显示</th><th>可搜索</th><th>状态</th><th>操作</th></tr></thead><tbody>
+    ${items.map(f=>`<tr><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button> <button class="btn danger small" data-del-field="${esc(f.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
+  document.querySelector("#addField").onclick=()=>fieldModal(view,null);
+  document.querySelectorAll("[data-edit-field]").forEach(b=>b.onclick=()=>fieldModal(view,items.find(x=>x.id===b.dataset.editField)));
+  document.querySelectorAll("[data-del-field]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/fields/"+b.dataset.delField,{method:"DELETE"});toast("字段已停用");renderFields(view)}catch(e){toast(e.message)}});
+}
+function fieldModal(view,f){
+  openModal(f?"编辑字段":"添加字段",`
+    <div class="field"><label>字段名称</label><input class="input" id="fLabel" value="${esc(f?.label||"")}"></div>
+    <div class="field"><label>字段类型</label><select class="input" id="fType">
+      ${["text","textarea","phone","email","number","date","time","url","select"].map(x=>`<option ${x===f?.field_type?"selected":""} value="${x}">${x}</option>`).join("")}
+    </select></div>
+    <div class="row wrap">
+      <label><input type="checkbox" id="fRequired" ${f?.required?"checked":""}> 必填</label>
+      <label><input type="checkbox" id="fList" ${f?.list_visible?"checked":""}> 客户列表显示</label>
+      <label><input type="checkbox" id="fSearch" ${f?.searchable!==0?"checked":""}> 可搜索</label>
+      <label><input type="checkbox" id="fEnabled" ${f?.enabled!==0?"checked":""}> 启用</label>
+    </div>
+    <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="fSort" type="number" value="${f?.sort_order??100}"></div>
+    <button class="btn full" id="fSave">保存</button>`,()=>{
+      document.querySelector("#fSave").onclick=async()=>{const body={label:val("fLabel"),fieldType:val("fType"),required:checked("fRequired"),listVisible:checked("fList"),searchable:checked("fSearch"),enabled:checked("fEnabled"),sortOrder:Number(val("fSort")||100),listSortOrder:Number(val("fSort")||100)};try{if(f)await api("/api/admin/fields/"+f.id,{method:"PATCH",body});else await api("/api/admin/fields",{method:"POST",body});closeModal();toast("字段设置已保存");renderFields(view)}catch(e){toast(e.message)}};
+    });
+}
+
+async function renderProgressAdmin(view){
+  const r=await api("/api/progress-defs");const items=r.items||[];
+  view.innerHTML=pageHead("客户进度管理","业务员勾选完成后，客户卡片百分比立即更新",`<button class="btn" id="addProgress">＋ 添加进度</button>`)+
+    `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>进度名称</th><th>说明</th><th>颜色</th><th>状态</th><th>操作</th></tr></thead><tbody>
+    ${items.map(p=>`<tr><td>${p.sort_order}</td><td><strong>${esc(p.label)}</strong></td><td>${esc(p.description||"")}</td><td><span class="tag" style="border-left:5px solid ${esc(p.color)}">${esc(p.color)}</span></td><td>${p.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-prog="${esc(p.id)}">编辑</button> <button class="btn danger small" data-del-prog="${esc(p.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
+  document.querySelector("#addProgress").onclick=()=>progressModal(view,null);
+  document.querySelectorAll("[data-edit-prog]").forEach(b=>b.onclick=()=>progressModal(view,items.find(x=>x.id===b.dataset.editProg)));
+  document.querySelectorAll("[data-del-prog]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/progress/"+b.dataset.delProg,{method:"DELETE"});toast("进度已停用");renderProgressAdmin(view)}catch(e){toast(e.message)}});
+}
+function progressModal(view,p){
+  openModal(p?"编辑进度":"添加进度",`
+    <div class="field"><label>进度名称</label><input class="input" id="pLabel" value="${esc(p?.label||"")}"></div>
+    <div class="field"><label>说明</label><input class="input" id="pDesc" value="${esc(p?.description||"")}"></div>
+    <div class="field"><label>颜色</label><input class="input" type="color" id="pColor" value="${esc(p?.color||"#2563eb")}"></div>
+    <div class="field"><label>排序数字</label><input class="input" type="number" id="pSort" value="${p?.sort_order??100}"></div>
+    <label><input type="checkbox" id="pEnabled" ${p?.enabled!==0?"checked":""}> 启用</label>
+    <button class="btn full" id="pSave" style="margin-top:16px">保存</button>`,()=>{
+      document.querySelector("#pSave").onclick=async()=>{const body={label:val("pLabel"),description:val("pDesc"),color:val("pColor"),sortOrder:Number(val("pSort")||100),enabled:checked("pEnabled")};try{if(p)await api("/api/admin/progress/"+p.id,{method:"PATCH",body});else await api("/api/admin/progress",{method:"POST",body});closeModal();toast("进度设置已保存");renderProgressAdmin(view)}catch(e){toast(e.message)}};
+    });
+}
+
+async function renderSidebarAdmin(view){
+  const r=await api("/api/admin/sidebar");const items=r.items||[];
+  view.innerHTML=pageHead("左侧栏管理","只有管理员可以设置；保存后管理员端和业务员端会自动同步",`<button class="btn" id="addSide">＋ 添加按钮</button>`)+
+    `<div class="notice" style="margin-bottom:14px">当前侧栏配置版本：<strong>${r.version}</strong>。在线用户会自动检测新版本并刷新左侧栏，不需要退出登录。</div>
+    <div class="settings-list" id="sideRows">
+      ${items.map(x=>`<div class="setting-row" draggable="true" data-side-id="${esc(x.id)}" data-audience="${esc(x.audience)}">
+        <div class="drag">⋮⋮</div><div><strong>${esc(x.label)}</strong><div class="muted" style="font-size:12px">${esc(x.url)}</div></div>
+        <div><span class="tag">${x.audience==="admin"?"管理员":x.audience==="sales"?"业务员":"两边"}</span></div>
+        <div>${x.enabled?"启用":"停用"}</div>
+        <div><button class="btn ghost small" data-side-edit="${esc(x.id)}">编辑</button> <button class="btn danger small" data-side-del="${esc(x.id)}">删除</button></div>
+      </div>`).join("")}
+    </div>`;
+  document.querySelector("#addSide").onclick=()=>sidebarModal(view,null);
+  document.querySelectorAll("[data-side-edit]").forEach(b=>b.onclick=()=>sidebarModal(view,items.find(x=>x.id===b.dataset.sideEdit)));
+  document.querySelectorAll("[data-side-del]").forEach(b=>b.onclick=async()=>{if(!confirm("删除这个侧栏按钮？"))return;try{await api("/api/admin/sidebar/"+b.dataset.sideDel,{method:"DELETE"});toast("侧栏按钮已删除并同步");await refreshSidebar(true);renderSidebarAdmin(view)}catch(e){toast(e.message)}});
+  enableSidebarDrag(view,items);
+}
+function sidebarModal(view,x){
+  openModal(x?"编辑左侧栏按钮":"添加左侧栏按钮",`
+    <div class="field"><label>按钮名称</label><input class="input" id="sLabel" value="${esc(x?.label||"")}"></div>
+    <div class="field"><label>显示对象</label><select class="input" id="sAudience"><option value="admin" ${x?.audience==="admin"?"selected":""}>管理员</option><option value="sales" ${x?.audience==="sales"?"selected":""}>业务员</option><option value="all" ${x?.audience==="all"?"selected":""}>管理员和业务员</option></select></div>
+    <div class="field"><label>跳转链接</label><input class="input" id="sUrl" value="${esc(x?.url||"https://")}"></div>
+    <div class="field"><label>图标文字/图标代号</label><input class="input" id="sIcon" value="${esc(x?.icon||"link")}"></div>
+    <div class="field"><label>分组标题</label><input class="input" id="sGroup" value="${esc(x?.group_label||"")}"></div>
+    <div class="field"><label>打开方式</label><select class="input" id="sTarget"><option value="same" ${x?.target!=="new"?"selected":""}>当前页面</option><option value="new" ${x?.target==="new"?"selected":""}>新窗口</option></select></div>
+    <div class="field"><label>排序数字</label><input class="input" type="number" id="sSort" value="${x?.sort_order??100}"></div>
+    <label><input type="checkbox" id="sEnabled" ${x?.enabled!==0?"checked":""}> 启用</label>
+    <button class="btn full" id="sSave" style="margin-top:16px">保存并同步</button>`,()=>{
+      document.querySelector("#sSave").onclick=async()=>{const body={label:val("sLabel"),audience:val("sAudience"),url:val("sUrl"),icon:val("sIcon"),groupLabel:val("sGroup"),target:val("sTarget"),sortOrder:Number(val("sSort")||100),enabled:checked("sEnabled")};try{if(x)await api("/api/admin/sidebar/"+x.id,{method:"PATCH",body});else await api("/api/admin/sidebar",{method:"POST",body});closeModal();toast("左侧栏已保存并同步");await refreshSidebar(true);renderSidebarAdmin(view)}catch(e){toast(e.message)}};
+    });
+}
+function enableSidebarDrag(view,items){
+  let dragId=null;
+  document.querySelectorAll("[data-side-id]").forEach(row=>{
+    row.addEventListener("dragstart",()=>dragId=row.dataset.sideId);
+    row.addEventListener("dragover",e=>e.preventDefault());
+    row.addEventListener("drop",async e=>{
+      e.preventDefault();const targetId=row.dataset.sideId;if(!dragId||dragId===targetId)return;
+      const a=items.find(x=>x.id===dragId),b=items.find(x=>x.id===targetId);
+      if(!a||!b||a.audience!==b.audience){toast("请在同一显示对象内排序");return;}
+      const subset=items.filter(x=>x.audience===a.audience).sort((x,y)=>x.sort_order-y.sort_order);
+      const from=subset.findIndex(x=>x.id===dragId),to=subset.findIndex(x=>x.id===targetId);
+      const [moved]=subset.splice(from,1);subset.splice(to,0,moved);
+      try{
+        for(let i=0;i<subset.length;i++)await api("/api/admin/sidebar/"+subset[i].id,{method:"PATCH",body:{sortOrder:(i+1)*10}});
+        toast("排序已同步");await refreshSidebar(true);renderSidebarAdmin(view);
+      }catch(err){toast(err.message)}
+    });
+  });
+}
+
+async function renderCapacity(view){
+  const r=await api("/api/admin/capacity"), c=r.config;
+  const noticeClass=r.level==="normal"?"":r.level==="warning"?"warning":"urgent";
+  const levelText={normal:"正常",warning:"注意",upgrade:"建议升级",urgent:"尽快升级"}[r.level]||r.level;
+  view.innerHTML=pageHead("系统容量与费用","你不需要记平台名称；需要付费时这里会明确告诉你")+
+    `<div class="notice ${noticeClass}" style="margin-bottom:16px"><strong>当前状态：${levelText}</strong><div style="margin-top:6px">${esc(r.message)}</div></div>
+    <div class="grid metrics">
+      <div class="card metric"><div class="label">客户数量</div><div class="value">${money(r.customerCount)}</div></div>
+      <div class="card metric"><div class="label">估算数据库使用</div><div class="value">${r.estimatedMb} MB</div></div>
+      <div class="card metric"><div class="label">当前免费单库参考上限</div><div class="value">${r.freeSingleDatabaseMb} MB</div></div>
+      <div class="card metric"><div class="label">容量使用率</div><div class="value">${r.percent}%</div></div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <h3 style="margin-top:0">客户资料容量</h3>
+      <div class="capacity-bar"><div class="capacity-fill" style="width:${Math.min(100,r.percent)}%"></div></div>
+      <div class="muted" style="margin-top:8px">系统会在约 ${c.warning_percent}% 开始提醒，${c.upgrade_percent}% 建议升级，${c.urgent_percent}% 提醒尽快处理。</div>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <h3 style="margin-top:0">如果以后需要付费，你应该付什么</h3>
+      <div class="table-wrap"><table>
+        <tbody>
+          <tr><th>服务商</th><td>${esc(c.provider)}</td></tr>
+          <tr><th>数据库</th><td>${esc(c.database)}</td></tr>
+          <tr><th>当前参考套餐</th><td>Workers Free / D1 Free</td></tr>
+          <tr><th>需要升级时</th><td>升级 Cloudflare Workers Paid</td></tr>
+          <tr><th>最低费用参考</th><td>约 ${c.paid_base_usd_month} USD / 月</td></tr>
+          <tr><th>价格检查日期</th><td>${esc(c.pricing_checked)}</td></tr>
+        </tbody>
+      </table></div>
+      <p class="muted">真正需要升级时，系统会在管理员首页和这里同时提醒。平台价格可能变化，因此会显示最近核对日期。</p>
+      <a class="btn" href="${esc(c.upgrade_url)}" target="_blank" rel="noopener">打开升级/付款平台</a>
+    </div>
+    <div class="card" style="margin-top:18px">
+      <h3 style="margin-top:0">当前免费额度参考</h3>
+      <div class="table-wrap"><table><thead><tr><th>项目</th><th>参考免费额度</th></tr></thead><tbody>
+        <tr><td>D1 数据读取</td><td>${money(c.free_rows_read_day)} 行 / 天</td></tr>
+        <tr><td>D1 数据写入</td><td>${money(c.free_rows_write_day)} 行 / 天</td></tr>
+        <tr><td>Workers 请求</td><td>${money(c.free_worker_requests_day)} 次 / 天</td></tr>
+        <tr><td>D1 账户总存储</td><td>${c.free_account_gb} GB</td></tr>
+      </tbody></table></div>
+    </div>`;
+}
+
+function openModal(title,body,onReady){
+  const el=document.createElement("div");el.className="modal-back";el.id="modal";
+  el.innerHTML=`<div class="modal"><div class="page-head"><div><h1 style="font-size:20px">${esc(title)}</h1></div><button class="btn ghost small" id="mClose">关闭</button></div>${body}</div>`;
+  document.body.appendChild(el);document.querySelector("#mClose").onclick=closeModal;el.onclick=e=>{if(e.target===el)closeModal()};onReady?.();
+}
+function closeModal(){document.querySelector("#modal")?.remove()}
+function val(id){return document.querySelector("#"+id)?.value||""}
+function checked(id){return !!document.querySelector("#"+id)?.checked}
+
+bootstrap();
