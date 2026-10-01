@@ -43,6 +43,50 @@ jobs:
         with:
           node-version: "22"
 
+      - name: Database destructive-change safety gate
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          node - <<'NODE'
+          const fs = require('fs');
+
+          const raw = fs.readFileSync('schema.sql', 'utf8');
+          // Remove SQL comments before checking so comments/examples do not cause false alarms.
+          const sql = raw
+            .replace(/\/\*[\s\S]*?\*\//g, ' ')
+            .replace(/--.*$/gm, ' ')
+            .replace(/\s+/g, ' ')
+            .trim();
+
+          const blocked = [
+            { name: 'DROP TABLE', re: /\bDROP\s+TABLE\b/i },
+            { name: 'DROP VIEW', re: /\bDROP\s+VIEW\b/i },
+            { name: 'DROP COLUMN', re: /\bALTER\s+TABLE\b[\s\S]*?\bDROP\s+(?:COLUMN\s+)?\b/i },
+            { name: 'TRUNCATE', re: /\bTRUNCATE\b/i },
+            { name: 'DELETE FROM', re: /\bDELETE\s+FROM\b/i },
+            { name: 'UPDATE existing data', re: /\bUPDATE\s+[A-Za-z_][A-Za-z0-9_]*\s+SET\b/i },
+            { name: 'INSERT OR REPLACE', re: /\bINSERT\s+OR\s+REPLACE\b/i },
+            { name: 'REPLACE INTO', re: /\bREPLACE\s+INTO\b/i },
+            { name: 'ALTER TABLE RENAME', re: /\bALTER\s+TABLE\b[\s\S]*?\bRENAME\b/i },
+            { name: 'Disable foreign keys', re: /\bPRAGMA\s+foreign_keys\s*=\s*(?:OFF|0)\b/i }
+          ];
+
+          const hits = blocked.filter(x => x.re.test(sql)).map(x => x.name);
+          if (hits.length) {
+            console.error('');
+            console.error('BLOCKED: schema.sql contains deployment-time database operations that may change or destroy existing customer data:');
+            for (const hit of hits) console.error(' - ' + hit);
+            console.error('');
+            console.error('Deployment stopped BEFORE the remote D1 database was touched.');
+            console.error('Review the migration explicitly before changing this safety gate.');
+            process.exit(1);
+          }
+
+          console.log('Database safety gate passed.');
+          console.log('No destructive or bulk-overwrite SQL was found in schema.sql.');
+          NODE
+
       - name: Resolve or create D1 database
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
         id: d1
