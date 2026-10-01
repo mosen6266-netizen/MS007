@@ -398,23 +398,22 @@ function renderCustomerRows(host,items,hasMore){
   host.innerHTML=`<div class="customer-list">${items.map(c=>{
     const details=[];
     for(const col of currentListColumns){
-      if(col.column_key==="name")continue;
+      if(col.column_key==="name"){
+        details.push(`<div class="customer-cell"><span>${esc(col.label||"客户姓名")}</span><strong>${esc(c.name||"—")}</strong></div>`);
+        continue;
+      }
       if(col.column_key==="owner"){
-        if(state.user.role==="admin") details.push(`<div class="customer-cell"><span>${esc(col.label||"业务员")}</span><strong>${esc(c.ownerName||"未分配")}</strong></div>`);
+        if(state.user.role==="admin")details.push(`<div class="customer-cell"><span>${esc(col.label||"业务员")}</span><strong>${esc(c.ownerName||"未分配")}</strong></div>`);
         continue;
       }
       if(col.column_key==="dynamic"&&col.field_id){
         const v=c.values?.[col.field_id]||"";
-        details.push(`<div class="customer-cell"><span>${esc(col.label)}</span><strong>${esc(v||"—")}</strong></div>`);
+        details.push(`<div class="customer-cell"><span>${esc(col.label||"")}</span><strong>${esc(v||"—")}</strong></div>`);
       }
     }
     const archiveLabel=customerPageState.viewArchived?"取消归档":"归档";
     return `<article class="customer-row" style="--pct:${Number(c.progressPercent||0)}%;--progress-color:${progressTone(Number(c.progressPercent||0))}">
-      <div class="customer-main">
-        <strong class="customer-name">${esc(c.name)}</strong>
-        <div class="muted" style="font-size:12px">更新：${esc((c.updatedAt||"").replace("T"," ").slice(0,16))}</div>
-      </div>
-      <div class="customer-fields">${details.join("")||'<div class="muted">暂无其他列表字段</div>'}</div>
+      <div class="customer-fields customer-fields-configurable">${details.join("")||'<div class="muted">未设置客户资料显示项</div>'}</div>
       <div class="customer-step-status">
         <div class="step-status current-step">
           <span>当前进度</span>
@@ -1222,8 +1221,16 @@ async function renderRegistrationLayoutSettings(view){
 async function renderListSettings(view,audience="admin"){
   const r=await api("/api/admin/list-columns?audience="+audience);
   const fields=r.fields||[];
-  let items=(r.items||[]).map(x=>({...x}));
-  if(!items.some(x=>x.column_key==="name"))items.unshift({id:"fixed_name",column_key:"name",field_id:null,label:"客户姓名",enabled:1,sort_order:0});
+
+  const seen=new Set();
+  let items=[];
+  for(const x of r.items||[]){
+    const key=String(x.column_key||"")+":"+String(x.field_id||"");
+    if(seen.has(key))continue;
+    seen.add(key);
+    items.push({...x});
+  }
+
   const titleAudience=audience==="admin"?"管理员":"业务员";
   view.innerHTML=pageHead("客户列表显示设置","管理员统一决定客户列表每一行显示哪些资料以及显示顺序")+
     `<div class="row" style="margin-bottom:14px">
@@ -1232,7 +1239,7 @@ async function renderListSettings(view,audience="admin"){
     </div>
     <div class="card">
       <h3 style="margin-top:0">${titleAudience}客户列表内容</h3>
-      <p class="muted">客户姓名固定显示。其他内容可以添加、删除、改显示名称和拖动排序。</p>
+      <p class="muted">没有任何固定字段。客户姓名、业务员和所有登记字段都可以自由添加、移除、改显示名称和拖动排序。</p>
       <div class="settings-list" id="listColumnRows"></div>
       <div class="row wrap" style="margin-top:14px">
         <select class="input grow" id="addColumnSelect"></select>
@@ -1240,52 +1247,97 @@ async function renderListSettings(view,audience="admin"){
         <button class="btn" id="saveColumns">保存并同步</button>
       </div>
     </div>`;
+
   document.querySelector("#listAdmin").onclick=()=>renderListSettings(view,"admin");
   document.querySelector("#listSales").onclick=()=>renderListSettings(view,"sales");
 
   const rows=document.querySelector("#listColumnRows");
+
   function redraw(){
-    rows.innerHTML=items.map((x,i)=>`<div class="setting-row" draggable="${x.column_key!=="name"}" data-ci="${i}">
-      <div class="drag">${x.column_key==="name"?"🔒":"⋮⋮"}</div>
-      <div><input class="input list-label" value="${esc(x.label)}" ${x.column_key==="name"?"disabled":""}><div class="muted" style="font-size:12px">${x.column_key==="dynamic"?"自定义字段":x.column_key==="owner"?"业务员":"固定字段"}</div></div>
-      <div><span class="tag">${x.column_key==="dynamic"?"字段":x.column_key}</span></div>
+    rows.innerHTML=items.length?items.map((x,i)=>`<div class="setting-row" draggable="true" data-ci="${i}">
+      <div class="drag">⋮⋮</div>
+      <div>
+        <input class="input list-label" value="${esc(x.label||"")}">
+        <div class="muted" style="font-size:12px">${x.column_key==="dynamic"?"登记字段":x.column_key==="owner"?"业务员":"客户姓名"}</div>
+      </div>
+      <div><span class="tag">${x.column_key==="dynamic"?"字段":x.column_key==="owner"?"业务员":"姓名"}</span></div>
       <div>${i+1}</div>
-      <div>${x.column_key==="name"?"":`<button class="btn danger small remove-col">移除</button>`}</div>
-    </div>`).join("");
+      <div><button class="btn danger small remove-col">移除</button></div>
+    </div>`).join(""):'<div class="empty-options">当前列表没有设置任何客户资料显示项。</div>';
+
     rows.querySelectorAll(".remove-col").forEach(btn=>btn.onclick=()=>{
-      const idx=Number(btn.closest("[data-ci]").dataset.ci);items.splice(idx,1);redraw();fillAdd();
+      const idx=Number(btn.closest("[data-ci]").dataset.ci);
+      items.splice(idx,1);
+      redraw();
+      fillAdd();
     });
     enableListDrag();
   }
+
   function fillAdd(){
-    const selected=new Set(items.filter(x=>x.column_key==="dynamic").map(x=>x.field_id));
-    let opts=[];
-    if(audience==="admin"&&!items.some(x=>x.column_key==="owner"))opts.push(`<option value="owner:">业务员</option>`);
-    for(const f of fields)if(!selected.has(f.id))opts.push(`<option value="dynamic:${esc(f.id)}">${esc(f.label)}</option>`);
-    document.querySelector("#addColumnSelect").innerHTML=opts.join("")||`<option value="">没有可添加的字段</option>`;
+    const selectedKeys=new Set(items.map(x=>String(x.column_key||"")+":"+String(x.field_id||"")));
+    const opts=[];
+
+    if(!selectedKeys.has("name:"))opts.push('<option value="name:">客户姓名</option>');
+    if(audience==="admin"&&!selectedKeys.has("owner:"))opts.push('<option value="owner:">业务员</option>');
+
+    for(const f of fields){
+      const k="dynamic:"+f.id;
+      if(!selectedKeys.has(k))opts.push(`<option value="dynamic:${esc(f.id)}">${esc(f.label)}</option>`);
+    }
+
+    document.querySelector("#addColumnSelect").innerHTML=opts.join("")||'<option value="">没有可添加的内容</option>';
   }
+
   function enableListDrag(){
     let from=null;
     rows.querySelectorAll("[data-ci][draggable='true']").forEach(row=>{
       row.ondragstart=()=>from=Number(row.dataset.ci);
       row.ondragover=e=>e.preventDefault();
-      row.ondrop=e=>{e.preventDefault();const to=Number(row.dataset.ci);if(from===null||from===to||items[to]?.column_key==="name")return;const [m]=items.splice(from,1);items.splice(to,0,m);redraw();};
+      row.ondrop=e=>{
+        e.preventDefault();
+        const to=Number(row.dataset.ci);
+        if(from===null||from===to)return;
+        const [m]=items.splice(from,1);
+        items.splice(to,0,m);
+        redraw();
+      };
     });
   }
-  redraw();fillAdd();
+
+  redraw();
+  fillAdd();
+
   document.querySelector("#addColumnBtn").onclick=()=>{
-    const v=val("addColumnSelect");if(!v)return;const [key,fid]=v.split(":");
-    if(key==="owner")items.push({column_key:"owner",field_id:null,label:"业务员",enabled:1});
-    else{const f=fields.find(x=>x.id===fid);if(f)items.push({column_key:"dynamic",field_id:f.id,label:f.label,enabled:1});}
-    redraw();fillAdd();
+    const v=val("addColumnSelect");if(!v)return;
+    const [key,fid]=v.split(":");
+    if(key==="name")items.push({column_key:"name",field_id:null,label:"客户姓名",enabled:1});
+    else if(key==="owner")items.push({column_key:"owner",field_id:null,label:"业务员",enabled:1});
+    else{
+      const f=fields.find(x=>x.id===fid);
+      if(f)items.push({column_key:"dynamic",field_id:f.id,label:f.label,enabled:1});
+    }
+    redraw();
+    fillAdd();
   };
+
   document.querySelector("#saveColumns").onclick=async()=>{
     const rowEls=[...rows.querySelectorAll("[data-ci]")];
     const payload=rowEls.map((el,i)=>{
       const item=items[Number(el.dataset.ci)];
-      return {columnKey:item.column_key,fieldId:item.field_id||null,label:item.column_key==="name"?"客户姓名":el.querySelector(".list-label")?.value||item.label,enabled:true,sortOrder:(i+1)*10};
+      return {
+        columnKey:item.column_key,
+        fieldId:item.field_id||null,
+        label:el.querySelector(".list-label")?.value||item.label||"",
+        enabled:true,
+        sortOrder:(i+1)*10
+      };
     });
-    try{await api("/api/admin/list-columns",{method:"PUT",body:{audience,items:payload}});toast("客户列表显示设置已同步");renderListSettings(view,audience)}catch(e){toast(e.message)}
+    try{
+      await api("/api/admin/list-columns",{method:"PUT",body:{audience,items:payload}});
+      toast("客户列表显示设置已同步");
+      renderListSettings(view,audience);
+    }catch(e){toast(e.message)}
   };
 }
 
