@@ -186,3 +186,56 @@ Verification:
 - Production database was not bootstrapped/recreated.
 
 Next work: Batch 6.
+
+
+## Batch 6 governance completion
+
+Batch 6 is complete in the current main-line governance model.
+
+Implemented/verified:
+- Main Quality Check and Deploy workflows provide the integrated regression/deployment gate; the old standalone Batch 6 branch-only workflow is superseded and is not required on main.
+- Version comes from Git commit SHA and is exposed through /api/health.
+- Deployment path is validate -> staging -> production.
+- Production D1 Time Travel information is recorded before production migrations.
+- Database safety and duplicate-function guards remain mandatory.
+- Final governance files are present at repository root:
+  - release-manifest.json
+  - deployment-history.json
+  - rollback-checkpoint.json
+- Disaster recovery instructions are documented in docs/DISASTER_RECOVERY.md.
+
+## Batch 7 finalization
+
+Batch 7 is complete at code/test level.
+
+Implemented:
+- Customer list remains keyset/cursor paginated with a 50-row frontend page.
+- Dashboard statistics cache is implemented in dashboard_statistics_cache.
+- Migration: migrations/0005_batch7_statistics_cache.sql.
+- Fresh recovery schema also contains the derived cache table.
+- /api/stats-bundle and legacy /api/stats read cache first and fall back safely to authoritative queries.
+- Successful customer/progress/user/import/restore changes invalidate the derived statistics cache.
+- Background progress recalculation invalidates statistics during maintenance batches.
+- Batch 7 scale regression: tests/batch7_scale.py.
+- Scale coverage: 20,000 customers, 25 salespeople, 40,000 progress rows, keyset pagination/index checks, aggregate queries, cache semantics, and large backup/restore round trip.
+- Batch 7 regression is included in both .github/workflows/test.yml and .github/workflows/deploy.yml.
+- File-resource/Base64 optimization was verified not applicable to MS007: this repository has no attachment data-URL pipeline.
+- Hover iframe/static-thumbnail tool optimization was verified not applicable to MS007: this repository has no iframe tool-preview implementation.
+
+Verification:
+- Final Batch 7 quality run 36934819082: success.
+- Final deployment run 36934819121 is the deployment record for commit f656fa7a20021c66929b9904bab2fc8e569bb8f3; consult deployment-history.json / GitHub Actions for its final conclusion.
+- Earlier Batch 7.2 cache Worker deployment 36934462608: success.
+- Earlier Batch 7.2 schema deployment 36934471830: success.
+
+Final recovery package:
+- release-manifest.json
+- deployment-history.json
+- rollback-checkpoint.json
+- docs/DISASTER_RECOVERY.md
+- docs/GPT_RECOVERY_INSTRUCTION.txt
+- docs/DEPLOYMENT.md
+- tests/batch7_scale.py
+
+Resume instruction for any later chat:
+"Read docs/UPGRADE_CHECKPOINT.md first. MS007 Batch 0-7 hardening is complete unless the final deploy record says otherwise. Preserve production D1/customer data and continue only from the first failed verification step."
