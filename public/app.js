@@ -772,16 +772,17 @@ async function renderProgressAdmin(view){
   view.innerHTML=pageHead("客户进度管理","业务员勾选完成后，客户卡片百分比立即更新",`<button class="btn" id="addProgress">＋ 添加进度</button>`)+
     `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>进度名称</th><th>说明</th><th>颜色</th><th>状态</th><th>操作</th></tr></thead><tbody>
     ${items.map(p=>`<tr><td>${p.sort_order}</td><td><strong>${esc(p.label)}</strong></td><td>${esc(p.description||"")}</td><td><span class="tag" style="border-left:5px solid ${esc(p.color)}">${esc(p.color)}</span></td><td>${p.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-prog="${esc(p.id)}">编辑</button> <button class="btn danger small" data-del-prog="${esc(p.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
-  document.querySelector("#addProgress").onclick=()=>progressModal(view,null);
+  const nextProgressSort=(items.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0))+1;
+  document.querySelector("#addProgress").onclick=()=>progressModal(view,null,nextProgressSort);
   document.querySelectorAll("[data-edit-prog]").forEach(b=>b.onclick=()=>progressModal(view,items.find(x=>x.id===b.dataset.editProg)));
   document.querySelectorAll("[data-del-prog]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/progress/"+b.dataset.delProg,{method:"DELETE"});toast("进度已停用");renderProgressAdmin(view)}catch(e){toast(e.message)}});
 }
-function progressModal(view,p){
+function progressModal(view,p,nextSort=1){
   openModal(p?"编辑进度":"添加进度",`
     <div class="field"><label>进度名称</label><input class="input" id="pLabel" value="${esc(p?.label||"")}"></div>
     <div class="field"><label>说明</label><input class="input" id="pDesc" value="${esc(p?.description||"")}"></div>
     <div class="field"><label>颜色</label><input class="input" type="color" id="pColor" value="${esc(p?.color||"#2563eb")}"></div>
-    <div class="field"><label>排序数字</label><input class="input" type="number" id="pSort" value="${p?.sort_order??100}"></div>
+    <div class="field"><label>排序数字</label><input class="input" type="number" id="pSort" value="${p?.sort_order??nextSort}"></div>
     <label><input type="checkbox" id="pEnabled" ${p?.enabled!==0?"checked":""}> 启用</label>
     <button class="btn full" id="pSave" style="margin-top:16px">保存</button>`,()=>{
       document.querySelector("#pSave").onclick=async()=>{const body={label:val("pLabel"),description:val("pDesc"),color:val("pColor"),sortOrder:Number(val("pSort")||100),enabled:checked("pEnabled")};try{if(p)await api("/api/admin/progress/"+p.id,{method:"PATCH",body});else await api("/api/admin/progress",{method:"POST",body});closeModal();toast("进度设置已保存");renderProgressAdmin(view)}catch(e){toast(e.message)}};
