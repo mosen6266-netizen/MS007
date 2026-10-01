@@ -369,19 +369,48 @@ async function listCustomers(request, env, user) {
     }
   }
 
-  const items = page.map(r => ({
-    id: r.id,
-    name: r.name,
-    ownerId: r.assigned_user_id,
-    ownerName: r.owner_name || "",
-    progressDone: Number(r.progress_done || 0),
-    progressTotal: Number(r.progress_total || 0),
-    progressPercent: Number(r.progress_percent || 0),
-    archived: !!r.archived,
-    createdAt: r.created_at,
-    updatedAt: r.updated_at,
-    values: valuesByCustomer[r.id] || {}
-  }));
+  // Resolve current + next progress for the whole page in two compact queries.
+  // This avoids one database request per customer when the list grows large.
+  const progressDefsResult = await env.DB.prepare(
+    "SELECT id,label,sort_order,color FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  const progressDefs = progressDefsResult.results || [];
+  const completedByCustomer = {};
+  if (ids.length && progressDefs.length) {
+    const idMarks = ids.map(() => "?").join(",");
+    const done = await env.DB.prepare(
+      `SELECT customer_id,progress_id FROM customer_progress
+       WHERE completed=1 AND customer_id IN (${idMarks})`
+    ).bind(...ids).all();
+    for (const x of done.results || []) {
+      (completedByCustomer[x.customer_id] ||= new Set()).add(x.progress_id);
+    }
+  }
+
+  const items = page.map(r => {
+    const completed = completedByCustomer[r.id] || new Set();
+    let currentProgress = null;
+    let nextProgress = null;
+    for (const p of progressDefs) {
+      if (completed.has(p.id)) currentProgress = {id:p.id,label:p.label,color:p.color};
+      else if (!nextProgress) nextProgress = {id:p.id,label:p.label,color:p.color};
+    }
+    return {
+      id: r.id,
+      name: r.name,
+      ownerId: r.assigned_user_id,
+      ownerName: r.owner_name || "",
+      progressDone: Number(r.progress_done || 0),
+      progressTotal: Number(r.progress_total || 0),
+      progressPercent: Number(r.progress_percent || 0),
+      currentProgress: currentProgress || {id:null,label:"未开始",color:"#94a3b8"},
+      nextProgress: nextProgress || {id:null,label:progressDefs.length?"已全部完成":"暂无进度",color:"#22c55e"},
+      archived: !!r.archived,
+      createdAt: r.created_at,
+      updatedAt: r.updated_at,
+      values: valuesByCustomer[r.id] || {}
+    };
+  });
 
   return responseJson({
     ok: true,
