@@ -1442,13 +1442,14 @@ async function renderDashboardSettings(view,audience="admin"){
   const items=r.items||[];
   const progressDefs=r.progressDefs||[];
   const progressName=new Map(progressDefs.map(x=>[x.id,x.label]));
+  const nextWidgetSort=items.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0)+1;
 
   view.innerHTML=pageHead("仪表盘设置","管理员可以添加、减少、编辑和排序仪表盘内容",`<button class="btn" id="addWidget">＋ 添加组件</button>`)+
     `<div class="row" style="margin-bottom:14px">
       <button class="btn ${audience==="admin"?"":"ghost"} small" id="dashAdmin">管理员仪表盘</button>
       <button class="btn ${audience==="sales"?"":"ghost"} small" id="dashSales">业务员仪表盘</button>
     </div>
-    <div class="notice" style="margin-bottom:14px">仪表盘支持“总数据 / 当日数据 / 本周数据”切换。所有常规统计和客户进度统计都会自动排除已归档客户。</div>
+    <div class="notice" style="margin-bottom:14px">仪表盘支持“总数据 / 当日 / 本周 / 本月”切换。所有常规统计和客户进度统计都会自动排除已归档客户。右键任意组件可在它的上方或下方插入新组件。</div>
     <div class="table-wrap"><table><thead><tr><th>顺序</th><th>标题</th><th>内容</th><th>状态</th><th>操作</th></tr></thead><tbody>
     ${items.map(x=>{
       let content=widgetTypeName[x.widget_type]||x.widget_type;
@@ -1456,13 +1457,18 @@ async function renderDashboardSettings(view,audience="admin"){
         let cfg={};try{cfg=JSON.parse(x.config_json||"{}")}catch{}
         content+=" · "+(progressName.get(cfg.progressId)||"未选择进度");
       }
-      return `<tr><td>${x.sort_order}</td><td><strong>${esc(x.title)}</strong></td><td>${esc(content)}</td><td>${x.enabled?"显示":"隐藏"}</td><td><button class="btn ghost small" data-widget-edit="${esc(x.id)}">编辑</button> <button class="btn danger small" data-widget-del="${esc(x.id)}">删除</button></td></tr>`;
+      return `<tr data-dashboard-row="${esc(x.id)}"><td>${x.sort_order}</td><td><strong>${esc(x.title)}</strong></td><td>${esc(content)}</td><td>${x.enabled?"显示":"隐藏"}</td><td><button class="btn ghost small" data-widget-edit="${esc(x.id)}">编辑</button> <button class="btn danger small" data-widget-del="${esc(x.id)}">删除</button></td></tr>`;
     }).join("")||`<tr><td colspan="5" class="muted">当前没有组件</td></tr>`}</tbody></table></div>`;
 
   document.querySelector("#dashAdmin").onclick=()=>renderDashboardSettings(view,"admin");
   document.querySelector("#dashSales").onclick=()=>renderDashboardSettings(view,"sales");
-  document.querySelector("#addWidget").onclick=()=>dashboardWidgetModal(view,audience,null,progressDefs);
-  document.querySelectorAll("[data-widget-edit]").forEach(b=>b.onclick=()=>dashboardWidgetModal(view,audience,items.find(x=>x.id===b.dataset.widgetEdit),progressDefs));
+  document.querySelector("#addWidget").onclick=()=>dashboardWidgetModal(view,audience,null,progressDefs,nextWidgetSort,null);
+
+  document.querySelectorAll("[data-widget-edit]").forEach(b=>{
+    const item=items.find(x=>x.id===b.dataset.widgetEdit);
+    b.onclick=()=>dashboardWidgetModal(view,audience,item,progressDefs,Number(item?.sort_order)||1,null);
+  });
+
   document.querySelectorAll("[data-widget-del]").forEach(b=>b.onclick=async()=>{
     if(!await uiConfirm("确认删除这个仪表盘组件？",{title:"删除仪表盘组件",confirmText:"删除",danger:true}))return;
     try{
@@ -1471,9 +1477,26 @@ async function renderDashboardSettings(view,audience="admin"){
       renderDashboardSettings(view,audience);
     }catch(e){toast(e.message)}
   });
+
+  document.querySelectorAll("[data-dashboard-row]").forEach(row=>row.addEventListener("contextmenu",e=>{
+    e.preventDefault();
+    const anchor=items.find(x=>x.id===row.dataset.dashboardRow);
+    if(!anchor)return;
+    showInsertContextMenu(e,{
+      label:anchor.title,
+      before:()=>dashboardWidgetModal(
+        view,audience,null,progressDefs,Number(anchor.sort_order)||1,
+        {anchorId:anchor.id,position:"before",anchorLabel:anchor.title}
+      ),
+      after:()=>dashboardWidgetModal(
+        view,audience,null,progressDefs,(Number(anchor.sort_order)||0)+1,
+        {anchorId:anchor.id,position:"after",anchorLabel:anchor.title}
+      )
+    });
+  }));
 }
 
-function dashboardWidgetModal(view,audience,w,progressDefs=[]){
+function dashboardWidgetModal(view,audience,w,progressDefs=[],nextSort=1,insert=null){
   let config={};try{config=JSON.parse(w?.config_json||"{}")}catch{}
 
   const normalOptions=audience==="admin"
@@ -1503,7 +1526,13 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[]){
     allOptions.push({value:selectedValue,label:widgetTypeName[w?.widget_type]||w?.widget_type||"原组件"});
   }
 
-  openModal(w?"编辑仪表盘组件":"添加仪表盘组件",`
+  const modalTitle=w
+    ?"编辑仪表盘组件"
+    :insert
+      ?(insert.position==="before"?`在「${insert.anchorLabel}」上方插入组件`:`在「${insert.anchorLabel}」下方插入组件`)
+      :"添加仪表盘组件";
+
+  openModal(modalTitle,`
     <div class="field">
       <label>组件内容</label>
       <select class="input" id="wType">
@@ -1512,7 +1541,11 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[]){
       <div class="muted" style="font-size:12px;margin-top:5px">客户进度已经直接列出来，选择例如“客户进度 · 客户建档”即可。</div>
     </div>
     <div class="field"><label>显示标题</label><input class="input" id="wTitle" value="${esc(w?.title||"")}"></div>
-    <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="wSort" type="number" value="${w?.sort_order??100}"></div>
+    <div class="field">
+      <label>排序数字（越小越靠前）</label>
+      <input class="input" id="wSort" type="number" value="${w?.sort_order??nextSort}" ${insert?"readonly":""}>
+      ${insert?'<div class="muted" style="font-size:12px;margin-top:5px">保存插入后，后续组件的排序数字会自动顺延。</div>':""}
+    </div>
     <label><input type="checkbox" id="wEnabled" ${w?.enabled!==0?"checked":""}> 显示</label>
     <button class="btn full" id="wSave" style="margin-top:16px">保存</button>
   `,()=>{
@@ -1540,22 +1573,32 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[]){
         audience,
         widgetType,
         title:val("wTitle")||autoTitle(),
-        sortOrder:Number(val("wSort")||100),
+        sortOrder:Number(val("wSort")||nextSort||1),
         enabled:checked("wEnabled"),
         config:isProgress?{progressId:selected.slice(9)}:{}
       };
 
+      if(insert){
+        body.insertAnchorId=insert.anchorId;
+        body.insertPosition=insert.position;
+      }
       if(isProgress&&!body.config.progressId){toast("请选择一个客户进度");return}
 
       try{
         if(w)await api("/api/admin/dashboard-widgets/"+w.id,{method:"PATCH",body});
         else await api("/api/admin/dashboard-widgets",{method:"POST",body});
         closeModal();
-        toast("仪表盘设置已保存");
+        toast(insert?"仪表盘组件已插入并自动调整排序":"仪表盘设置已保存");
         renderDashboardSettings(view,audience);
       }catch(e){toast(e.message)}
     };
-  },{draftKey:`dashboard-widget:${audience}:${w?.id||"new"}`});
+  },{
+    draftKey:w
+      ?`dashboard-widget:${audience}:${w.id}`
+      :insert
+        ?`dashboard-widget:${audience}:insert:${insert.anchorId}:${insert.position}`
+        :`dashboard-widget:${audience}:new`
+  });
 }
 
 
