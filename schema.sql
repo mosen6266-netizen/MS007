@@ -389,3 +389,15 @@ INSERT OR IGNORE INTO maintenance_jobs(
   (SELECT COUNT(*) FROM customers WHERE deleted_at IS NULL),
   '{}',datetime('now'),NULL,datetime('now'),NULL
 );
+
+
+-- Batch 7.2 dashboard statistics cache.
+-- Derived data only; safe to rebuild from authoritative customer/progress tables.
+CREATE TABLE IF NOT EXISTS dashboard_statistics_cache (
+  cache_key TEXT PRIMARY KEY,
+  value_json TEXT NOT NULL DEFAULT '{}',
+  updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_dashboard_statistics_cache_updated
+ON dashboard_statistics_cache(updated_at);
