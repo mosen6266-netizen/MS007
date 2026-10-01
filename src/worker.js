@@ -198,10 +198,12 @@ async function telegramAvailableFields(env){
 }
 
 async function telegramApiCall(token,method,payload){
+  token=String(token||"").trim();
+  if(!/^[0-9]+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("Bot Token 格式不正确");
   const ctl=new AbortController();
   const timer=setTimeout(()=>ctl.abort(),8000);
   try{
-    const res=await fetch("https://api.telegram.org/bot"+encodeURIComponent(token)+"/"+method,{
+    const res=await fetch("https://api.telegram.org/bot"+token+"/"+method,{
       method:"POST",
       headers:{"content-type":"application/json"},
       body:JSON.stringify(payload||{}),
@@ -225,7 +227,7 @@ async function telegramAdminGet(env){
   let fields=defaultTelegramFields();
   try{
     const parsed=JSON.parse(row.fields_json||"[]");
-    if(Array.isArray(parsed)&&parsed.length)fields=parsed;
+    if(Array.isArray(parsed))fields=parsed;
   }catch{}
   const availableFields=await telegramAvailableFields(env);
   const logs=await env.DB.prepare(
@@ -282,8 +284,6 @@ async function telegramAdminSave(request,env,user){
     seen.add(key);
     fields.push({key,label:String(item?.label||fieldLabel.get(key)||key).trim().slice(0,80)});
   }
-  if(!fields.length)fields.push(...defaultTelegramFields());
-
   if(enabled && !encToken)return fail("请先填写 Telegram Bot Token");
   if(enabled && !chatId)return fail("请先填写 Telegram 群 ID");
 
@@ -372,7 +372,7 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
   let fields=defaultTelegramFields();
   try{
     const parsed=JSON.parse(row.fields_json||"[]");
-    if(Array.isArray(parsed)&&parsed.length)fields=parsed;
+    if(Array.isArray(parsed))fields=parsed;
   }catch{}
 
   const customIds=[...new Set(fields.filter(x=>String(x.key||"").startsWith("field:")).map(x=>String(x.key).slice(6)).filter(Boolean))];
