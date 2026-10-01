@@ -156,6 +156,21 @@ async function recalcProgress(env, customerId) {
   return { done, total, percent };
 }
 
+async function recalcAllProgress(env) {
+  const totalRow = await env.DB.prepare("SELECT COUNT(*) n FROM progress_definitions WHERE enabled=1").first();
+  const total = Number(totalRow?.n || 0);
+  await env.DB.prepare(
+    `UPDATE customers
+     SET progress_total=?,
+         progress_done=(SELECT COUNT(*) FROM customer_progress cp JOIN progress_definitions pd ON pd.id=cp.progress_id WHERE cp.customer_id=customers.id AND cp.completed=1 AND pd.enabled=1),
+         progress_percent=CASE WHEN ?=0 THEN 0 ELSE ROUND(
+           (SELECT COUNT(*) FROM customer_progress cp JOIN progress_definitions pd ON pd.id=cp.progress_id WHERE cp.customer_id=customers.id AND cp.completed=1 AND pd.enabled=1) * 100.0 / ?
+         ) END,
+         updated_at=updated_at
+     WHERE deleted_at IS NULL`
+  ).bind(total,total,total).run();
+}
+
 async function bootstrapStatus(env) {
   const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
   return Number(row?.n || 0) === 0;
@@ -500,8 +515,7 @@ async function createProgressDef(request, env, user) {
   await env.DB.prepare(
     "INSERT INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)"
   ).bind(id,label,String(b.description||""),b.enabled===false?0:1,safeInt(b.sortOrder,100,0,100000),String(b.color||"#2563eb"),t,t).run();
-  const customers=await env.DB.prepare("SELECT id FROM customers WHERE deleted_at IS NULL LIMIT 500").all();
-  for(const c of customers.results||[]) await recalcProgress(env,c.id);
+  await recalcAllProgress(env);
   await audit(env,user,"create","progress_definition",id,{label});
   return responseJson({ok:true,id},201);
 }
@@ -519,7 +533,88 @@ async function updateProgressDef(request, env, user, id) {
     b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
     b.color!==undefined?String(b.color):old.color,t,id
   ).run();
+  await recalcAllProgress(env);
   await audit(env,user,"update","progress_definition",id,b);
+  return responseJson({ok:true});
+}
+
+async function listColumns(env, user) {
+  const r = await env.DB.prepare(
+    "SELECT id,audience,column_key,field_id,label,enabled,sort_order FROM list_columns WHERE audience=? AND enabled=1 ORDER BY sort_order,label"
+  ).bind(user.role).all();
+  return responseJson({ok:true,items:r.results||[]});
+}
+
+async function adminListColumns(request, env) {
+  const url=new URL(request.url);
+  const audience=url.searchParams.get("audience")==="sales"?"sales":"admin";
+  const r=await env.DB.prepare(
+    "SELECT id,audience,column_key,field_id,label,enabled,sort_order FROM list_columns WHERE audience=? ORDER BY sort_order,label"
+  ).bind(audience).all();
+  const fields=await env.DB.prepare("SELECT id,label,field_key FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label").all();
+  return responseJson({ok:true,audience,items:r.results||[],fields:fields.results||[]});
+}
+
+async function saveListColumns(request, env, user) {
+  const b=await readBody(request);
+  const audience=b.audience==="sales"?"sales":"admin";
+  const items=Array.isArray(b.items)?b.items:[];
+  const statements=[env.DB.prepare("DELETE FROM list_columns WHERE audience=?").bind(audience)];
+  let sort=10;
+  for(const item of items){
+    if(item.columnKey==="dynamic" && !item.fieldId) continue;
+    statements.push(env.DB.prepare(
+      "INSERT INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order) VALUES(?,?,?,?,?,?,?)"
+    ).bind(uid("lc_"),audience,String(item.columnKey||"dynamic"),item.fieldId||null,String(item.label||""),item.enabled===false?0:1,sort));
+    sort+=10;
+  }
+  await env.DB.batch(statements);
+  await audit(env,user,"replace","list_columns",audience,{count:items.length});
+  return responseJson({ok:true});
+}
+
+async function dashboardWidgets(env,user){
+  const r=await env.DB.prepare(
+    "SELECT id,audience,widget_type,title,enabled,sort_order,config_json FROM dashboard_widgets WHERE audience=? AND enabled=1 ORDER BY sort_order,title"
+  ).bind(user.role).all();
+  return responseJson({ok:true,items:r.results||[]});
+}
+
+async function adminDashboardWidgets(request,env){
+  const url=new URL(request.url);
+  const audience=url.searchParams.get("audience")==="sales"?"sales":"admin";
+  const r=await env.DB.prepare(
+    "SELECT id,audience,widget_type,title,enabled,sort_order,config_json FROM dashboard_widgets WHERE audience=? ORDER BY sort_order,title"
+  ).bind(audience).all();
+  return responseJson({ok:true,audience,items:r.results||[]});
+}
+
+async function createDashboardWidget(request,env,user){
+  const b=await readBody(request);
+  const allowed=["metric_total","metric_today","metric_complete","metric_archived","sales_breakdown"];
+  const type=allowed.includes(b.widgetType)?b.widgetType:"metric_total";
+  const audience=b.audience==="sales"?"sales":"admin";
+  const id=uid("dw_"),t=now();
+  await env.DB.prepare(
+    "INSERT INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
+  ).bind(id,audience,type,String(b.title||"统计组件"),b.enabled===false?0:1,safeInt(b.sortOrder,100,0,100000),JSON.stringify(b.config||{})).run();
+  await audit(env,user,"create","dashboard_widget",id,b);
+  return responseJson({ok:true,id},201);
+}
+
+async function updateDashboardWidget(request,env,user,id){
+  const old=await env.DB.prepare("SELECT * FROM dashboard_widgets WHERE id=?").bind(id).first();
+  if(!old)return fail("仪表盘组件不存在",404);
+  const b=await readBody(request);
+  const allowed=["metric_total","metric_today","metric_complete","metric_archived","sales_breakdown"];
+  const type=b.widgetType!==undefined&&allowed.includes(b.widgetType)?b.widgetType:old.widget_type;
+  const audience=b.audience!==undefined?(b.audience==="sales"?"sales":"admin"):old.audience;
+  await env.DB.prepare(
+    "UPDATE dashboard_widgets SET audience=?,widget_type=?,title=?,enabled=?,sort_order=?,config_json=? WHERE id=?"
+  ).bind(audience,type,b.title!==undefined?String(b.title):old.title,b.enabled!==undefined?(b.enabled?1:0):old.enabled,
+    b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
+    b.config!==undefined?JSON.stringify(b.config):old.config_json,id).run();
+  await audit(env,user,"update","dashboard_widget",id,b);
   return responseJson({ok:true});
 }
 
@@ -677,6 +772,8 @@ async function api(request, env) {
   }});
   if (path === "/api/logout" && method === "POST") return handleLogout(request, env, user);
   if (path === "/api/sidebar" && method === "GET") return listSidebar(env,user);
+  if (path === "/api/list-columns" && method === "GET") return listColumns(env,user);
+  if (path === "/api/dashboard-widgets" && method === "GET") return dashboardWidgets(env,user);
   if (path === "/api/fields" && method === "GET") return listFields(env,user);
   if (path === "/api/progress-defs" && method === "GET") return listProgressDefs(env,user);
   if (path === "/api/customers" && method === "GET") return listCustomers(request,env,user);
@@ -727,6 +824,17 @@ async function api(request, env) {
   }
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
+  if (path === "/api/admin/list-columns" && method === "GET") return adminListColumns(request,env);
+  if (path === "/api/admin/list-columns" && method === "PUT") return saveListColumns(request,env,user);
+  if (path === "/api/admin/dashboard-widgets" && method === "GET") return adminDashboardWidgets(request,env);
+  if (path === "/api/admin/dashboard-widgets" && method === "POST") return createDashboardWidget(request,env,user);
+  m=path.match(/^\/api\/admin\/dashboard-widgets\/([^/]+)$/);
+  if(m && method==="PATCH") return updateDashboardWidget(request,env,user,m[1]);
+  if(m && method==="DELETE"){
+    await env.DB.prepare("DELETE FROM dashboard_widgets WHERE id=?").bind(m[1]).run();
+    await audit(env,user,"delete","dashboard_widget",m[1],{});
+    return responseJson({ok:true});
+  }
 
   return fail("接口不存在",404,"NOT_FOUND");
 }
