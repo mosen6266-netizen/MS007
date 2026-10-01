@@ -2081,6 +2081,7 @@ async function renderTelegramSettings(view){
 
   const queueMonitor=r.queueMonitor||{};
   const unresolvedInitial=Array.isArray(r.unresolved?.items)?r.unresolved.items:[];
+  let currentTelegramUnresolvedItems=unresolvedInitial;
   let telegramBulkRetryRunning=false;
   const telegramManualFailureCount=items=>(items||[]).filter(
     x=>x.status==="needs_admin" || x.source==="delivery"
@@ -2248,7 +2249,7 @@ async function renderTelegramSettings(view){
           <p class="muted" id="tgUnresolvedMeta" style="margin:6px 0 0">这里自动汇总所有最终还没有成功的 Telegram 通知，包括等待发送、自动重试、需要管理员处理、已跳过和旧失败记录。发送成功后会自动从这里消失，不需要你再翻历史记录。</p>
         </div>
         <div class="row wrap">
-          <button class="btn secondary small" id="tgRetryAllFailed" ${telegramManualFailureCount(unresolvedInitial)?"":"disabled"}>一键重新发送全部失败</button>
+          <button class="btn secondary small" id="tgRetryAllFailed" ${telegramManualFailureCount(unresolvedInitial)?"":"disabled"}>${telegramManualFailureCount(unresolvedInitial)?("一键重新发送全部失败（"+telegramManualFailureCount(unresolvedInitial)+"）"):"当前没有失败需要重发"}</button>
           <button class="btn ghost small" id="tgUnresolvedRefresh">立即刷新</button>
         </div>
       </div>
@@ -2427,6 +2428,7 @@ async function renderTelegramSettings(view){
     try{
       const out=await api("/api/admin/telegram/unresolved");
       const items=Array.isArray(out.items)?out.items:[];
+      currentTelegramUnresolvedItems=items;
       body.innerHTML=telegramUnresolvedRowsHtml(items);
       const count=document.querySelector("#tgUnresolvedCount");
       if(count)count.textContent=money(items.length);
@@ -2449,13 +2451,7 @@ async function renderTelegramSettings(view){
 
   document.querySelector("#tgRetryAllFailed").onclick=async()=>{
     if(telegramBulkRetryRunning)return;
-    const initialFailures=telegramManualFailureCount(
-      Array.from(document.querySelectorAll("#tgUnresolvedBody [data-tg-unresolved-retry]"))
-        .map(btn=>({
-          status:btn.dataset.tgUnresolvedSource==="delivery"?"failed":"needs_admin",
-          source:btn.dataset.tgUnresolvedSource||"queue"
-        }))
-    );
+    const initialFailures=telegramManualFailureCount(currentTelegramUnresolvedItems);
     if(!initialFailures){
       toast("当前没有需要重新发送的失败通知");
       return;
@@ -2520,6 +2516,7 @@ async function renderTelegramSettings(view){
       if(currentBtn){
         const out=await api("/api/admin/telegram/unresolved").catch(()=>null);
         const items=Array.isArray(out?.items)?out.items:[];
+        currentTelegramUnresolvedItems=items;
         const failedCount=telegramManualFailureCount(items);
         currentBtn.disabled=failedCount===0;
         currentBtn.textContent=failedCount?("一键重新发送全部失败（"+failedCount+"）"):"当前没有失败需要重发";
