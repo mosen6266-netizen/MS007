@@ -62,6 +62,53 @@ value=con.execute(
 ).fetchone()[0]
 assert value=="first@example.com", value
 
+# Guarded progress UPSERT must also obey the edit version.
+con.execute(
+    """INSERT INTO progress_definitions(
+      id,label,description,enabled,sort_order,color,created_at,updated_at
+    ) VALUES('p_integrity','Integrity Progress','',1,999,'#2563eb',datetime('now'),datetime('now'))"""
+)
+con.execute(
+    """INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
+       SELECT ?,?,?,?,datetime('now')
+       WHERE EXISTS(SELECT 1 FROM customers WHERE id=? AND edit_version=?)
+       ON CONFLICT(customer_id,progress_id) DO UPDATE SET
+         completed=excluded.completed,
+         completed_by=excluded.completed_by,
+         completed_at=excluded.completed_at""",
+    ("c_integrity","p_integrity",1,"u_integrity","c_integrity",2),
+)
+assert con.execute(
+    "SELECT completed FROM customer_progress WHERE customer_id='c_integrity' AND progress_id='p_integrity'"
+).fetchone()[0]==1
+
+cur=con.execute(
+    "UPDATE customers SET edit_version=edit_version+1 WHERE id=? AND edit_version=?",
+    ("c_integrity",2),
+)
+assert cur.rowcount==1
+
+# Stale version 2 cannot undo the version 3 progress.
+con.execute(
+    """INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
+       SELECT ?,?,?,?,?,?
+       WHERE 0""",
+    ("noop","noop",0,None,None,None),
+)
+con.execute(
+    """INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
+       SELECT ?,?,?,?,NULL
+       WHERE EXISTS(SELECT 1 FROM customers WHERE id=? AND edit_version=?)
+       ON CONFLICT(customer_id,progress_id) DO UPDATE SET
+         completed=excluded.completed,
+         completed_by=excluded.completed_by,
+         completed_at=excluded.completed_at""",
+    ("c_integrity","p_integrity",0,"u_integrity","c_integrity",2),
+)
+assert con.execute(
+    "SELECT completed FROM customer_progress WHERE customer_id='c_integrity' AND progress_id='p_integrity'"
+).fetchone()[0]==1
+
 worker=(root/"src/worker.js").read_text(encoding="utf-8")
 app=(root/"public/app.js").read_text(encoding="utf-8")
 assert "/api/admin/sales-options" in worker
