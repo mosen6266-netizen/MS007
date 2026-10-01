@@ -75,6 +75,9 @@ jobs:
       - name: Batch 1 customer integrity regression
         run: python tests/batch1_integrity.py
 
+      - name: Batch 2 referential integrity regression
+        run: python tests/batch2_integrity.py
+
   staging:
     needs: validate
     runs-on: ubuntu-latest
