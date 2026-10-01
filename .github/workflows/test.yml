@@ -64,7 +64,7 @@ jobs:
               "sidebar_categories","sidebar_item_categories","list_columns",
               "dashboard_widgets","audit_logs","system_settings","telegram_settings",
               "telegram_progress_routes","telegram_delivery_logs","telegram_send_queue",
-              "telegram_chat_rate","customer_search_index","maintenance_jobs","ms007_migration_guard"
+              "telegram_chat_rate","customer_search_index","maintenance_jobs","dashboard_statistics_cache","ms007_migration_guard"
           }
           tables={r[0] for r in con.execute("select name from sqlite_master where type='table'")}
           missing=sorted(required-tables)
@@ -94,6 +94,9 @@ jobs:
 
       - name: Batch 5 draft and Telegram reliability regression
         run: python tests/batch5_reliability.py
+
+      - name: Batch 7 scale and statistics cache regression
+        run: python tests/batch7_scale.py
 
       - name: Verify bootstrap defaults do not leak into migration files
         shell: bash
