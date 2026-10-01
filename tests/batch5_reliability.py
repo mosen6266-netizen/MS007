@@ -19,12 +19,16 @@ assert "localStorage.removeItem(storageKey)" in draft_block
 
 for token in [
     "async function telegramQueueMonitor",
+    "async function telegramUnresolvedItems",
     "async function retryTelegramQueueItem",
+    "async function retryTelegramDeliveryLog",
     "MAX_AUTO_ATTEMPTS=8",
     "requires_admin",
     "dead_lettered_at",
     "needs_admin",
     "retryTelegramQueueItem(env,user,m[1],ctx)",
+    "retryTelegramDeliveryLog(request,env,user,m[1],ctx)",
+    "/api/admin/telegram/unresolved",
 ]:
     assert token in worker,token
 
@@ -42,11 +46,45 @@ for token in [
     "queueMonitor.needsAdminCount",
     "queueMonitor.oldestWaitSeconds",
     "queueMonitor.recentSuccessRate",
+    "未发送成功",
+    "tgUnresolvedBody",
+    "tgUnresolvedRefresh",
+    "data-tg-unresolved-retry",
+    "/api/admin/telegram/unresolved",
+    "每 5 秒自动检查一次",
     "需要管理员处理",
     "data-tg-retry",
     "手动重试",
 ]:
     assert token in telegram_ui,token
+
+# The unresolved center must merge live queue rows with unresolved failed/skipped
+# delivery logs, and hide old failures after a later success or a newer queue item.
+unresolved=worker[worker.index("async function telegramUnresolvedItems"):worker.index("async function telegramQueueMonitor")]
+for token in [
+    "FROM telegram_send_queue q",
+    "l.status IN ('failed','skipped')",
+    "s.status='success'",
+    "NOT EXISTS",
+    "q2.created_at>=l.created_at",
+]:
+    assert token in unresolved,token
+
+# Successful sends delete the queue row, so the unresolved center automatically
+# loses pending/retry/admin-attention entries once Telegram accepts the message.
+process=worker[worker.index("async function processTelegramQueue"):worker.index("async function telegramAdminGet")]
+assert "status:\"success\"" in process
+assert 'DELETE FROM telegram_send_queue WHERE id=?' in process
+
+# Manual resend supports both live queue items and historical failed/skipped logs.
+retry_log=worker[worker.index("async function retryTelegramDeliveryLog"):worker.index("async function bumpVersion")]
+for token in [
+    "sendTelegramProgressNotification",
+    "{manual:true}",
+    "Telegram Bot Token 未设置",
+    "这个进度没有可用的通知群",
+]:
+    assert token in retry_log,token
 
 con=sqlite3.connect(":memory:")
 con.execute("PRAGMA foreign_keys=ON")
