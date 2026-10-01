@@ -1160,21 +1160,33 @@ async function dashboardWidgets(env,user){
 async function adminDashboardWidgets(request,env){
   const url=new URL(request.url);
   const audience=url.searchParams.get("audience")==="sales"?"sales":"admin";
-  const r=await env.DB.prepare(
-    "SELECT id,audience,widget_type,title,enabled,sort_order,config_json FROM dashboard_widgets WHERE audience=? ORDER BY sort_order,title"
-  ).bind(audience).all();
-  return responseJson({ok:true,audience,items:r.results||[]});
+  const [r,p]=await Promise.all([
+    env.DB.prepare(
+      "SELECT id,audience,widget_type,title,enabled,sort_order,config_json FROM dashboard_widgets WHERE audience=? ORDER BY sort_order,title"
+    ).bind(audience).all(),
+    env.DB.prepare(
+      "SELECT id,label,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
+    ).all()
+  ]);
+  return responseJson({ok:true,audience,items:r.results||[],progressDefs:p.results||[]});
 }
 
 async function createDashboardWidget(request,env,user){
   const b=await readBody(request);
-  const allowed=["metric_total","metric_today","metric_complete","metric_archived","sales_breakdown"];
+  const allowed=["metric_total","metric_today","metric_complete","metric_archived","metric_progress","sales_breakdown"];
   const type=allowed.includes(b.widgetType)?b.widgetType:"metric_total";
   const audience=b.audience==="sales"?"sales":"admin";
   const id=uid("dw_"),t=now();
+  let config=b.config&&typeof b.config==="object"?b.config:{};
+  if(type==="metric_progress"){
+    const progressId=String(config.progressId||"");
+    const exists=await env.DB.prepare("SELECT id FROM progress_definitions WHERE id=? AND enabled=1").bind(progressId).first();
+    if(!exists)return fail("请选择有效的客户进度");
+    config={progressId};
+  }
   await env.DB.prepare(
     "INSERT INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
-  ).bind(id,audience,type,String(b.title||"统计组件"),b.enabled===false?0:1,safeInt(b.sortOrder,100,0,100000),JSON.stringify(b.config||{})).run();
+  ).bind(id,audience,type,String(b.title||"统计组件"),b.enabled===false?0:1,safeInt(b.sortOrder,100,0,100000),JSON.stringify(config)).run();
   await audit(env,user,"create","dashboard_widget",id,b);
   return responseJson({ok:true,id},201);
 }
@@ -1183,14 +1195,22 @@ async function updateDashboardWidget(request,env,user,id){
   const old=await env.DB.prepare("SELECT * FROM dashboard_widgets WHERE id=?").bind(id).first();
   if(!old)return fail("仪表盘组件不存在",404);
   const b=await readBody(request);
-  const allowed=["metric_total","metric_today","metric_complete","metric_archived","sales_breakdown"];
+  const allowed=["metric_total","metric_today","metric_complete","metric_archived","metric_progress","sales_breakdown"];
   const type=b.widgetType!==undefined&&allowed.includes(b.widgetType)?b.widgetType:old.widget_type;
   const audience=b.audience!==undefined?(b.audience==="sales"?"sales":"admin"):old.audience;
+  let configJson=b.config!==undefined?JSON.stringify(b.config):old.config_json;
+  if(type==="metric_progress"){
+    let cfg={};try{cfg=b.config!==undefined?b.config:JSON.parse(old.config_json||"{}")}catch{}
+    const progressId=String(cfg?.progressId||"");
+    const exists=await env.DB.prepare("SELECT id FROM progress_definitions WHERE id=? AND enabled=1").bind(progressId).first();
+    if(!exists)return fail("请选择有效的客户进度");
+    configJson=JSON.stringify({progressId});
+  }
   await env.DB.prepare(
     "UPDATE dashboard_widgets SET audience=?,widget_type=?,title=?,enabled=?,sort_order=?,config_json=? WHERE id=?"
   ).bind(audience,type,b.title!==undefined?String(b.title):old.title,b.enabled!==undefined?(b.enabled?1:0):old.enabled,
     b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
-    b.config!==undefined?JSON.stringify(b.config):old.config_json,id).run();
+    configJson,id).run();
   await audit(env,user,"update","dashboard_widget",id,b);
   return responseJson({ok:true});
 }
@@ -1354,29 +1374,71 @@ async function updateSidebarItem(request, env, user, id) {
   return responseJson({ok:true});
 }
 
-async function stats(env, user) {
-  const where=normalizedRole(user.role)==="sales"?"deleted_at IS NULL AND assigned_user_id=?":"deleted_at IS NULL";
-  const bind=normalizedRole(user.role)==="sales"?[user.id]:[];
+async function stats(request, env, user) {
+  const url=new URL(request.url);
+  const period=["total","today","week"].includes(url.searchParams.get("period"))?url.searchParams.get("period"):"total";
+  const fromRaw=String(url.searchParams.get("from")||"").trim();
+  const from=(period!=="total" && /^\d{4}-\d{2}-\d{2}T/.test(fromRaw))?fromRaw:null;
+
+  const salesOnly=normalizedRole(user.role)==="sales";
+  const ownerSql=salesOnly?" AND c.assigned_user_id=?":"";
+  const ownerBind=salesOnly?[user.id]:[];
+  const createdPeriodSql=from?" AND c.created_at>=?":"";
+  const createdBind=from?[from]:[];
+
   const base=await env.DB.prepare(
     `SELECT COUNT(*) total,
-      SUM(CASE WHEN date(created_at)=date('now') THEN 1 ELSE 0 END) today,
-      SUM(CASE WHEN progress_percent=100 THEN 1 ELSE 0 END) completed,
-      SUM(CASE WHEN archived=1 THEN 1 ELSE 0 END) archived
-     FROM customers WHERE ${where}`
-  ).bind(...bind).first();
+      SUM(CASE WHEN c.progress_percent=100 THEN 1 ELSE 0 END) completed
+     FROM customers c
+     WHERE c.deleted_at IS NULL AND c.archived=0${ownerSql}${createdPeriodSql}`
+  ).bind(...ownerBind,...createdBind).first();
+
+  const todayStart=new Date(); // fallback only; UI normally supplies local boundary.
+  todayStart.setUTCHours(0,0,0,0);
+  const todayIso=todayStart.toISOString();
+  const today=await env.DB.prepare(
+    `SELECT COUNT(*) n FROM customers c
+      WHERE c.deleted_at IS NULL AND c.archived=0${ownerSql} AND c.created_at>=?`
+  ).bind(...ownerBind,todayIso).first();
+
+  const progressRows=await env.DB.prepare(
+    `SELECT cp.progress_id, COUNT(DISTINCT cp.customer_id) n
+     FROM customer_progress cp
+     JOIN customers c ON c.id=cp.customer_id
+     WHERE cp.completed=1
+       AND c.deleted_at IS NULL
+       AND c.archived=0
+       ${salesOnly?"AND c.assigned_user_id=?":""}
+       ${from?"AND cp.completed_at>=?":""}
+     GROUP BY cp.progress_id`
+  ).bind(...ownerBind,...createdBind).all();
+
+  const progressCounts={};
+  for(const row of progressRows.results||[])progressCounts[row.progress_id]=Number(row.n||0);
+
   let sales=[];
   if(normalizedRole(user.role)==="admin"){
     const r=await env.DB.prepare(
       `SELECT u.id,u.display_name,COUNT(c.id) customer_count,
        COALESCE(ROUND(AVG(c.progress_percent)),0) avg_progress
-       FROM users u LEFT JOIN customers c ON c.assigned_user_id=u.id AND c.deleted_at IS NULL
-       WHERE u.role='sales' AND u.active=1 GROUP BY u.id,u.display_name ORDER BY customer_count DESC,u.display_name`
-    ).all();
+       FROM users u
+       LEFT JOIN customers c ON c.assigned_user_id=u.id
+         AND c.deleted_at IS NULL
+         AND c.archived=0
+         ${from?"AND c.created_at>=?":""}
+       WHERE u.role='sales' AND u.active=1
+       GROUP BY u.id,u.display_name
+       ORDER BY customer_count DESC,u.display_name`
+    ).bind(...createdBind).all();
     sales=r.results||[];
   }
-  return responseJson({ok:true,summary:{
-    total:Number(base?.total||0),today:Number(base?.today||0),completed:Number(base?.completed||0),archived:Number(base?.archived||0)
-  },sales});
+
+  return responseJson({ok:true,period,from:from||null,summary:{
+    total:Number(base?.total||0),
+    today:Number(today?.n||0),
+    completed:Number(base?.completed||0),
+    archived:0
+  },progressCounts,sales});
 }
 
 async function capacity(env) {
@@ -1720,7 +1782,7 @@ async function api(request, env, ctx) {
   if (path === "/api/progress-defs" && method === "GET") return listProgressDefs(env,user);
   if (path === "/api/customers" && method === "GET") return listCustomers(request,env,user);
   if (path === "/api/customers" && method === "POST") return createCustomer(request,env,user);
-  if (path === "/api/stats" && method === "GET") return stats(env,user);
+  if (path === "/api/stats" && method === "GET") return stats(request,env,user);
 
   let m=path.match(/^\/api\/customers\/([^/]+)$/);
   if(m && method==="GET") return getCustomer(env,user,m[1]);
