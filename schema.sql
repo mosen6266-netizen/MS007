@@ -246,6 +246,16 @@ INSERT OR IGNORE INTO telegram_settings
 VALUES
 (1,0,'','','','[{"key":"sales_name","label":"业务员"},{"key":"customer_name","label":"客户姓名"},{"key":"completed_progress","label":"已完成进度"},{"key":"next_progress","label":"下一步进度"},{"key":"progress_percent","label":"当前完成度"}]',0,'查看客户详情',datetime('now'));
 
+CREATE TABLE IF NOT EXISTS telegram_progress_routes (
+  progress_id TEXT PRIMARY KEY,
+  route_mode TEXT NOT NULL CHECK (route_mode IN ('replace','additional')),
+  chat_id TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (progress_id) REFERENCES progress_definitions(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_progress_routes_mode
+ON telegram_progress_routes(route_mode);
+
 CREATE TABLE IF NOT EXISTS telegram_delivery_logs (
   id TEXT PRIMARY KEY,
   customer_id TEXT,
