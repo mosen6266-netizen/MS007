@@ -132,9 +132,13 @@ function safeInt(v, fallback, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function encodeCursor(row) {
-  return btoa(unescape(encodeURIComponent(JSON.stringify([row.updated_at, row.id]))))
+function encodeKeysetCursor(sortValue,id) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify([sortValue,id]))))
     .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+function encodeCursor(row) {
+  return encodeKeysetCursor(row.updated_at,row.id);
 }
 
 function decodeCursor(value) {
@@ -152,6 +156,188 @@ async function getSystemSetting(env, key, fallback = null) {
   const row = await env.DB.prepare("SELECT value_json FROM system_settings WHERE setting_key=?").bind(key).first();
   if (!row) return fallback;
   try { return JSON.parse(row.value_json); } catch { return fallback; }
+}
+
+
+async function setSystemSetting(env,key,value){
+  const t=now();
+  await env.DB.prepare(
+    `INSERT INTO system_settings(setting_key,value_json,updated_at) VALUES(?,?,?)
+     ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
+  ).bind(key,JSON.stringify(value),t).run();
+}
+
+function searchFieldPredicate(alias="fd"){
+  return `(${alias}.searchable=1 OR ${alias}.field_type IN ('phone','email')
+    OR LOWER(${alias}.field_key) LIKE '%case%'
+    OR ${alias}.label LIKE '%案件编号%')`;
+}
+
+async function rebuildCustomerSearchIndex(env,customerId){
+  const row=await env.DB.prepare(
+    `SELECT c.id,c.name,
+      GROUP_CONCAT(CASE WHEN fd.id IS NOT NULL THEN cv.value END,' ') searchable_values
+     FROM customers c
+     LEFT JOIN customer_values cv ON cv.customer_id=c.id
+     LEFT JOIN field_definitions fd
+       ON fd.id=cv.field_id AND fd.enabled=1 AND ${searchFieldPredicate("fd")}
+     WHERE c.id=?
+     GROUP BY c.id,c.name`
+  ).bind(customerId).first();
+  if(!row)return;
+  const searchText=[row.name||"",row.searchable_values||""]
+    .join(" ").replace(/\s+/g," ").trim().toLowerCase();
+  await env.DB.prepare(
+    `INSERT INTO customer_search_index(customer_id,search_text,updated_at) VALUES(?,?,?)
+     ON CONFLICT(customer_id) DO UPDATE SET
+       search_text=excluded.search_text,updated_at=excluded.updated_at`
+  ).bind(customerId,searchText,now()).run();
+}
+
+async function queueMaintenanceJob(env,taskKey){
+  if(!["search_index_rebuild","progress_recalc"].includes(taskKey))return;
+  const totalRow=await env.DB.prepare(
+    "SELECT COUNT(*) n FROM customers WHERE deleted_at IS NULL"
+  ).first();
+  const total=Number(totalRow?.n||0);
+  const t=now();
+  await env.DB.prepare(
+    `INSERT INTO maintenance_jobs(
+      task_key,status,cursor_id,processed,total,detail_json,requested_at,started_at,updated_at,completed_at
+     ) VALUES(?,'pending','',0,?,'{}',?,NULL,?,NULL)
+     ON CONFLICT(task_key) DO UPDATE SET
+       status='pending',cursor_id='',processed=0,total=excluded.total,
+       detail_json='{}',requested_at=excluded.requested_at,started_at=NULL,
+       updated_at=excluded.updated_at,completed_at=NULL`
+  ).bind(taskKey,total,t,t).run();
+  if(taskKey==="search_index_rebuild")await setSystemSetting(env,"search_index_ready_v1",false);
+}
+
+async function maintenanceStatus(env){
+  const r=await env.DB.prepare(
+    `SELECT task_key,status,processed,total,requested_at,started_at,updated_at,completed_at
+     FROM maintenance_jobs ORDER BY task_key`
+  ).all();
+  const labels={
+    search_index_rebuild:"客户搜索索引",
+    progress_recalc:"客户进度重算"
+  };
+  return (r.results||[]).map(x=>({
+    ...x,
+    label:labels[x.task_key]||x.task_key,
+    processed:Number(x.processed||0),
+    total:Number(x.total||0)
+  }));
+}
+
+async function processMaintenanceBatch(env,{batchSize=100}={}){
+  const job=await env.DB.prepare(
+    `SELECT * FROM maintenance_jobs
+     WHERE status IN ('pending','running')
+     ORDER BY CASE status WHEN 'running' THEN 0 ELSE 1 END,requested_at
+     LIMIT 1`
+  ).first();
+  if(!job)return {ok:true,idle:true};
+
+  const t=now();
+  if(job.status!=="running"){
+    await env.DB.prepare(
+      "UPDATE maintenance_jobs SET status='running',started_at=COALESCE(started_at,?),updated_at=? WHERE task_key=?"
+    ).bind(t,t,job.task_key).run();
+  }
+
+  const cursor=String(job.cursor_id||"");
+  const limit=Math.max(10,Math.min(200,Number(batchSize||100)));
+  let rows=[];
+
+  if(job.task_key==="search_index_rebuild"){
+    const r=await env.DB.prepare(
+      `SELECT c.id,c.name,
+        GROUP_CONCAT(CASE WHEN fd.id IS NOT NULL THEN cv.value END,' ') searchable_values
+       FROM customers c
+       LEFT JOIN customer_values cv ON cv.customer_id=c.id
+       LEFT JOIN field_definitions fd
+         ON fd.id=cv.field_id AND fd.enabled=1 AND ${searchFieldPredicate("fd")}
+       WHERE c.deleted_at IS NULL AND c.id>?
+       GROUP BY c.id,c.name
+       ORDER BY c.id
+       LIMIT ?`
+    ).bind(cursor,limit).all();
+    rows=r.results||[];
+    const statements=rows.map(row=>{
+      const searchText=[row.name||"",row.searchable_values||""]
+        .join(" ").replace(/\s+/g," ").trim().toLowerCase();
+      return env.DB.prepare(
+        `INSERT INTO customer_search_index(customer_id,search_text,updated_at) VALUES(?,?,?)
+         ON CONFLICT(customer_id) DO UPDATE SET
+           search_text=excluded.search_text,updated_at=excluded.updated_at`
+      ).bind(row.id,searchText,t);
+    });
+    if(statements.length)await env.DB.batch(statements);
+  }else if(job.task_key==="progress_recalc"){
+    const r=await env.DB.prepare(
+      `SELECT id FROM customers
+       WHERE deleted_at IS NULL AND id>?
+       ORDER BY id LIMIT ?`
+    ).bind(cursor,limit).all();
+    rows=r.results||[];
+    const totalRow=await env.DB.prepare(
+      "SELECT COUNT(*) n FROM progress_definitions WHERE enabled=1"
+    ).first();
+    const progressTotal=Number(totalRow?.n||0);
+    const statements=rows.map(row=>env.DB.prepare(
+      `UPDATE customers SET
+         progress_total=?,
+         progress_done=(
+           SELECT COUNT(*) FROM customer_progress cp
+           JOIN progress_definitions pd ON pd.id=cp.progress_id
+           WHERE cp.customer_id=customers.id AND cp.completed=1 AND pd.enabled=1
+         ),
+         progress_percent=CASE WHEN ?=0 THEN 0 ELSE ROUND((
+           SELECT COUNT(*) FROM customer_progress cp
+           JOIN progress_definitions pd ON pd.id=cp.progress_id
+           WHERE cp.customer_id=customers.id AND cp.completed=1 AND pd.enabled=1
+         )*100.0/?) END
+       WHERE id=?`
+    ).bind(progressTotal,progressTotal,progressTotal,row.id));
+    if(statements.length)await env.DB.batch(statements);
+  }else{
+    await env.DB.prepare(
+      "UPDATE maintenance_jobs SET status='failed',detail_json=?,updated_at=? WHERE task_key=?"
+    ).bind(JSON.stringify({message:"unknown task"}),t,job.task_key).run();
+    return {ok:false,taskKey:job.task_key};
+  }
+
+  const processed=Math.min(Number(job.total||0),Number(job.processed||0)+rows.length);
+  const lastId=rows.length?String(rows[rows.length-1].id):cursor;
+  const complete=rows.length<limit;
+
+  await env.DB.prepare(
+    `UPDATE maintenance_jobs SET
+      status=?,cursor_id=?,processed=?,updated_at=?,completed_at=?
+     WHERE task_key=?`
+  ).bind(
+    complete?"complete":"running",
+    lastId,complete?Number(job.total||processed):processed,t,complete?t:null,job.task_key
+  ).run();
+
+  if(complete&&job.task_key==="search_index_rebuild"){
+    const counts=await env.DB.prepare(
+      `SELECT
+        (SELECT COUNT(*) FROM customers WHERE deleted_at IS NULL) customer_count,
+        (SELECT COUNT(*) FROM customer_search_index si
+          JOIN customers c ON c.id=si.customer_id WHERE c.deleted_at IS NULL) index_count`
+    ).first();
+    const ready=Number(counts?.customer_count||0)===Number(counts?.index_count||0);
+    await setSystemSetting(env,"search_index_ready_v1",ready);
+    if(!ready){
+      await env.DB.prepare(
+        "UPDATE maintenance_jobs SET status='failed',detail_json=?,updated_at=? WHERE task_key='search_index_rebuild'"
+      ).bind(JSON.stringify({message:"index count verification failed",...counts}),t).run();
+    }
+  }
+
+  return {ok:true,taskKey:job.task_key,processed:rows.length,complete};
 }
 
 
@@ -621,9 +807,9 @@ async function telegramAdminGet(env){
 
 async function telegramLogs(request,env){
   const url=new URL(request.url);
-  const page=safeInt(url.searchParams.get("page"),1,1,1000000);
   const limit=safeInt(url.searchParams.get("limit"),50,1,100);
   const status=String(url.searchParams.get("status")||"").trim();
+  const cursor=decodeCursor(url.searchParams.get("cursor"));
   const allowedStatus=new Set(["pending","retry","success","failed","skipped"]);
   const statusFilter=allowedStatus.has(status)?status:"";
 
@@ -653,25 +839,32 @@ async function telegramLogs(request,env){
     LEFT JOIN users u ON u.id=q.actor_user_id
     LEFT JOIN progress_definitions p ON p.id=q.progress_id
   `;
-  const whereSql=statusFilter?"WHERE activity.status=?":"";
-  const binds=statusFilter?[statusFilter]:[];
 
-  const totalRow=await env.DB.prepare(
-    `SELECT COUNT(*) n FROM (${baseSql}) activity ${whereSql}`
-  ).bind(...binds).first();
-  const total=Number(totalRow?.n||0);
-  const pages=Math.max(1,Math.ceil(total/limit));
-  const offset=(page-1)*limit;
-
+  const where=[];
+  const binds=[];
+  if(statusFilter){where.push("activity.status=?");binds.push(statusFilter);}
+  if(cursor&&Array.isArray(cursor)&&cursor.length===2){
+    where.push("(activity.created_at < ? OR (activity.created_at=? AND activity.id < ?))");
+    binds.push(cursor[0],cursor[0],cursor[1]);
+  }
+  const whereSql=where.length?"WHERE "+where.join(" AND "):"";
   const r=await env.DB.prepare(
     `SELECT * FROM (${baseSql}) activity
      ${whereSql}
      ORDER BY activity.created_at DESC,activity.id DESC
-     LIMIT ? OFFSET ?`
-  ).bind(...binds,limit,offset).all();
+     LIMIT ?`
+  ).bind(...binds,limit+1).all();
 
-  return responseJson({ok:true,items:r.results||[],page,limit,total,pages,status:statusFilter});
+  const rows=r.results||[];
+  const hasMore=rows.length>limit;
+  const items=rows.slice(0,limit);
+  const last=items[items.length-1];
+  return responseJson({
+    ok:true,items,limit,status:statusFilter,
+    nextCursor:hasMore&&last?encodeKeysetCursor(last.created_at,last.id):null
+  });
 }
+
 async function telegramAdminSave(request,env,user){
   const b=await readBody(request);
   const old=await telegramSettingsRow(env);
@@ -955,153 +1148,7 @@ async function recalcProgress(env, customerId) {
 }
 
 async function recalcAllProgress(env) {
-  const totalRow = await env.DB.prepare("SELECT COUNT(*) n FROM progress_definitions WHERE enabled=1").first();
-  const total = Number(totalRow?.n || 0);
-  await env.DB.prepare(
-    `UPDATE customers
-     SET progress_total=?,
-         progress_done=(SELECT COUNT(*) FROM customer_progress cp JOIN progress_definitions pd ON pd.id=cp.progress_id WHERE cp.customer_id=customers.id AND cp.completed=1 AND pd.enabled=1),
-         progress_percent=CASE WHEN ?=0 THEN 0 ELSE ROUND(
-           (SELECT COUNT(*) FROM customer_progress cp JOIN progress_definitions pd ON pd.id=cp.progress_id WHERE cp.customer_id=customers.id AND cp.completed=1 AND pd.enabled=1) * 100.0 / ?
-         ) END,
-         updated_at=updated_at
-     WHERE deleted_at IS NULL`
-  ).bind(total,total,total).run();
-}
-
-async function bootstrapStatus(env) {
-  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
-  return Number(row?.n || 0) === 0;
-}
-
-async function bootstrapDiagnostic(request, env) {
-  const token = request.headers.get("x-bootstrap-token") || "";
-  if (!env.BOOTSTRAP_TOKEN || token !== env.BOOTSTRAP_TOKEN) {
-    return fail("初始化授权无效", 403, "BOOTSTRAP_FORBIDDEN");
-  }
-
-  let step = "start";
-  let testUserId = null;
-  let testUsername = null;
-  try {
-    step = "bootstrap_status";
-    const empty = await bootstrapStatus(env);
-    if (!empty) return responseJson({ ok:true, skipped:true, reason:"already_initialized" });
-
-    step = "password_hash";
-    const salt = newSalt();
-    const iterations = 100000;
-    const hash = await derivePassword("MS007-diagnostic-password", salt, iterations);
-
-    step = "insert_test_user";
-    testUserId = uid("diag_");
-    testUsername = "diag_" + crypto.randomUUID().replace(/-/g,"").slice(0,16);
-    const t = now();
-    await env.DB.prepare(
-      `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
-       VALUES(?,?,?,?,?,?,'admin',0,?,?)`
-    ).bind(testUserId, testUsername, "Diagnostic", hash, salt, iterations, t, t).run();
-
-    step = "insert_audit";
-    const auditId = uid("diag_a_");
-    await env.DB.prepare(
-      "INSERT INTO audit_logs(id,actor_user_id,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?)"
-    ).bind(auditId, testUserId, "diagnostic", "user", testUserId, "{}", now()).run();
-
-    step = "cleanup_audit";
-    await env.DB.prepare("DELETE FROM audit_logs WHERE id=?").bind(auditId).run();
-
-    step = "cleanup_user";
-    await env.DB.prepare("DELETE FROM users WHERE id=?").bind(testUserId).run();
-
-    return responseJson({ ok:true, diagnostic:true });
-  } catch (e) {
-    try {
-      if (testUserId) {
-        await env.DB.prepare("DELETE FROM audit_logs WHERE actor_user_id=? OR entity_id=?").bind(testUserId,testUserId).run();
-        await env.DB.prepare("DELETE FROM users WHERE id=?").bind(testUserId).run();
-      }
-    } catch {}
-    return responseJson({
-      ok:false,
-      diagnostic:true,
-      step,
-      errorName:String(e?.name||"Error"),
-      errorMessage:String(e?.message||e)
-    },500);
-  }
-}
-
-async function handleBootstrap(request, env) {
-  const empty = await bootstrapStatus(env);
-  if (!empty) return fail("系统已经初始化", 409, "ALREADY_INITIALIZED");
-  const token = request.headers.get("x-bootstrap-token") || "";
-  if (!env.BOOTSTRAP_TOKEN || token !== env.BOOTSTRAP_TOKEN) {
-    return fail("初始化授权无效", 403, "BOOTSTRAP_FORBIDDEN");
-  }
-  const body = await readBody(request);
-  const username = String(body.username || "").trim();
-  const displayName = String(body.displayName || "管理员").trim();
-  const password = String(body.password || "");
-  if (username.length < 3 || password.length < 8) {
-    return fail("管理员账号至少3位，密码至少8位");
-  }
-  const salt = newSalt();
-  const iterations = 100000;
-  const hash = await derivePassword(password, salt, iterations);
-  const id = uid("u_");
-  const t = now();
-  await env.DB.prepare(
-    `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
-     VALUES(?,?,?,?,?,?,'admin',1,?,?)`
-  ).bind(id, username, displayName, hash, salt, iterations, t, t).run();
-  await audit(env, { id }, "bootstrap_admin", "user", id, { username });
-  return responseJson({ ok: true });
-}
-
-async function handleLogin(request, env) {
-  const body = await readBody(request);
-  const username = String(body.username || "").trim();
-  const password = String(body.password || "");
-  const wantedRole = normalizedRole(body.role) || null;
-  const u = await env.DB.prepare(
-    "SELECT * FROM users WHERE username=? AND active=1"
-  ).bind(username).first();
-  if (!u) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
-  const hash = await derivePassword(password, u.password_salt, Number(u.password_iterations || 100000));
-  if (hash !== u.password_hash) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
-  const actualRole=normalizedRole(u.role);
-  if (wantedRole && actualRole !== wantedRole) return fail("该账号没有这个入口的权限", 403, "WRONG_ROLE");
-
-  const rawToken = newSessionToken();
-  const tokenHash = await sha256Hex(rawToken);
-  const days = safeInt(env.SESSION_DAYS || "7", 7, 1, 30);
-  const expires = new Date(Date.now() + days * 86400000).toISOString();
-  await env.DB.prepare(
-    "INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)"
-  ).bind(tokenHash, u.id, expires, now()).run();
-  await audit(env, u, "login", "session", null, {});
-  const cookieName=actualRole==="admin"?"sid_admin":"sid_sales";
-  const cookie = `${cookieName}=${encodeURIComponent(rawToken)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${days * 86400}`;
-  return responseJson({
-    ok: true,
-    user: { id: u.id, username: u.username, displayName: u.display_name, role: actualRole }
-  }, 200, { "set-cookie": cookie });
-}
-
-async function handleLogout(request, env, user) {
-  const cookies=parseCookies(request);
-  const role=normalizedRole(user?.role);
-  const cookieName=role==="admin"?"sid_admin":"sid_sales";
-  const sid=cookies[cookieName]||cookies.sid;
-  if(sid){
-    const hash=await sha256Hex(sid);
-    await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(hash).run();
-  }
-  await audit(env,user,"logout","session",null,{});
-  return responseJson({ok:true},200,{
-    "set-cookie":cookieName+"=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
-  });
+  await queueMaintenanceJob(env,"progress_recalc");
 }
 
 async function listCustomers(request, env, user) {
@@ -1124,12 +1171,26 @@ async function listCustomers(request, env, user) {
   }
 
   if (q) {
-    where.push(`(c.name LIKE ? OR EXISTS(
-      SELECT 1 FROM customer_values cv
-      JOIN field_definitions fd ON fd.id=cv.field_id
-      WHERE cv.customer_id=c.id AND fd.searchable=1 AND cv.value LIKE ?
-    ))`);
-    binds.push("%" + q + "%", "%" + q + "%");
+    const indexReady=await getSystemSetting(env,"search_index_ready_v1",false);
+    if(indexReady){
+      where.push(`EXISTS(
+        SELECT 1 FROM customer_search_index si
+        WHERE si.customer_id=c.id AND si.search_text LIKE ?
+      )`);
+      binds.push("%"+q.toLowerCase()+"%");
+    }else{
+      // Safe add -> backfill -> verify -> switch fallback. Until the derived
+      // index is verified complete, production search keeps the authoritative path.
+      where.push(`(c.name LIKE ? OR EXISTS(
+        SELECT 1 FROM customer_values cv
+        JOIN field_definitions fd ON fd.id=cv.field_id
+        WHERE cv.customer_id=c.id AND fd.enabled=1
+          AND (fd.searchable=1 OR fd.field_type IN ('phone','email')
+               OR LOWER(fd.field_key) LIKE '%case%' OR fd.label LIKE '%案件编号%')
+          AND cv.value LIKE ?
+      ))`);
+      binds.push("%"+q+"%","%"+q+"%");
+    }
   }
 
   if (cursor && Array.isArray(cursor) && cursor.length === 2) {
@@ -1405,6 +1466,7 @@ async function createCustomer(request, env, user) {
   }
 
   await env.DB.batch(statements);
+  await rebuildCustomerSearchIndex(env,id);
   await audit(env,user,"create","customer",id,{name:nameCheck.value,assignedUserId:ownerCheck.ownerId});
   return responseJson({ok:true,id,editVersion:1},201);
 }
@@ -1451,6 +1513,7 @@ async function updateCustomer(request, env, user, id) {
   ).bind(nameCheck.value,ownerCheck.ownerId,archived,t,id));
 
   await env.DB.batch(statements);
+  await rebuildCustomerSearchIndex(env,id);
   await audit(env,user,"update","customer",id,{
     before:{
       name:current.name,
@@ -1601,6 +1664,8 @@ async function saveCustomerAtomic(request,env,user,id,ctx){
       "EDIT_CONFLICT"
     );
   }
+
+  await rebuildCustomerSearchIndex(env,id);
 
   const fieldChanges=Object.entries(valuesCheck.values||{})
     .filter(([fieldId,value])=>String(previousValues[fieldId]??"")!==String(value??""))
@@ -1876,6 +1941,11 @@ async function updateField(request, env, user, id) {
     ).bind(JSON.stringify(normalizedTemplate),t));
   }
   await env.DB.batch(statements);
+  const searchSemanticsChanged=
+    !!old.enabled!==after.enabled ||
+    !!old.searchable!==after.searchable ||
+    String(old.field_type)!==String(after.fieldType);
+  if(searchSemanticsChanged)await queueMaintenanceJob(env,"search_index_rebuild");
 
   await audit(env,user,"update","field",id,{
     before:{
@@ -1949,6 +2019,7 @@ async function hardDeleteField(env,user,id){
   statements.push(env.DB.prepare("DELETE FROM field_definitions WHERE id=?").bind(id));
 
   await env.DB.batch(statements);
+  await queueMaintenanceJob(env,"search_index_rebuild");
   await audit(env,user,"delete_permanent","field",id,{
     before:{
       label:field.label,fieldType:field.field_type,required:!!field.required,
@@ -2815,24 +2886,26 @@ async function statsBundle(request,env,user){
   });
 }
 
-async function capacity(env) {
+async function computeCapacitySnapshot(env){
   const config=await getSystemSetting(env,"capacity_config",{
     provider:"Cloudflare",database:"D1",free_single_db_mb:500,free_account_gb:5,
     free_rows_read_day:5000000,free_rows_write_day:100000,free_worker_requests_day:100000,
     paid_base_usd_month:5,warning_percent:70,upgrade_percent:85,urgent_percent:95,
     upgrade_url:"https://dash.cloudflare.com/",pricing_checked:"2026-10-01"
   });
-  const c=await env.DB.prepare("SELECT COUNT(*) n FROM customers WHERE deleted_at IS NULL").first();
-  const core=await env.DB.prepare(
-    `SELECT COALESCE(SUM(LENGTH(id)+LENGTH(name)+COALESCE(LENGTH(assigned_user_id),0)+LENGTH(created_at)+LENGTH(updated_at)+96),0) bytes
-     FROM customers`
-  ).first();
-  const vals=await env.DB.prepare(
-    "SELECT COALESCE(SUM(LENGTH(customer_id)+LENGTH(field_id)+LENGTH(value)+48),0) bytes FROM customer_values"
-  ).first();
-  const logs=await env.DB.prepare(
-    "SELECT COALESCE(SUM(LENGTH(id)+LENGTH(action)+LENGTH(entity_type)+COALESCE(LENGTH(detail_json),0)+72),0) bytes FROM audit_logs"
-  ).first();
+  const [c,core,vals,logs]=await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) n FROM customers WHERE deleted_at IS NULL").first(),
+    env.DB.prepare(
+      `SELECT COALESCE(SUM(LENGTH(id)+LENGTH(name)+COALESCE(LENGTH(assigned_user_id),0)+LENGTH(created_at)+LENGTH(updated_at)+96),0) bytes
+       FROM customers`
+    ).first(),
+    env.DB.prepare(
+      "SELECT COALESCE(SUM(LENGTH(customer_id)+LENGTH(field_id)+LENGTH(value)+48),0) bytes FROM customer_values"
+    ).first(),
+    env.DB.prepare(
+      "SELECT COALESCE(SUM(LENGTH(id)+LENGTH(action)+LENGTH(entity_type)+COALESCE(LENGTH(detail_json),0)+72),0) bytes FROM audit_logs"
+    ).first()
+  ]);
   const estimatedBytes=Math.round((Number(core?.bytes||0)+Number(vals?.bytes||0)+Number(logs?.bytes||0))*1.8);
   const usedMb=estimatedBytes/1024/1024;
   const maxMb=Number(config.free_single_db_mb||500);
@@ -2841,13 +2914,38 @@ async function capacity(env) {
   if(percent>=Number(config.urgent_percent||95)){level="urgent";message="数据库容量非常接近当前免费上限，建议尽快升级。";}
   else if(percent>=Number(config.upgrade_percent||85)){level="upgrade";message="数据库容量已经较高，建议准备升级套餐。";}
   else if(percent>=Number(config.warning_percent||70)){level="warning";message="数据库容量开始增加，目前仍可正常使用。";}
-  return responseJson({ok:true,
+  const snapshot={
     customerCount:Number(c?.n||0),
     estimatedMb:Number(usedMb.toFixed(2)),
     freeSingleDatabaseMb:maxMb,
     percent:Number(percent.toFixed(2)),
-    level,message,config
-  });
+    level,message,config,
+    calculatedAt:now()
+  };
+  await setSystemSetting(env,"capacity_snapshot_v1",snapshot);
+  return snapshot;
+}
+
+async function getCapacitySnapshot(env,{force=false}={}){
+  const cached=await getSystemSetting(env,"capacity_snapshot_v1",null);
+  const ageMs=cached?.calculatedAt?Date.now()-Date.parse(cached.calculatedAt):Number.POSITIVE_INFINITY;
+  if(!force&&cached&&Number.isFinite(ageMs)&&ageMs>=0&&ageMs<45*60*1000){
+    return {...cached,cached:true,cacheAgeMinutes:Number((ageMs/60000).toFixed(1))};
+  }
+  const fresh=await computeCapacitySnapshot(env);
+  return {...fresh,cached:false,cacheAgeMinutes:0};
+}
+
+async function refreshCapacitySnapshotIfStale(env){
+  await getCapacitySnapshot(env,{force:false});
+}
+
+async function capacity(env) {
+  const [snapshot,maintenance]=await Promise.all([
+    getCapacitySnapshot(env),
+    maintenanceStatus(env)
+  ]);
+  return responseJson({ok:true,...snapshot,maintenance});
 }
 
 async function salesOptions(env){
@@ -3186,6 +3284,7 @@ async function importChunk(request,env,user){
 
 async function finishImport(env,user){
   await recalcAllProgress(env);
+  await queueMaintenanceJob(env,"search_index_rebuild");
   await bumpVersion(env,"sidebar_version");
   await audit(env,user,"import","business_data",null,{mode:"chunked"});
   return responseJson({ok:true,message:"数据恢复完成"});
@@ -3203,32 +3302,22 @@ async function softDeleteCustomer(env,user,id){
 
 async function recycleList(request,env) {
   const url=new URL(request.url);
-  const page=safeInt(url.searchParams.get("page"),1,1,1000000);
   const limit=safeInt(url.searchParams.get("limit"),50,1,100);
   const q=String(url.searchParams.get("q")||"").trim();
   const owner=String(url.searchParams.get("owner")||"").trim();
+  const cursor=decodeCursor(url.searchParams.get("cursor"));
   const where=["c.deleted_at IS NOT NULL"];
   const binds=[];
 
-  if(q){
-    where.push("c.name LIKE ?");
-    binds.push("%"+q+"%");
-  }
-  if(owner==="__none__"){
-    where.push("c.assigned_user_id IS NULL");
-  }else if(owner){
-    where.push("c.assigned_user_id=?");
-    binds.push(owner);
+  if(q){where.push("c.name LIKE ?");binds.push("%"+q+"%");}
+  if(owner==="__none__")where.push("c.assigned_user_id IS NULL");
+  else if(owner){where.push("c.assigned_user_id=?");binds.push(owner);}
+  if(cursor&&Array.isArray(cursor)&&cursor.length===2){
+    where.push("(c.deleted_at < ? OR (c.deleted_at=? AND c.id < ?))");
+    binds.push(cursor[0],cursor[0],cursor[1]);
   }
 
   const whereSql=where.join(" AND ");
-  const totalRow=await env.DB.prepare(
-    `SELECT COUNT(*) n FROM customers c WHERE ${whereSql}`
-  ).bind(...binds).first();
-  const total=Number(totalRow?.n||0);
-  const pages=Math.max(1,Math.ceil(total/limit));
-  const offset=(page-1)*limit;
-
   const [r,owners]=await Promise.all([
     env.DB.prepare(
       `SELECT c.id,c.name,c.deleted_at,c.updated_at,c.assigned_user_id,u.display_name owner_name
@@ -3236,18 +3325,20 @@ async function recycleList(request,env) {
        LEFT JOIN users u ON u.id=c.assigned_user_id
        WHERE ${whereSql}
        ORDER BY c.deleted_at DESC,c.id DESC
-       LIMIT ? OFFSET ?`
-    ).bind(...binds,limit,offset).all(),
+       LIMIT ?`
+    ).bind(...binds,limit+1).all(),
     env.DB.prepare(
       "SELECT id,display_name,active FROM users WHERE role='sales' ORDER BY display_name,id"
     ).all()
   ]);
 
+  const rows=r.results||[];
+  const hasMore=rows.length>limit;
+  const items=rows.slice(0,limit);
+  const last=items[items.length-1];
   return responseJson({
-    ok:true,
-    items:r.results||[],
-    owners:owners.results||[],
-    page,limit,total,pages
+    ok:true,items,owners:owners.results||[],limit,
+    nextCursor:hasMore&&last?encodeKeysetCursor(last.deleted_at,last.id):null
   });
 }
 
@@ -3255,18 +3346,19 @@ async function restoreCustomer(env,user,id){
   const row=await env.DB.prepare("SELECT id FROM customers WHERE id=? AND deleted_at IS NOT NULL").bind(id).first();
   if(!row)return fail("回收站中找不到这个客户",404);
   await env.DB.prepare("UPDATE customers SET deleted_at=NULL,updated_at=? WHERE id=?").bind(now(),id).run();
+  await rebuildCustomerSearchIndex(env,id);
   await audit(env,user,"restore","customer",id,{});
   return responseJson({ok:true});
 }
 
 async function auditList(request,env){
   const url=new URL(request.url);
-  const page=safeInt(url.searchParams.get("page"),1,1,1000000);
   const limit=safeInt(url.searchParams.get("limit"),50,1,100);
   const actor=String(url.searchParams.get("actor")||"").trim();
   const action=String(url.searchParams.get("action")||"").trim();
   const from=String(url.searchParams.get("from")||"").trim();
   const to=String(url.searchParams.get("to")||"").trim();
+  const cursor=decodeCursor(url.searchParams.get("cursor"));
 
   const where=["1=1"];
   const binds=[];
@@ -3275,15 +3367,12 @@ async function auditList(request,env){
   if(action){where.push("a.action=?");binds.push(action);}
   if(from){where.push("a.created_at>=?");binds.push(from);}
   if(to){where.push("a.created_at<?");binds.push(to);}
+  if(cursor&&Array.isArray(cursor)&&cursor.length===2){
+    where.push("(a.created_at < ? OR (a.created_at=? AND a.id < ?))");
+    binds.push(cursor[0],cursor[0],cursor[1]);
+  }
 
   const whereSql=where.join(" AND ");
-  const totalRow=await env.DB.prepare(
-    `SELECT COUNT(*) n FROM audit_logs a WHERE ${whereSql}`
-  ).bind(...binds).first();
-  const total=Number(totalRow?.n||0);
-  const pages=Math.max(1,Math.ceil(total/limit));
-  const offset=(page-1)*limit;
-
   const [r,actors,actions]=await Promise.all([
     env.DB.prepare(
       `SELECT a.id,a.action,a.entity_type,a.entity_id,a.detail_json,a.created_at,u.display_name actor_name
@@ -3291,25 +3380,28 @@ async function auditList(request,env){
        LEFT JOIN users u ON u.id=a.actor_user_id
        WHERE ${whereSql}
        ORDER BY a.created_at DESC,a.id DESC
-       LIMIT ? OFFSET ?`
-    ).bind(...binds,limit,offset).all(),
+       LIMIT ?`
+    ).bind(...binds,limit+1).all(),
     env.DB.prepare(
       "SELECT id,display_name,role FROM users ORDER BY role,display_name,id"
     ).all(),
-    env.DB.prepare(
-      "SELECT DISTINCT action FROM audit_logs ORDER BY action"
-    ).all()
+    env.DB.prepare("SELECT DISTINCT action FROM audit_logs ORDER BY action").all()
   ]);
 
+  const rows=r.results||[];
+  const hasMore=rows.length>limit;
+  const page=rows.slice(0,limit);
+  const last=page[page.length-1];
   return responseJson({
     ok:true,
-    items:(r.results||[]).map(x=>({
+    items:page.map(x=>({
       ...x,
       detail:(()=>{try{return JSON.parse(x.detail_json||"{}")}catch{return{}}})()
     })),
     actors:actors.results||[],
     actions:(actions.results||[]).map(x=>x.action),
-    page,limit,total,pages
+    limit,
+    nextCursor:hasMore&&last?encodeKeysetCursor(last.created_at,last.id):null
   });
 }
 
@@ -3726,6 +3818,7 @@ async function api(request, env, ctx) {
   if(m && method==="PATCH") return updateField(request,env,user,m[1]);
   if(m && method==="DELETE"){
     await env.DB.prepare("UPDATE field_definitions SET enabled=0,updated_at=? WHERE id=?").bind(now(),m[1]).run();
+    await queueMaintenanceJob(env,"search_index_rebuild");
     await audit(env,user,"disable","field",m[1],{});
     return responseJson({ok:true});
   }
@@ -3739,8 +3832,9 @@ async function api(request, env, ctx) {
   if(m && method==="PATCH") return updateProgressDef(request,env,user,m[1]);
   if(m && method==="DELETE"){
     await env.DB.prepare("UPDATE progress_definitions SET enabled=0,updated_at=? WHERE id=?").bind(now(),m[1]).run();
+    await recalcAllProgress(env);
     await audit(env,user,"disable","progress_definition",m[1],{});
-    return responseJson({ok:true});
+    return responseJson({ok:true,recalculationQueued:true});
   }
   m=path.match(/^\/api\/admin\/progress\/([^/]+)\/hard-delete$/);
   if(m && method==="DELETE") return hardDeleteProgressDef(env,user,m[1]);
@@ -3818,11 +3912,15 @@ export default {
   },
 
   async scheduled(controller,env,ctx){
-    const job=processTelegramQueue(env,{
-      maxItems:12,
-      maxRunMs:48000,
-      allowShortWait:true
-    }).catch(()=>{});
+    const job=(async()=>{
+      await processTelegramQueue(env,{
+        maxItems:12,
+        maxRunMs:36000,
+        allowShortWait:true
+      }).catch(()=>{});
+      await processMaintenanceBatch(env,{batchSize:100}).catch(()=>{});
+      await refreshCapacitySnapshotIfStale(env).catch(()=>{});
+    })();
     if(ctx?.waitUntil)ctx.waitUntil(job);
     else await job;
   }

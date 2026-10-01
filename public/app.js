@@ -366,6 +366,13 @@ async function renderDashboard(view,period=null,cache=null){
   if(state.user.role==="admin"&&cap&&cap.level!=="normal"){
     capacityHtml=`<div class="notice ${cap.level==="warning"?"warning":"urgent"}" style="margin-bottom:16px"><strong>系统容量提醒：</strong> ${esc(cap.message)} <a href="#/admin/capacity">查看详情</a></div>`;
   }
+  if(state.user.role==="admin"&&cap){
+    const activeJobs=(cap.maintenance||[]).filter(x=>x.status==="pending"||x.status==="running");
+    if(activeJobs.length){
+      const text=activeJobs.map(x=>`${x.label} ${x.processed}/${x.total}`).join("；");
+      capacityHtml+=`<div class="notice" style="margin-bottom:16px"><strong>后台维护进行中：</strong> ${esc(text)}。系统会分批处理，不会阻塞业务员操作。 <a href="#/admin/capacity">查看状态</a></div>`;
+    }
+  }
 
   const periodName={total:"总数据",today:"当日数据",week:"本周数据",month:"本月数据"}[period]||"总数据";
   const metricValue={
@@ -2322,6 +2329,8 @@ async function renderTelegramSettings(view){
   const recentTelegramLogs=r.logs||[];
   let telegramLogMode="recent";
   let telegramLogPage=1;
+  let telegramLogCursor="";
+  let telegramLogBack=[];
 
   const telegramLogRowsHtml=(items)=>items.length?items.map(x=>`<tr>
     <td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td>
@@ -2342,27 +2351,40 @@ async function renderTelegramSettings(view){
     document.querySelector("#tgViewAllLogs").textContent="查看全部发送记录";
   }
 
-  async function loadTelegramLogPage(page=1){
+  async function loadTelegramLogPage(cursor="",back=[]){
     telegramLogMode="all";
-    telegramLogPage=page;
+    telegramLogCursor=String(cursor||"");
+    telegramLogBack=Array.isArray(back)?back:[];
+    telegramLogPage=telegramLogBack.length+1;
     const status=val("tgLogStatus");
-    const qs=new URLSearchParams({page:String(page),limit:"50"});
+    const qs=new URLSearchParams({limit:"50"});
+    if(telegramLogCursor)qs.set("cursor",telegramLogCursor);
     if(status)qs.set("status",status);
 
     const body=document.querySelector("#tgLogBody");
     body.innerHTML='<tr><td colspan="6" class="muted">正在加载发送记录...</td></tr>';
     try{
       const out=await api("/api/admin/telegram/logs?"+qs.toString());
-      telegramLogPage=Number(out.page||page||1);
       document.querySelector("#tgLogTitle").textContent="全部发送记录";
-      document.querySelector("#tgLogMeta").textContent="共 "+Number(out.total||0)+" 条发送记录，每页 50 条。";
+      document.querySelector("#tgLogMeta").textContent="第 "+telegramLogPage+" 页，每页最多 50 条。游标分页不会随着历史记录增长而变慢。";
       body.innerHTML=telegramLogRowsHtml(out.items||[]);
       document.querySelector("#tgLogStatus").style.display="";
       document.querySelector("#tgViewAllLogs").textContent="返回最近记录";
-      document.querySelector("#tgLogPager").innerHTML=listPagerHtml("tgLogsPage",telegramLogPage,out.pages||1,out.total||0);
+      document.querySelector("#tgLogPager").innerHTML=`<div class="row wrap" style="justify-content:flex-end">
+        <button class="btn ghost small" id="tgLogsCursorPrev" ${telegramLogBack.length?"":"disabled"}>上一页</button>
+        <span class="muted">第 ${telegramLogPage} 页</span>
+        <button class="btn ghost small" id="tgLogsCursorNext" ${out.nextCursor?"":"disabled"}>下一页</button>
+      </div>`;
 
-      document.querySelector("#tgLogsPagePrev").onclick=()=>loadTelegramLogPage(telegramLogPage-1);
-      document.querySelector("#tgLogsPageNext").onclick=()=>loadTelegramLogPage(telegramLogPage+1);
+      document.querySelector("#tgLogsCursorPrev").onclick=()=>{
+        if(!telegramLogBack.length)return;
+        const previous=telegramLogBack[telegramLogBack.length-1]||"";
+        loadTelegramLogPage(previous,telegramLogBack.slice(0,-1));
+      };
+      document.querySelector("#tgLogsCursorNext").onclick=()=>{
+        if(!out.nextCursor)return;
+        loadTelegramLogPage(out.nextCursor,[...telegramLogBack,telegramLogCursor]);
+      };
     }catch(e){
       body.innerHTML='<tr><td colspan="6" class="muted">'+esc(e.message)+'</td></tr>';
     }
@@ -2370,9 +2392,9 @@ async function renderTelegramSettings(view){
 
   document.querySelector("#tgViewAllLogs").onclick=()=>{
     if(telegramLogMode==="all")showRecentTelegramLogs();
-    else loadTelegramLogPage(1);
+    else loadTelegramLogPage();
   };
-  document.querySelector("#tgLogStatus").onchange=()=>loadTelegramLogPage(1);
+  document.querySelector("#tgLogStatus").onchange=()=>loadTelegramLogPage();
 
   updateTemplatePreview();
 }
@@ -2381,8 +2403,16 @@ async function renderCapacity(view){
   const r=await api("/api/admin/capacity"), c=r.config;
   const noticeClass=r.level==="normal"?"":r.level==="warning"?"warning":"urgent";
   const levelText={normal:"正常",warning:"注意",upgrade:"建议升级",urgent:"尽快升级"}[r.level]||r.level;
+  const maintenance=r.maintenance||[];
+  const maintenanceHtml=`<div class="card" style="margin-top:18px">
+    <h3 style="margin-top:0">后台性能维护</h3>
+    <p class="muted">搜索索引回填和进度重算会按批次在后台处理，不会一次扫描并锁住全部客户。</p>
+    <div class="table-wrap"><table><thead><tr><th>任务</th><th>状态</th><th>进度</th><th>更新时间</th></tr></thead><tbody>
+      ${maintenance.map(x=>`<tr><td>${esc(x.label||x.task_key)}</td><td>${x.status==="complete"?"已完成":x.status==="running"?"处理中":x.status==="pending"?"等待处理":"需要检查"}</td><td>${money(x.processed||0)} / ${money(x.total||0)}</td><td>${esc((x.updated_at||"").replace("T"," ").slice(0,19))}</td></tr>`).join("")||'<tr><td colspan="4" class="muted">当前没有后台维护任务</td></tr>'}
+    </tbody></table></div>
+  </div>`;
   view.innerHTML=pageHead("系统容量与费用","你不需要记平台名称；需要付费时这里会明确告诉你")+
-    `<div class="notice ${noticeClass}" style="margin-bottom:16px"><strong>当前状态：${levelText}</strong><div style="margin-top:6px">${esc(r.message)}</div></div>
+    `<div class="notice ${noticeClass}" style="margin-bottom:16px"><strong>当前状态：${levelText}</strong><div style="margin-top:6px">${esc(r.message)}</div><div class="muted" style="margin-top:6px;font-size:12px">容量快照：${esc((r.calculatedAt||"").replace("T"," ").slice(0,19))} · ${r.cached?"使用缓存（约 "+r.cacheAgeMinutes+" 分钟）":"刚刚刷新"}</div></div>
     <div class="grid metrics">
       <div class="card metric"><div class="label">客户数量</div><div class="value">${money(r.customerCount)}</div></div>
       <div class="card metric"><div class="label">估算数据库使用</div><div class="value">${r.estimatedMb} MB</div></div>
@@ -2394,6 +2424,7 @@ async function renderCapacity(view){
       <div class="capacity-bar"><div class="capacity-fill" style="width:${Math.min(100,r.percent)}%"></div></div>
       <div class="muted" style="margin-top:8px">系统会在约 ${c.warning_percent}% 开始提醒，${c.upgrade_percent}% 建议升级，${c.urgent_percent}% 提醒尽快处理。</div>
     </div>
+    ${maintenanceHtml}
     <div class="card" style="margin-top:18px">
       <h3 style="margin-top:0">如果以后需要付费，你应该付什么</h3>
       <div class="table-wrap"><table>
@@ -2506,13 +2537,15 @@ function openAuditDetail(item){
 
 async function renderAudit(view,opts={}){
   const stateOpts={
-    page:Number(opts.page||1),
+    cursor:String(opts.cursor||""),
+    back:Array.isArray(opts.back)?opts.back:[],
     actor:String(opts.actor||""),
     action:String(opts.action||""),
     from:String(opts.from||""),
     to:String(opts.to||"")
   };
-  const qs=new URLSearchParams({page:String(stateOpts.page),limit:"50"});
+  const qs=new URLSearchParams({limit:"50"});
+  if(stateOpts.cursor)qs.set("cursor",stateOpts.cursor);
   if(stateOpts.actor)qs.set("actor",stateOpts.actor);
   if(stateOpts.action)qs.set("action",stateOpts.action);
   if(stateOpts.from)qs.set("from",stateOpts.from+"T00:00:00.000Z");
@@ -2524,8 +2557,12 @@ async function renderAudit(view,opts={}){
 
   const r=await api("/api/admin/audit?"+qs.toString());
   const items=r.items||[];
-  const currentPage=Number(r.page||stateOpts.page||1);
-  const pages=Number(r.pages||1);
+  const currentPage=stateOpts.back.length+1;
+  const pager=`<div class="row wrap" style="justify-content:flex-end;margin-top:12px">
+    <button class="btn ghost small" id="auditCursorPrev" ${stateOpts.back.length?"":"disabled"}>上一页</button>
+    <span class="muted">第 ${currentPage} 页</span>
+    <button class="btn ghost small" id="auditCursorNext" ${r.nextCursor?"":"disabled"}>下一页</button>
+  </div>`;
 
   view.innerHTML=pageHead("操作记录","查看谁在什么时候对系统做了什么操作")+
     `<div class="card list-filter-card">
@@ -2549,39 +2586,49 @@ async function renderAudit(view,opts={}){
     </div>
     <div class="table-wrap"><table><thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>对象ID</th><th>变更详情</th></tr></thead><tbody>
       ${items.map(x=>`<tr><td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td><td>${esc(x.actor_name||"系统")}</td><td>${esc(actionName[x.action]||x.action)}</td><td>${esc(entityName[x.entity_type]||x.entity_type)}</td><td><span class="muted">${esc(x.entity_id||"")}</span></td><td><button class="btn ghost small" data-audit-detail="${esc(x.id)}">查看</button></td></tr>`).join("")||`<tr><td colspan="6" class="muted">没有符合条件的操作记录</td></tr>`}
-    </tbody></table></div>
-    ${listPagerHtml("auditPage",currentPage,pages,r.total||0)}`;
+    </tbody></table></div>${pager}`;
 
   const readFilters=()=>({
-    page:1,
-    actor:val("auditActor"),
-    action:val("auditAction"),
-    from:val("auditFrom"),
-    to:val("auditTo")
+    cursor:"",back:[],
+    actor:val("auditActor"),action:val("auditAction"),
+    from:val("auditFrom"),to:val("auditTo")
   });
   document.querySelectorAll("[data-audit-detail]").forEach(btn=>btn.onclick=()=>{
     const item=items.find(x=>x.id===btn.dataset.auditDetail);
     if(item)openAuditDetail(item);
   });
   document.querySelector("#auditApply").onclick=()=>renderAudit(view,readFilters());
-  document.querySelector("#auditReset").onclick=()=>renderAudit(view,{page:1});
-  document.querySelector("#auditPagePrev").onclick=()=>renderAudit(view,{...stateOpts,page:currentPage-1});
-  document.querySelector("#auditPageNext").onclick=()=>renderAudit(view,{...stateOpts,page:currentPage+1});
+  document.querySelector("#auditReset").onclick=()=>renderAudit(view,{});
+  document.querySelector("#auditCursorPrev").onclick=()=>{
+    if(!stateOpts.back.length)return;
+    const previous=stateOpts.back[stateOpts.back.length-1]||"";
+    renderAudit(view,{...stateOpts,cursor:previous,back:stateOpts.back.slice(0,-1)});
+  };
+  document.querySelector("#auditCursorNext").onclick=()=>{
+    if(!r.nextCursor)return;
+    renderAudit(view,{...stateOpts,cursor:r.nextCursor,back:[...stateOpts.back,stateOpts.cursor]});
+  };
 }
 
 async function renderRecycle(view,opts={}){
   const stateOpts={
-    page:Number(opts.page||1),
+    cursor:String(opts.cursor||""),
+    back:Array.isArray(opts.back)?opts.back:[],
     q:String(opts.q||""),
     owner:String(opts.owner||"")
   };
-  const qs=new URLSearchParams({page:String(stateOpts.page),limit:"50"});
+  const qs=new URLSearchParams({limit:"50"});
+  if(stateOpts.cursor)qs.set("cursor",stateOpts.cursor);
   if(stateOpts.q)qs.set("q",stateOpts.q);
   if(stateOpts.owner)qs.set("owner",stateOpts.owner);
   const r=await api("/api/admin/recycle?"+qs.toString());
   const items=r.items||[];
-  const currentPage=Number(r.page||stateOpts.page||1);
-  const pages=Number(r.pages||1);
+  const currentPage=stateOpts.back.length+1;
+  const pager=`<div class="row wrap" style="justify-content:flex-end;margin-top:12px">
+    <button class="btn ghost small" id="recycleCursorPrev" ${stateOpts.back.length?"":"disabled"}>上一页</button>
+    <span class="muted">第 ${currentPage} 页</span>
+    <button class="btn ghost small" id="recycleCursorNext" ${r.nextCursor?"":"disabled"}>下一页</button>
+  </div>`;
 
   view.innerHTML=pageHead("回收站","删除客户不会立即永久消失，可以在这里恢复")+
     `<div class="card list-filter-card">
@@ -2600,29 +2647,39 @@ async function renderRecycle(view,opts={}){
     </div>
     <div class="table-wrap"><table><thead><tr><th>客户姓名</th><th>业务员</th><th>删除时间</th><th>操作</th></tr></thead><tbody>
       ${items.map(x=>`<tr><td><strong>${esc(x.name)}</strong></td><td>${esc(x.owner_name||"未分配")}</td><td>${esc((x.deleted_at||"").replace("T"," ").slice(0,19))}</td><td><button class="btn secondary small" data-restore="${esc(x.id)}">恢复客户</button></td></tr>`).join("")||`<tr><td colspan="4" class="muted">没有符合条件的回收站客户</td></tr>`}
-    </tbody></table></div>
-    ${listPagerHtml("recyclePage",currentPage,pages,r.total||0)}`;
+    </tbody></table></div>${pager}`;
 
   const readFilters=()=>({
-    page:1,
+    cursor:"",back:[],
     q:val("recycleSearch").trim(),
     owner:val("recycleOwner")
   });
   document.querySelector("#recycleApply").onclick=()=>renderRecycle(view,readFilters());
-  document.querySelector("#recycleReset").onclick=()=>renderRecycle(view,{page:1});
+  document.querySelector("#recycleReset").onclick=()=>renderRecycle(view,{});
   document.querySelector("#recycleSearch").onkeydown=e=>{if(e.key==="Enter")renderRecycle(view,readFilters())};
 
   document.querySelectorAll("[data-restore]").forEach(b=>b.onclick=async()=>{
     try{
       await api("/api/admin/recycle/"+b.dataset.restore+"/restore",{method:"POST"});
       toast("客户已恢复");
-      const nextPage=items.length===1&&currentPage>1?currentPage-1:currentPage;
-      renderRecycle(view,{...stateOpts,page:nextPage});
+      if(items.length===1&&!r.nextCursor&&stateOpts.back.length){
+        const previous=stateOpts.back[stateOpts.back.length-1]||"";
+        renderRecycle(view,{...stateOpts,cursor:previous,back:stateOpts.back.slice(0,-1)});
+      }else{
+        renderRecycle(view,stateOpts);
+      }
     }catch(e){toast(e.message)}
   });
 
-  document.querySelector("#recyclePagePrev").onclick=()=>renderRecycle(view,{...stateOpts,page:currentPage-1});
-  document.querySelector("#recyclePageNext").onclick=()=>renderRecycle(view,{...stateOpts,page:currentPage+1});
+  document.querySelector("#recycleCursorPrev").onclick=()=>{
+    if(!stateOpts.back.length)return;
+    const previous=stateOpts.back[stateOpts.back.length-1]||"";
+    renderRecycle(view,{...stateOpts,cursor:previous,back:stateOpts.back.slice(0,-1)});
+  };
+  document.querySelector("#recycleCursorNext").onclick=()=>{
+    if(!r.nextCursor)return;
+    renderRecycle(view,{...stateOpts,cursor:r.nextCursor,back:[...stateOpts.back,stateOpts.cursor]});
+  };
 }
 
 async function renderBackup(view){
