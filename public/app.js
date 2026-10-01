@@ -281,8 +281,35 @@ async function renderRoute(){
   }
 }
 
-async function renderDashboard(view){
-  const [r,wr]=await Promise.all([api("/api/stats"),api("/api/dashboard-widgets")]);
+function dashboardPeriodStart(period){
+  const d=new Date();
+  if(period==="today"){
+    d.setHours(0,0,0,0);
+    return d.toISOString();
+  }
+  if(period==="week"){
+    const day=d.getDay();
+    const diff=(day+6)%7;
+    d.setDate(d.getDate()-diff);
+    d.setHours(0,0,0,0);
+    return d.toISOString();
+  }
+  return "";
+}
+
+async function renderDashboard(view,period=null){
+  const stored=sessionStorage.getItem("ms007DashboardPeriod");
+  period=period||(["total","today","week"].includes(stored)?stored:"total");
+  sessionStorage.setItem("ms007DashboardPeriod",period);
+
+  const qs=new URLSearchParams({period});
+  const from=dashboardPeriodStart(period);
+  if(from)qs.set("from",from);
+
+  const [r,wr]=await Promise.all([
+    api("/api/stats?"+qs.toString()),
+    api("/api/dashboard-widgets")
+  ]);
   const s=r.summary, widgets=wr.items||[];
   let capacityHtml="";
   if(state.user.role==="admin"){
@@ -291,25 +318,60 @@ async function renderDashboard(view){
       capacityHtml=`<div class="notice ${cap.level==="warning"?"warning":"urgent"}" style="margin-bottom:16px"><strong>系统容量提醒：</strong> ${esc(cap.message)} <a href="#/admin/capacity">查看详情</a></div>`;
     }
   }
+
+  const periodName={total:"总数据",today:"当日数据",week:"本周数据"}[period]||"总数据";
   const metricValue={
     metric_total:s.total,
     metric_today:s.today,
     metric_complete:s.completed,
-    metric_archived:s.archived
+    metric_archived:0
   };
+
   const metricWidgets=widgets.filter(x=>x.widget_type.startsWith("metric_"));
   const largeWidgets=widgets.filter(x=>!x.widget_type.startsWith("metric_"));
-  let html=pageHead("仪表盘",state.user.role==="admin"?"查看整个团队的客户情况":"查看你的客户情况") + capacityHtml;
+
+  let html=pageHead(
+    "仪表盘",
+    state.user.role==="admin"?"查看整个团队的客户情况":"查看你的客户情况",
+    `<div class="dashboard-period-switch">
+      <button class="btn ${period==="total"?"":"ghost"} small" data-dashboard-period="total">总数据</button>
+      <button class="btn ${period==="today"?"":"ghost"} small" data-dashboard-period="today">当日数据</button>
+      <button class="btn ${period==="week"?"":"ghost"} small" data-dashboard-period="week">本周数据</button>
+    </div>`
+  ) + capacityHtml;
+
   if(metricWidgets.length){
-    html+=`<div class="grid metrics">${metricWidgets.map(w=>`<div class="card metric"><div class="label">${esc(w.title)}</div><div class="value">${money(metricValue[w.widget_type]??0)}</div></div>`).join("")}</div>`;
+    html+=`<div class="grid metrics">${metricWidgets.map(w=>{
+      let value=metricValue[w.widget_type]??0;
+      let subtitle=periodName;
+      if(w.widget_type==="metric_progress"){
+        let cfg={};try{cfg=JSON.parse(w.config_json||"{}")}catch{}
+        value=Number(r.progressCounts?.[cfg.progressId]||0);
+      }else if(w.widget_type==="metric_today"){
+        subtitle="今天新增（固定）";
+      }else if(w.widget_type==="metric_archived"){
+        subtitle="归档客户不计入统计";
+      }
+      return `<div class="card metric">
+        <div class="label">${esc(w.title)}</div>
+        <div class="value">${money(value)}</div>
+        <div class="metric-period-label">${esc(subtitle)}</div>
+      </div>`;
+    }).join("")}</div>`;
   }
+
   for(const w of largeWidgets){
     if(w.widget_type==="sales_breakdown" && state.user.role==="admin"){
-      html+=`<div class="card" style="margin-top:18px"><h3 style="margin-top:0">${esc(w.title)}</h3><div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead><tbody>${(r.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">还没有业务员</td></tr>`}</tbody></table></div></div>`;
+      html+=`<div class="card" style="margin-top:18px"><div class="dashboard-card-head"><h3>${esc(w.title)}</h3><span>${esc(periodName)}</span></div><div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead><tbody>${(r.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">当前时间范围内没有数据</td></tr>`}</tbody></table></div></div>`;
     }
   }
-  if(!widgets.length) html+=`<div class="empty card">当前仪表盘没有启用任何组件。</div>`;
+
+  if(!widgets.length)html+=`<div class="empty card">当前仪表盘没有启用任何组件。</div>`;
   view.innerHTML=html;
+
+  view.querySelectorAll("[data-dashboard-period]").forEach(b=>b.onclick=()=>{
+    renderDashboard(view,b.dataset.dashboardPeriod);
+  });
 }
 
 async function getSales(){
@@ -1342,42 +1404,127 @@ async function renderListSettings(view,audience="admin"){
 }
 
 const widgetTypeName={
-  metric_total:"客户总数",
+  metric_total:"客户数量",
   metric_today:"今日新增",
-  metric_complete:"已完成",
-  metric_archived:"已归档",
+  metric_complete:"已完成客户",
+  metric_archived:"已归档（不计入常规统计）",
+  metric_progress:"客户进度统计",
   sales_breakdown:"业务员客户分布"
 };
 
 async function renderDashboardSettings(view,audience="admin"){
   const r=await api("/api/admin/dashboard-widgets?audience="+audience);
   const items=r.items||[];
+  const progressDefs=r.progressDefs||[];
+  const progressName=new Map(progressDefs.map(x=>[x.id,x.label]));
+
   view.innerHTML=pageHead("仪表盘设置","管理员可以添加、减少、编辑和排序仪表盘内容",`<button class="btn" id="addWidget">＋ 添加组件</button>`)+
     `<div class="row" style="margin-bottom:14px">
       <button class="btn ${audience==="admin"?"":"ghost"} small" id="dashAdmin">管理员仪表盘</button>
       <button class="btn ${audience==="sales"?"":"ghost"} small" id="dashSales">业务员仪表盘</button>
     </div>
+    <div class="notice" style="margin-bottom:14px">仪表盘支持“总数据 / 当日数据 / 本周数据”切换。所有常规统计和客户进度统计都会自动排除已归档客户。</div>
     <div class="table-wrap"><table><thead><tr><th>顺序</th><th>标题</th><th>内容</th><th>状态</th><th>操作</th></tr></thead><tbody>
-    ${items.map(x=>`<tr><td>${x.sort_order}</td><td><strong>${esc(x.title)}</strong></td><td>${esc(widgetTypeName[x.widget_type]||x.widget_type)}</td><td>${x.enabled?"显示":"隐藏"}</td><td><button class="btn ghost small" data-widget-edit="${esc(x.id)}">编辑</button> <button class="btn danger small" data-widget-del="${esc(x.id)}">删除</button></td></tr>`).join("")||`<tr><td colspan="5" class="muted">当前没有组件</td></tr>`}</tbody></table></div>`;
+    ${items.map(x=>{
+      let content=widgetTypeName[x.widget_type]||x.widget_type;
+      if(x.widget_type==="metric_progress"){
+        let cfg={};try{cfg=JSON.parse(x.config_json||"{}")}catch{}
+        content+=" · "+(progressName.get(cfg.progressId)||"未选择进度");
+      }
+      return `<tr><td>${x.sort_order}</td><td><strong>${esc(x.title)}</strong></td><td>${esc(content)}</td><td>${x.enabled?"显示":"隐藏"}</td><td><button class="btn ghost small" data-widget-edit="${esc(x.id)}">编辑</button> <button class="btn danger small" data-widget-del="${esc(x.id)}">删除</button></td></tr>`;
+    }).join("")||`<tr><td colspan="5" class="muted">当前没有组件</td></tr>`}</tbody></table></div>`;
+
   document.querySelector("#dashAdmin").onclick=()=>renderDashboardSettings(view,"admin");
   document.querySelector("#dashSales").onclick=()=>renderDashboardSettings(view,"sales");
-  document.querySelector("#addWidget").onclick=()=>dashboardWidgetModal(view,audience,null);
-  document.querySelectorAll("[data-widget-edit]").forEach(b=>b.onclick=()=>dashboardWidgetModal(view,audience,items.find(x=>x.id===b.dataset.widgetEdit)));
-  document.querySelectorAll("[data-widget-del]").forEach(b=>b.onclick=async()=>{if(!await uiConfirm("确认删除这个仪表盘组件？",{title:"删除仪表盘组件",confirmText:"删除",danger:true}))return;try{await api("/api/admin/dashboard-widgets/"+b.dataset.widgetDel,{method:"DELETE"});toast("组件已删除");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}});
+  document.querySelector("#addWidget").onclick=()=>dashboardWidgetModal(view,audience,null,progressDefs);
+  document.querySelectorAll("[data-widget-edit]").forEach(b=>b.onclick=()=>dashboardWidgetModal(view,audience,items.find(x=>x.id===b.dataset.widgetEdit),progressDefs));
+  document.querySelectorAll("[data-widget-del]").forEach(b=>b.onclick=async()=>{
+    if(!await uiConfirm("确认删除这个仪表盘组件？",{title:"删除仪表盘组件",confirmText:"删除",danger:true}))return;
+    try{
+      await api("/api/admin/dashboard-widgets/"+b.dataset.widgetDel,{method:"DELETE"});
+      toast("组件已删除");
+      renderDashboardSettings(view,audience);
+    }catch(e){toast(e.message)}
+  });
 }
-function dashboardWidgetModal(view,audience,w){
-  const allowed=audience==="admin"?Object.keys(widgetTypeName):Object.keys(widgetTypeName).filter(x=>x!=="sales_breakdown");
+
+function dashboardWidgetModal(view,audience,w,progressDefs=[]){
+  const baseAllowed=audience==="admin"
+    ?["metric_total","metric_complete","metric_progress","sales_breakdown"]
+    :["metric_total","metric_complete","metric_progress"];
+  const allowed=w?.widget_type&&!baseAllowed.includes(w.widget_type)?[...baseAllowed,w.widget_type]:baseAllowed;
+
+  let config={};try{config=JSON.parse(w?.config_json||"{}")}catch{}
+
   openModal(w?"编辑仪表盘组件":"添加仪表盘组件",`
-    <div class="field"><label>组件内容</label><select class="input" id="wType">${allowed.map(x=>`<option value="${x}" ${w?.widget_type===x?"selected":""}>${esc(widgetTypeName[x])}</option>`).join("")}</select></div>
+    <div class="field"><label>组件内容</label><select class="input" id="wType">${allowed.map(x=>`<option value="${x}" ${w?.widget_type===x?"selected":""}>${esc(widgetTypeName[x]||x)}</option>`).join("")}</select></div>
+
+    <div class="field hidden" id="wProgressBox">
+      <label>选择客户进度</label>
+      <select class="input" id="wProgressId">
+        <option value="">请选择进度</option>
+        ${progressDefs.map(p=>`<option value="${esc(p.id)}" ${config.progressId===p.id?"selected":""}>${esc(p.label)}</option>`).join("")}
+      </select>
+      <div class="muted" style="font-size:12px">例如选择“客户建档”，仪表盘就会显示该进度在当前时间范围内完成的客户数量。</div>
+    </div>
+
     <div class="field"><label>显示标题</label><input class="input" id="wTitle" value="${esc(w?.title||"")}"></div>
     <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="wSort" type="number" value="${w?.sort_order??100}"></div>
     <label><input type="checkbox" id="wEnabled" ${w?.enabled!==0?"checked":""}> 显示</label>
-    <button class="btn full" id="wSave" style="margin-top:16px">保存</button>`,()=>{
-      const type=document.querySelector("#wType");
-      if(!w)document.querySelector("#wTitle").value=widgetTypeName[type.value];
-      type.onchange=()=>{if(!w||!val("wTitle"))document.querySelector("#wTitle").value=widgetTypeName[type.value]};
-      document.querySelector("#wSave").onclick=async()=>{const body={audience,widgetType:val("wType"),title:val("wTitle")||widgetTypeName[val("wType")],sortOrder:Number(val("wSort")||100),enabled:checked("wEnabled")};try{if(w)await api("/api/admin/dashboard-widgets/"+w.id,{method:"PATCH",body});else await api("/api/admin/dashboard-widgets",{method:"POST",body});closeModal();toast("仪表盘设置已保存");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}};
-    },{draftKey:`dashboard-widget:${audience}:${w?.id||"new"}`});
+    <button class="btn full" id="wSave" style="margin-top:16px">保存</button>
+  `,()=>{
+    const type=document.querySelector("#wType");
+    const progressBox=document.querySelector("#wProgressBox");
+    const progressSelect=document.querySelector("#wProgressId");
+    const title=document.querySelector("#wTitle");
+
+    const updateTypeUi=()=>{
+      const isProgress=type.value==="metric_progress";
+      progressBox.classList.toggle("hidden",!isProgress);
+      if(!w||!title.value){
+        if(isProgress){
+          const selected=progressDefs.find(x=>x.id===progressSelect.value);
+          title.value=selected?selected.label:"客户进度统计";
+        }else{
+          title.value=widgetTypeName[type.value]||"统计组件";
+        }
+      }
+    };
+
+    if(!w)title.value=widgetTypeName[type.value]||"统计组件";
+    type.onchange=updateTypeUi;
+    progressSelect.onchange=()=>{
+      if(type.value==="metric_progress"){
+        const selected=progressDefs.find(x=>x.id===progressSelect.value);
+        if(selected)title.value=selected.label;
+      }
+    };
+    updateTypeUi();
+
+    document.querySelector("#wSave").onclick=async()=>{
+      const widgetType=val("wType");
+      const body={
+        audience,
+        widgetType,
+        title:val("wTitle")||widgetTypeName[widgetType]||"统计组件",
+        sortOrder:Number(val("wSort")||100),
+        enabled:checked("wEnabled"),
+        config:{}
+      };
+      if(widgetType==="metric_progress"){
+        const progressId=val("wProgressId");
+        if(!progressId){toast("请选择一个客户进度");return}
+        body.config={progressId};
+      }
+      try{
+        if(w)await api("/api/admin/dashboard-widgets/"+w.id,{method:"PATCH",body});
+        else await api("/api/admin/dashboard-widgets",{method:"POST",body});
+        closeModal();
+        toast("仪表盘设置已保存");
+        renderDashboardSettings(view,audience);
+      }catch(e){toast(e.message)}
+    };
+  },{draftKey:`dashboard-widget:${audience}:${w?.id||"new"}`});
 }
 
 
