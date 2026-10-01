@@ -47,11 +47,12 @@ con.execute("""INSERT INTO list_columns(id,audience,column_key,field_id,label,en
 VALUES('lc2','admin','dynamic','f2','渠道',1,10)""")
 
 # Permanent field cleanup must leave no FK reference behind.
-con.execute("BEGIN")
-con.execute("DELETE FROM customer_values WHERE field_id='f2'")
-con.execute("DELETE FROM list_columns WHERE field_id='f2'")
-con.execute("DELETE FROM field_definitions WHERE id='f2'")
-con.execute("COMMIT")
+# Commit fixture setup first, then verify the cleanup as one transaction.
+con.commit()
+with con:
+    con.execute("DELETE FROM customer_values WHERE field_id='f2'")
+    con.execute("DELETE FROM list_columns WHERE field_id='f2'")
+    con.execute("DELETE FROM field_definitions WHERE id='f2'")
 assert con.execute("SELECT COUNT(*) FROM customer_values WHERE field_id='f2'").fetchone()[0]==0
 assert con.execute("SELECT COUNT(*) FROM list_columns WHERE field_id='f2'").fetchone()[0]==0
 assert con.execute("SELECT COUNT(*) FROM field_definitions WHERE id='f2'").fetchone()[0]==0
