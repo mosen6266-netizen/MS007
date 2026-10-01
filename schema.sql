@@ -112,6 +112,29 @@ CREATE TABLE IF NOT EXISTS sidebar_items (
 );
 CREATE INDEX IF NOT EXISTS idx_sidebar_audience ON sidebar_items(audience, enabled, sort_order);
 
+CREATE TABLE IF NOT EXISTS sidebar_categories (
+  id TEXT PRIMARY KEY,
+  audience TEXT NOT NULL CHECK (audience IN ('admin','sales')),
+  label TEXT NOT NULL,
+  sort_order INTEGER NOT NULL DEFAULT 100,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  UNIQUE(audience,label)
+);
+CREATE INDEX IF NOT EXISTS idx_sidebar_categories_audience
+ON sidebar_categories(audience, sort_order, label);
+
+CREATE TABLE IF NOT EXISTS sidebar_item_categories (
+  item_id TEXT NOT NULL,
+  audience TEXT NOT NULL CHECK (audience IN ('admin','sales')),
+  category_id TEXT NOT NULL,
+  PRIMARY KEY (item_id,audience),
+  FOREIGN KEY (item_id) REFERENCES sidebar_items(id) ON DELETE CASCADE,
+  FOREIGN KEY (category_id) REFERENCES sidebar_categories(id) ON DELETE RESTRICT
+);
+CREATE INDEX IF NOT EXISTS idx_sidebar_item_categories_category
+ON sidebar_item_categories(audience, category_id);
+
 CREATE TABLE IF NOT EXISTS list_columns (
   id TEXT PRIMARY KEY,
   audience TEXT NOT NULL CHECK (audience IN ('admin','sales')),
@@ -259,6 +282,31 @@ INSERT OR IGNORE INTO sidebar_items
 (id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
 ('sa_telegram','admin','Telegram 通知','link','#/admin/telegram','same',1,75,'通知',datetime('now'),datetime('now'));
 
+
+-- Preserve existing sidebar group labels as real categories without changing any existing item.
+INSERT OR IGNORE INTO sidebar_categories(id,audience,label,sort_order,created_at,updated_at)
+SELECT 'legacy:admin:' || group_label,'admin',group_label,MIN(sort_order),datetime('now'),datetime('now')
+FROM sidebar_items
+WHERE group_label<>'' AND audience IN ('admin','all')
+GROUP BY group_label;
+
+INSERT OR IGNORE INTO sidebar_categories(id,audience,label,sort_order,created_at,updated_at)
+SELECT 'legacy:sales:' || group_label,'sales',group_label,MIN(sort_order),datetime('now'),datetime('now')
+FROM sidebar_items
+WHERE group_label<>'' AND audience IN ('sales','all')
+GROUP BY group_label;
+
+INSERT OR IGNORE INTO sidebar_item_categories(item_id,audience,category_id)
+SELECT si.id,'admin',sc.id
+FROM sidebar_items si
+JOIN sidebar_categories sc ON sc.audience='admin' AND sc.label=si.group_label
+WHERE si.group_label<>'' AND si.audience IN ('admin','all');
+
+INSERT OR IGNORE INTO sidebar_item_categories(item_id,audience,category_id)
+SELECT si.id,'sales',sc.id
+FROM sidebar_items si
+JOIN sidebar_categories sc ON sc.audience='sales' AND sc.label=si.group_label
+WHERE si.group_label<>'' AND si.audience IN ('sales','all');
 
 CREATE INDEX IF NOT EXISTS idx_customer_progress_progress_completed
 ON customer_progress(progress_id, completed, completed_at);
