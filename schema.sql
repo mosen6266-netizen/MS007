@@ -215,3 +215,10 @@ INSERT OR IGNORE INTO sidebar_items
 
 INSERT OR IGNORE INTO system_settings(setting_key,value_json,updated_at)
 VALUES('sidebar_version','1',datetime('now'));
+
+
+INSERT OR IGNORE INTO sidebar_items
+(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
+('sa_audit','admin','操作记录','list-plus','#/admin/audit','same',1,80,'系统',datetime('now'),datetime('now')),
+('sa_recycle','admin','回收站','database','#/admin/recycle','same',1,90,'系统',datetime('now'),datetime('now')),
+('sa_backup','admin','数据备份','database','#/admin/backup','same',1,100,'系统',datetime('now'),datetime('now'));
