@@ -145,7 +145,9 @@ async function renderLogin(role){
     try{
       const r=await api("/api/login",{method:"POST",body:{username:fd.get("username"),password:fd.get("password"),role}});
       state.user=r.user;
-      location.hash=state.pendingCustomerId?`#/${role}/customer/${encodeURIComponent(state.pendingCustomerId)}`:`#/${role}/dashboard`;
+      const pendingCustomerId=state.pendingCustomerId;
+      state.pendingCustomerId=null;
+      location.hash=pendingCustomerId?`#/${role}/customer/${encodeURIComponent(pendingCustomerId)}`:`#/${role}/dashboard`;
       await enterApp();
     }catch(err){toast(err.message);}
   };
@@ -156,8 +158,9 @@ async function enterApp(){
   startSidebarSync();
   const direct=location.hash.match(/^#\/customer\/([^/]+)$/);
   if(direct){
-    state.pendingCustomerId=decodeURIComponent(direct[1]);
-    location.hash=`#/${state.user.role}/customer/${encodeURIComponent(state.pendingCustomerId)}`;
+    const pendingCustomerId=decodeURIComponent(direct[1]);
+    state.pendingCustomerId=null;
+    location.hash=`#/${state.user.role}/customer/${encodeURIComponent(pendingCustomerId)}`;
   }else if(!location.hash.startsWith("#/")){
     location.hash=`#/${state.user.role}/dashboard`;
   }
