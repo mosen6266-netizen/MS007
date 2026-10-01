@@ -2020,24 +2020,6 @@ async function createProgressDef(request, env, user) {
   return responseJson({ok:true,id,sortOrder},201);
 }
 
-async function updateProgressDef(request, env, user, id) {
-  const old=await env.DB.prepare("SELECT * FROM progress_definitions WHERE id=?").bind(id).first();
-  if(!old) return fail("进度不存在",404);
-  const b=await readBody(request),t=now();
-  await env.DB.prepare(
-    "UPDATE progress_definitions SET label=?,description=?,enabled=?,sort_order=?,color=?,updated_at=? WHERE id=?"
-  ).bind(
-    b.label!==undefined?String(b.label):old.label,
-    b.description!==undefined?String(b.description):old.description,
-    b.enabled!==undefined?(b.enabled?1:0):old.enabled,
-    b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
-    b.color!==undefined?String(b.color):old.color,t,id
-  ).run();
-  await recalcAllProgress(env);
-  await audit(env,user,"update","progress_definition",id,b);
-  return responseJson({ok:true});
-}
-
 async function listColumns(env, user) {
   const r = await env.DB.prepare(
     "SELECT id,audience,column_key,field_id,label,enabled,sort_order FROM list_columns WHERE audience=? AND enabled=1 ORDER BY sort_order,label,id"
