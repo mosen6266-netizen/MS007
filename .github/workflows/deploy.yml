@@ -78,6 +78,9 @@ jobs:
       - name: Batch 2 referential integrity regression
         run: python tests/batch2_integrity.py
 
+      - name: Batch 3 backup restore V3 regression
+        run: python tests/batch3_backup_v3.py
+
   staging:
     needs: validate
     runs-on: ubuntu-latest

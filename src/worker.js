@@ -3450,8 +3450,9 @@ async function exportBackupManifest(env,user){
     const row=await env.DB.prepare(spec.count).first();
     sections[section]={count:Number(row?.n||0)};
   }
+  const recordTotal=Object.values(sections).reduce((n,x)=>n+Number(x.count||0),0);
   const exportedAt=now();
-  await audit(env,user,"export_manifest","business_data",null,{version:3,sections});
+  await audit(env,user,"export_manifest","business_data",null,{version:3,recordTotal,sections});
   return responseJson({
     ok:true,
     format:"MS007-BUSINESS-BACKUP",
@@ -3460,6 +3461,9 @@ async function exportBackupManifest(env,user){
     appVersion:env.APP_VERSION||"dev",
     manifest:{
       sections,
+      recordTotal,
+      checksumAlgorithm:"SHA-256",
+      chunkSize:1000,
       excluded:[
         "password_hashes","password_salts","login_sessions","bootstrap_token",
         "telegram_bot_token","telegram_send_queue","telegram_chat_rate"

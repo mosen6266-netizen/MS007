@@ -2626,60 +2626,253 @@ async function renderRecycle(view,opts={}){
 }
 
 async function renderBackup(view){
-  view.innerHTML=pageHead("数据备份与恢复","备份只包含业务数据和配置，不包含管理员密码、业务员密码或登录会话")+
+  const backupOrder=[
+    "users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress",
+    "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets",
+    "systemSettings","telegramSettings","telegramProgressRoutes","auditLogs","telegramDeliveryLogs"
+  ];
+  const legacyOrder=[
+    "users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress",
+    "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets","systemSettings"
+  ];
+
+  view.innerHTML=pageHead("数据备份与恢复","V3 备份采用分块导出、SHA-256 完整性校验和恢复前预演；不会包含任何账号密码、登录会话或 Telegram Bot Token")+
     `<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">
       <div class="card">
-        <h3 style="margin-top:0">导出完整业务备份</h3>
-        <p class="muted">导出客户资料、业务员基础资料、客户进度、登记字段、左侧栏、列表设置和仪表盘配置。</p>
-        <button class="btn" id="exportBackup">导出备份文件</button>
+        <h3 style="margin-top:0">导出完整业务备份 V3</h3>
+        <p class="muted">分批导出客户资料、账号基础资料、客户进度、登记字段、左侧栏、列表/仪表盘设置、Telegram 非敏感配置和历史记录，并为每个数据部分生成 SHA-256 校验值。</p>
+        <button class="btn" id="exportBackup">导出 V3 备份文件</button>
+        <div id="exportProgress" class="muted" style="margin-top:10px"></div>
       </div>
       <div class="card">
         <h3 style="margin-top:0">从备份恢复</h3>
-        <p class="muted">支持大数据量分批恢复。恢复过程不会把密码从备份带回系统，业务员会为了安全保持停用，管理员重新设置密码后再启用。</p>
+        <p class="muted">V3 会先校验文件并做完整预演；发现账号、字段或分类冲突时不会写入任何数据。密码和 Bot Token 永远不会从备份恢复。</p>
         <input class="input" type="file" id="backupFile" accept="application/json,.json">
-        <button class="btn secondary" id="importBackup" style="margin-top:10px">开始恢复</button>
+        <button class="btn secondary" id="importBackup" style="margin-top:10px">检查并恢复</button>
         <div id="restoreProgress" class="muted" style="margin-top:10px"></div>
       </div>
     </div>
-    <div class="notice warning" style="margin-top:16px">建议你每隔一段时间手动导出一份备份保存到自己的电脑。以后还会继续增加自动备份机制。</div>`;
+    <div class="notice warning" style="margin-top:16px">建议定期把 V3 备份文件保存到自己的安全位置。恢复前系统会先检查记录数量、SHA-256 校验值和数据冲突，不会直接覆盖后再判断。</div>`;
+
+  const sha256Json=async value=>{
+    if(!globalThis.crypto?.subtle)throw new Error("当前浏览器不支持 SHA-256 完整性校验，请使用最新版 Chrome、Edge 或 Safari。");
+    const bytes=new TextEncoder().encode(JSON.stringify(value));
+    const digest=await crypto.subtle.digest("SHA-256",bytes);
+    return [...new Uint8Array(digest)].map(x=>x.toString(16).padStart(2,"0")).join("");
+  };
+
+  const downloadJson=(data,filename)=>{
+    const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob);
+    a.download=filename;
+    document.body.appendChild(a);
+    a.click();
+    const href=a.href;
+    a.remove();
+    setTimeout(()=>URL.revokeObjectURL(href),2000);
+  };
+
+  const formatPreview=(summary,total)=>{
+    const conflicts=summary.conflicts||[];
+    const warnings=summary.warnings||[];
+    const lines=[
+      `预演完成：共 ${total} 条`,
+      `新增 ${summary.newCount||0} · 更新 ${summary.updateCount||0} · 合并/关联 ${summary.mergeCount||0}`,
+      `冲突 ${conflicts.length} · 提醒 ${warnings.length}`
+    ];
+    let html=`<div><strong>${esc(lines[0])}</strong><br>${esc(lines[1])}<br>${esc(lines[2])}</div>`;
+    if(conflicts.length){
+      html+=`<div class="notice danger" style="margin-top:10px"><strong>发现冲突，已停止恢复，没有写入任何数据。</strong><br>${conflicts.slice(0,20).map(x=>esc(`${x.section||""} · ${x.type||"conflict"} · ${x.value||x.backupId||""}`)).join("<br>")}${conflicts.length>20?`<br>另外还有 ${conflicts.length-20} 项冲突`:""}</div>`;
+    }
+    if(warnings.length){
+      html+=`<details style="margin-top:10px"><summary>查看 ${warnings.length} 条恢复提醒</summary><div style="margin-top:6px">${warnings.slice(0,30).map(x=>esc(`${x.section||""} · ${x.message||x.type||"提醒"}`)).join("<br>")}${warnings.length>30?`<br>另外还有 ${warnings.length-30} 条提醒`:""}</div></details>`;
+    }
+    return html;
+  };
 
   document.querySelector("#exportBackup").onclick=async()=>{
-    const btn=document.querySelector("#exportBackup");btn.disabled=true;btn.textContent="正在生成...";
+    const btn=document.querySelector("#exportBackup");
+    const progress=document.querySelector("#exportProgress");
+    btn.disabled=true;
+    btn.textContent="正在生成...";
+    progress.textContent="正在读取备份清单...";
     try{
-      const data=await api("/api/admin/export");
-      const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
-      const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+      const meta=await api("/api/admin/export-manifest");
+      if(meta?.format!=="MS007-BUSINESS-BACKUP"||Number(meta?.version||0)<3||!meta?.manifest?.sections){
+        throw new Error("服务器没有返回有效的 V3 备份清单");
+      }
+
+      const sections=backupOrder.filter(k=>Object.prototype.hasOwnProperty.call(meta.manifest.sections,k));
+      const total=sections.reduce((n,k)=>n+Number(meta.manifest.sections[k]?.count||0),0);
+      const data={};
+      let done=0;
+
+      for(const section of sections){
+        const rows=[];
+        let offset=0;
+        while(true){
+          const chunk=await api(`/api/admin/export-section?section=${encodeURIComponent(section)}&offset=${offset}&limit=1000`);
+          const items=Array.isArray(chunk.items)?chunk.items:[];
+          rows.push(...items);
+          done+=items.length;
+          progress.textContent=`正在导出：${done} / ${total} 条 · ${section}`;
+          if(chunk.nextOffset===null||chunk.nextOffset===undefined)break;
+          offset=Number(chunk.nextOffset)||0;
+        }
+
+        const expected=Number(meta.manifest.sections[section]?.count||0);
+        if(rows.length!==expected){
+          throw new Error(`${section} 导出数量不一致：预计 ${expected}，实际 ${rows.length}`);
+        }
+        data[section]=rows;
+        meta.manifest.sections[section]={
+          ...meta.manifest.sections[section],
+          count:rows.length,
+          sha256:await sha256Json(rows)
+        };
+      }
+
+      const backup={
+        format:"MS007-BUSINESS-BACKUP",
+        version:3,
+        exportedAt:meta.exportedAt||new Date().toISOString(),
+        appVersion:meta.appVersion||"unknown",
+        manifest:{
+          ...meta.manifest,
+          checksumAlgorithm:"SHA-256",
+          chunkSize:1000,
+          recordTotal:total
+        },
+        data
+      };
+
+      progress.textContent=`正在写入备份文件：${total} 条数据...`;
       const d=new Date().toISOString().replace(/[:.]/g,"-");
-      a.download=`MS007-业务数据备份-${d}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),2000);
-      toast("备份文件已生成");
-    }catch(e){toast(e.message)}
-    btn.disabled=false;btn.textContent="导出备份文件";
+      downloadJson(backup,`MS007-业务数据备份-V3-${d}.json`);
+      progress.textContent=`V3 备份已生成：${total} 条数据，${sections.length} 个数据部分均已写入 SHA-256 校验值。`;
+      toast("V3 备份文件已生成");
+    }catch(e){
+      progress.textContent=`导出失败：${e.message}`;
+      toast(e.message);
+    }finally{
+      btn.disabled=false;
+      btn.textContent="导出 V3 备份文件";
+    }
   };
 
   document.querySelector("#importBackup").onclick=async()=>{
+    const btn=document.querySelector("#importBackup");
+    const progress=document.querySelector("#restoreProgress");
     const file=document.querySelector("#backupFile").files?.[0];
     if(!file){toast("请先选择备份文件");return}
-    let backup;
-    try{backup=JSON.parse(await file.text())}catch{toast("这个文件不是有效的 JSON 备份");return}
-    if(backup?.format!=="MS007-BUSINESS-BACKUP"||!backup?.data){toast("这不是 MS007 业务备份文件");return}
-    if(!await uiConfirm("确认开始恢复这份备份？\n\n同 ID 数据会按备份内容覆盖。",{title:"恢复业务数据",confirmText:"开始恢复",danger:true}))return;
 
-    const order=["users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress","sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets","systemSettings"];
-    const total=order.reduce((n,k)=>n+(Array.isArray(backup.data[k])?backup.data[k].length:0),0);
-    let done=0;const progress=document.querySelector("#restoreProgress");
+    let backup;
+    try{backup=JSON.parse(await file.text())}
+    catch{toast("这个文件不是有效的 JSON 备份");return}
+
+    if(backup?.format!=="MS007-BUSINESS-BACKUP"||!backup?.data){
+      toast("这不是 MS007 业务备份文件");
+      return;
+    }
+
+    btn.disabled=true;
+    btn.textContent="正在检查...";
     try{
+      const isV3=Number(backup.version||0)>=3;
+      const order=isV3?backupOrder:legacyOrder;
+      const total=order.reduce((n,k)=>n+(Array.isArray(backup.data[k])?backup.data[k].length:0),0);
+
+      if(isV3){
+        if(!backup?.manifest?.sections)throw new Error("V3 备份缺少 manifest 清单");
+
+        progress.textContent="正在校验记录数量与 SHA-256...";
+        for(const section of order){
+          const rows=Array.isArray(backup.data[section])?backup.data[section]:[];
+          const spec=backup.manifest.sections?.[section];
+          if(!spec)throw new Error(`V3 备份缺少 ${section} 清单`);
+          if(Number(spec.count||0)!==rows.length){
+            throw new Error(`${section} 记录数量校验失败：清单 ${Number(spec.count||0)}，文件 ${rows.length}`);
+          }
+          const expected=String(spec.sha256||"").toLowerCase();
+          if(!/^[a-f0-9]{64}$/.test(expected)){
+            throw new Error(`${section} 缺少有效的 SHA-256 校验值`);
+          }
+          const actual=await sha256Json(rows);
+          if(actual!==expected)throw new Error(`${section} SHA-256 校验失败，文件可能不完整或已被修改`);
+        }
+
+        const summary={newCount:0,updateCount:0,mergeCount:0,conflicts:[],warnings:[]};
+        let previewed=0;
+        progress.textContent=`完整性校验通过，正在预演：0 / ${total} 条`;
+        for(const section of order){
+          const rows=Array.isArray(backup.data[section])?backup.data[section]:[];
+          for(let i=0;i<rows.length;i+=200){
+            const chunk=rows.slice(i,i+200);
+            const r=await api("/api/admin/import-preview-chunk",{
+              method:"POST",
+              body:{format:"MS007-BUSINESS-BACKUP",version:3,section,rows:chunk}
+            });
+            summary.newCount+=Number(r.newCount||0);
+            summary.updateCount+=Number(r.updateCount||0);
+            summary.mergeCount+=Number(r.mergeCount||0);
+            summary.conflicts.push(...(r.conflicts||[]).map(x=>({...x,section})));
+            summary.warnings.push(...(r.warnings||[]).map(x=>({...x,section})));
+            previewed+=chunk.length;
+            progress.textContent=`正在预演：${previewed} / ${total} 条 · ${section}`;
+          }
+        }
+
+        progress.innerHTML=formatPreview(summary,total);
+        if(summary.conflicts.length){
+          toast("恢复预演发现冲突，未写入任何数据");
+          return;
+        }
+
+        const ok=await uiConfirm(
+          `V3 完整性校验和恢复预演均已通过。\n\n共 ${total} 条数据：新增 ${summary.newCount}，更新 ${summary.updateCount}，合并/关联 ${summary.mergeCount}，提醒 ${summary.warnings.length}。\n\n账号密码、登录会话和 Telegram Bot Token 不会恢复；新导入账号保持停用，需管理员重新设置密码后再启用。\n\n确认开始正式恢复？`,
+          {title:"恢复业务数据 V3",confirmText:"开始安全恢复",danger:true}
+        );
+        if(!ok)return;
+      }else{
+        const ok=await uiConfirm(
+          "这是旧版 MS007 备份。系统会继续兼容恢复，但旧文件没有 V3 的 SHA-256 校验和恢复预演保护。\n\n确认继续恢复？",
+          {title:"恢复旧版业务备份",confirmText:"继续恢复",danger:true}
+        );
+        if(!ok)return;
+      }
+
+      let done=0;
+      btn.textContent="正在恢复...";
       for(const section of order){
         const rows=Array.isArray(backup.data[section])?backup.data[section]:[];
-        for(let i=0;i<rows.length;i+=100){
-          const chunk=rows.slice(i,i+100);
-          await api("/api/admin/import-chunk",{method:"POST",body:{format:"MS007-BUSINESS-BACKUP",section,rows:chunk}});
-          done+=chunk.length;progress.textContent=`正在恢复：${done} / ${total} 条`;
+        for(let i=0;i<rows.length;i+=200){
+          const chunk=rows.slice(i,i+200);
+          await api("/api/admin/import-chunk",{
+            method:"POST",
+            body:{
+              format:"MS007-BUSINESS-BACKUP",
+              version:Number(backup.version||2),
+              section,
+              rows:chunk
+            }
+          });
+          done+=chunk.length;
+          progress.textContent=`正在恢复：${done} / ${total} 条 · ${section}`;
         }
       }
+
       await api("/api/admin/import-finish",{method:"POST"});
-      progress.textContent=`恢复完成：${done} 条数据`;toast("业务数据恢复完成");
+      progress.textContent=`恢复完成：${done} 条数据。密码、登录会话和 Telegram Bot Token 均未从备份恢复。`;
+      toast("业务数据恢复完成");
       await refreshSidebar(true);
-    }catch(e){progress.textContent=`恢复中断：${e.message}`;toast(e.message)}
+    }catch(e){
+      progress.textContent=`恢复中断：${e.message}`;
+      toast(e.message);
+    }finally{
+      btn.disabled=false;
+      btn.textContent="检查并恢复";
+    }
   };
 }
 
