@@ -656,20 +656,30 @@ async function renderFields(view){
   const r=await api("/api/fields");const items=r.items||[];
   view.innerHTML=pageHead("登记字段管理","添加、编辑、排序并决定哪些字段显示在客户列表",`<button class="btn" id="addField">＋ 添加字段</button>`)+
     `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>名称</th><th>类型</th><th>必填</th><th>列表显示</th><th>可搜索</th><th>状态</th><th>操作</th></tr></thead><tbody>
-    ${items.map(f=>`<tr><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(fieldTypeName[f.field_type]||f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button> <button class="btn danger small" data-del-field="${esc(f.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
+    ${items.map(f=>`<tr data-field-row="${esc(f.id)}"><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(fieldTypeName[f.field_type]||f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button> <button class="btn danger small" data-del-field="${esc(f.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
   const nextFieldSort=(items.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0))+1;
   document.querySelector("#addField").onclick=()=>fieldModal(view,null,nextFieldSort);
   document.querySelectorAll("[data-edit-field]").forEach(b=>b.onclick=()=>fieldModal(view,items.find(x=>x.id===b.dataset.editField)));
   document.querySelectorAll("[data-del-field]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/fields/"+b.dataset.delField,{method:"DELETE"});toast("字段已停用");renderFields(view)}catch(e){toast(e.message)}});
+  document.querySelectorAll("[data-field-row]").forEach(row=>row.addEventListener("contextmenu",e=>{
+    e.preventDefault();
+    const anchor=items.find(x=>x.id===row.dataset.fieldRow);if(!anchor)return;
+    showInsertContextMenu(e,{
+      label:anchor.label,
+      before:()=>fieldModal(view,null,Number(anchor.sort_order)||1,{anchorId:anchor.id,position:"before",anchorLabel:anchor.label}),
+      after:()=>fieldModal(view,null,(Number(anchor.sort_order)||0)+1,{anchorId:anchor.id,position:"after",anchorLabel:anchor.label})
+    });
+  }));
 }
-function fieldModal(view,f,nextSort=1){
+function fieldModal(view,f,nextSort=1,insert=null){
   let fieldOptions=[];
   try{
     const parsed=JSON.parse(f?.options_json||"[]");
     if(Array.isArray(parsed)) fieldOptions=parsed.map(x=>String(x)).filter(Boolean);
   }catch{}
 
-  openModal(f?"编辑字段":"添加字段",`
+  const modalTitle=f?"编辑字段":insert?(insert.position==="before"?`在「${insert.anchorLabel}」上方插入字段`:`在「${insert.anchorLabel}」下方插入字段`):"添加字段";
+  openModal(modalTitle,`
     <div class="field"><label>字段名称</label><input class="input" id="fLabel" value="${esc(f?.label||"")}"></div>
     <div class="field"><label>字段类型</label><select class="input" id="fType">
       ${["text","textarea","phone","email","number","date","time","url","select"].map(x=>`<option ${x===f?.field_type?"selected":""} value="${x}">${esc(fieldTypeName[x]||x)}</option>`).join("")}
@@ -692,7 +702,7 @@ function fieldModal(view,f,nextSort=1){
       <label><input type="checkbox" id="fSearch" ${f?.searchable!==0?"checked":""}> 可搜索</label>
       <label><input type="checkbox" id="fEnabled" ${f?.enabled!==0?"checked":""}> 启用</label>
     </div>
-    <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="fSort" type="number" value="${f?.sort_order??nextSort}"></div>
+    <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="fSort" type="number" value="${f?.sort_order??nextSort}" ${insert?"readonly":""}>${insert?'<div class="muted" style="font-size:12px;margin-top:5px">插入保存时会自动调整后续所有排序数字。</div>':""}</div>
     <button class="btn full" id="fSave">保存</button>`,()=>{
       const typeEl=document.querySelector("#fType");
       const box=document.querySelector("#fOptionsBox");
@@ -787,37 +797,59 @@ function fieldModal(view,f,nextSort=1){
           listSortOrder:Number(val("fSort")||100),
           options:type==="select"?fieldOptions:[]
         };
+        if(insert){
+          body.insertAnchorId=insert.anchorId;
+          body.insertPosition=insert.position;
+        }
         try{
           if(f)await api("/api/admin/fields/"+f.id,{method:"PATCH",body});
           else await api("/api/admin/fields",{method:"POST",body});
           closeModal();
-          toast("字段设置已保存");
+          toast(insert?"字段已插入并自动调整排序":"字段设置已保存");
           renderFields(view);
         }catch(e){toast(e.message)}
       };
-    },{draftKey:`field:${f?.id||"new"}`});
+    },{draftKey:f?`field:${f.id}`:insert?`field:insert:${insert.anchorId}:${insert.position}`:"field:new"});
 }
 
 async function renderProgressAdmin(view){
   const r=await api("/api/progress-defs");const items=r.items||[];
   view.innerHTML=pageHead("客户进度管理","业务员勾选完成后，客户卡片百分比立即更新",`<button class="btn" id="addProgress">＋ 添加进度</button>`)+
     `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>进度名称</th><th>说明</th><th>颜色</th><th>状态</th><th>操作</th></tr></thead><tbody>
-    ${items.map(p=>`<tr><td>${p.sort_order}</td><td><strong>${esc(p.label)}</strong></td><td>${esc(p.description||"")}</td><td><span class="tag" style="border-left:5px solid ${esc(p.color)}">${esc(p.color)}</span></td><td>${p.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-prog="${esc(p.id)}">编辑</button> <button class="btn danger small" data-del-prog="${esc(p.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
+    ${items.map(p=>`<tr data-progress-row="${esc(p.id)}"><td>${p.sort_order}</td><td><strong>${esc(p.label)}</strong></td><td>${esc(p.description||"")}</td><td><span class="tag" style="border-left:5px solid ${esc(p.color)}">${esc(p.color)}</span></td><td>${p.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-prog="${esc(p.id)}">编辑</button> <button class="btn danger small" data-del-prog="${esc(p.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
   const nextProgressSort=(items.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0))+1;
   document.querySelector("#addProgress").onclick=()=>progressModal(view,null,nextProgressSort);
   document.querySelectorAll("[data-edit-prog]").forEach(b=>b.onclick=()=>progressModal(view,items.find(x=>x.id===b.dataset.editProg)));
   document.querySelectorAll("[data-del-prog]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/progress/"+b.dataset.delProg,{method:"DELETE"});toast("进度已停用");renderProgressAdmin(view)}catch(e){toast(e.message)}});
+  document.querySelectorAll("[data-progress-row]").forEach(row=>row.addEventListener("contextmenu",e=>{
+    e.preventDefault();
+    const anchor=items.find(x=>x.id===row.dataset.progressRow);if(!anchor)return;
+    showInsertContextMenu(e,{
+      label:anchor.label,
+      before:()=>progressModal(view,null,Number(anchor.sort_order)||1,{anchorId:anchor.id,position:"before",anchorLabel:anchor.label}),
+      after:()=>progressModal(view,null,(Number(anchor.sort_order)||0)+1,{anchorId:anchor.id,position:"after",anchorLabel:anchor.label})
+    });
+  }));
 }
-function progressModal(view,p,nextSort=1){
-  openModal(p?"编辑进度":"添加进度",`
+function progressModal(view,p,nextSort=1,insert=null){
+  const modalTitle=p?"编辑进度":insert?(insert.position==="before"?`在「${insert.anchorLabel}」上方插入进度`:`在「${insert.anchorLabel}」下方插入进度`):"添加进度";
+  openModal(modalTitle,`
     <div class="field"><label>进度名称</label><input class="input" id="pLabel" value="${esc(p?.label||"")}"></div>
     <div class="field"><label>说明</label><input class="input" id="pDesc" value="${esc(p?.description||"")}"></div>
     <div class="field"><label>颜色</label><input class="input" type="color" id="pColor" value="${esc(p?.color||"#2563eb")}"></div>
-    <div class="field"><label>排序数字</label><input class="input" type="number" id="pSort" value="${p?.sort_order??nextSort}"></div>
+    <div class="field"><label>排序数字</label><input class="input" type="number" id="pSort" value="${p?.sort_order??nextSort}" ${insert?"readonly":""}>${insert?'<div class="muted" style="font-size:12px;margin-top:5px">插入保存时会自动调整后续所有排序数字。</div>':""}</div>
     <label><input type="checkbox" id="pEnabled" ${p?.enabled!==0?"checked":""}> 启用</label>
     <button class="btn full" id="pSave" style="margin-top:16px">保存</button>`,()=>{
-      document.querySelector("#pSave").onclick=async()=>{const body={label:val("pLabel"),description:val("pDesc"),color:val("pColor"),sortOrder:Number(val("pSort")||100),enabled:checked("pEnabled")};try{if(p)await api("/api/admin/progress/"+p.id,{method:"PATCH",body});else await api("/api/admin/progress",{method:"POST",body});closeModal();toast("进度设置已保存");renderProgressAdmin(view)}catch(e){toast(e.message)}};
-    },{draftKey:`progress:${p?.id||"new"}`});
+      document.querySelector("#pSave").onclick=async()=>{
+        const body={label:val("pLabel"),description:val("pDesc"),color:val("pColor"),sortOrder:Number(val("pSort")||100),enabled:checked("pEnabled")};
+        if(insert){body.insertAnchorId=insert.anchorId;body.insertPosition=insert.position}
+        try{
+          if(p)await api("/api/admin/progress/"+p.id,{method:"PATCH",body});
+          else await api("/api/admin/progress",{method:"POST",body});
+          closeModal();toast(insert?"进度已插入并自动调整排序":"进度设置已保存");renderProgressAdmin(view)
+        }catch(e){toast(e.message)}
+      };
+    },{draftKey:p?`progress:${p.id}`:insert?`progress:insert:${insert.anchorId}:${insert.position}`:"progress:new"});
 }
 
 async function renderSidebarAdmin(view){
@@ -1519,6 +1551,36 @@ function removeModal({clearDraft=false}={}){
   el.remove();
 }
 
+function closeRowContextMenu(){
+  document.querySelector("#rowContextMenu")?.remove();
+}
+
+function showInsertContextMenu(event,{label,before,after}){
+  closeRowContextMenu();
+  const menu=document.createElement("div");
+  menu.id="rowContextMenu";
+  menu.className="row-context-menu";
+  menu.innerHTML=`
+    <div class="row-context-title">${esc(label||"当前项目")}</div>
+    <button type="button" data-insert-before>↑ 在上方插入一条</button>
+    <button type="button" data-insert-after>↓ 在下方插入一条</button>`;
+  document.body.appendChild(menu);
+
+  const pad=8;
+  const rect=menu.getBoundingClientRect();
+  menu.style.left=Math.max(pad,Math.min(event.clientX,window.innerWidth-rect.width-pad))+"px";
+  menu.style.top=Math.max(pad,Math.min(event.clientY,window.innerHeight-rect.height-pad))+"px";
+
+  const cleanup=()=>closeRowContextMenu();
+  menu.querySelector("[data-insert-before]").onclick=()=>{cleanup();before?.()};
+  menu.querySelector("[data-insert-after]").onclick=()=>{cleanup();after?.()};
+
+  setTimeout(()=>{
+    document.addEventListener("click",cleanup,{once:true});
+    window.addEventListener("scroll",cleanup,{once:true,capture:true});
+  },0);
+}
+
 function openDrawer(title,body,onReady,opts={}){
   removeDrawer();
   const el=document.createElement("div");
@@ -1567,5 +1629,7 @@ function closeModal(){
 
 function val(id){return document.querySelector("#"+id)?.value||""}
 function checked(id){return !!document.querySelector("#"+id)?.checked}
+
+document.addEventListener("keydown",e=>{if(e.key==="Escape")closeRowContextMenu()});
 
 bootstrap();
