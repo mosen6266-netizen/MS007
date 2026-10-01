@@ -97,4 +97,34 @@ Verification:
 - Production migrations: success/no unapplied migrations.
 - Production deploy/smoke: success.
 
-Next work: Batch 3 - Backup/Restore V3.
+Next work: Batch 3 - Backup/Restore V3. (completed below)
+
+
+## Batch 3 completed verification
+
+Final verified commit: 97267b0d43d498eeff9c0c97116a770d0c8d4354
+
+Implemented:
+- Backup V3 manifest with version, record counts, total record count, chunk metadata, and per-section SHA-256 integrity checks.
+- Chunked export suitable for larger datasets instead of the old one-request full export path.
+- Full restore integrity verification and dry-run/preview across all V3 sections before the first write is allowed.
+- Conflict reporting for account identity/role, field keys, and sidebar category identity; conflicts stop restore before any data is written.
+- Safe UPSERT/UPDATE restore behavior; destructive REPLACE semantics were removed from the restore path.
+- Backup now includes non-secret Telegram settings/routes, administrator/sales account metadata, audit history, and Telegram delivery history.
+- Password hashes/salts, login sessions, bootstrap token, and Telegram Bot Token remain excluded from backup and restore.
+- New imported accounts remain disabled and require an administrator to set a password before enabling.
+- Legacy V2 business backup restore remains supported for backward compatibility, while V3 receives the stronger integrity and preview protections.
+- Added Batch 3 Backup/Restore V3 regression checks and made both quality and deployment validation run them.
+
+Verification:
+- Quality Check run 36922766798: success.
+- Deploy run 36922766823: success.
+- Frontend/Worker syntax, database safety gate, duplicate-function guard, Batch 1, Batch 2, and Batch 3 regressions: success.
+- Staging database already existed, so bootstrap schema was skipped.
+- Staging migrations, deployment, and smoke test: success.
+- Production database already existed, so bootstrap schema was skipped.
+- Production recovery point was recorded and uploaded before migrations.
+- Production migrations applied successfully; no unapplied migrations remained.
+- Production deployment and smoke test: success.
+
+Next work: Batch 4 - Performance.
