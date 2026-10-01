@@ -1,0 +1,22 @@
+{
+  "batch": "Batch 7",
+  "step": "2",
+  "title": "Statistics cache design",
+  "purpose": "Reduce full table scans for customer and salesperson statistics.",
+  "protection": {
+    "customer_data_modified": false,
+    "schema_migration_required": false,
+    "production_records_touched": false
+  },
+  "planned_changes": [
+    "incremental customer counters",
+    "salesperson statistics cache",
+    "archive status counters",
+    "safe invalidation on customer changes"
+  ],
+  "validation": [
+    "customer records remain unchanged",
+    "existing configuration remains unchanged",
+    "statistics can be rebuilt if cache is lost"
+  ]
+}
