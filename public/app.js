@@ -2081,6 +2081,10 @@ async function renderTelegramSettings(view){
 
   const queueMonitor=r.queueMonitor||{};
   const unresolvedInitial=Array.isArray(r.unresolved?.items)?r.unresolved.items:[];
+  let telegramBulkRetryRunning=false;
+  const telegramManualFailureCount=items=>(items||[]).filter(
+    x=>x.status==="needs_admin" || x.source==="delivery"
+  ).length;
   const formatQueueWait=seconds=>{
     const value=Math.max(0,Number(seconds||0));
     if(!value)return "无等待";
@@ -2243,7 +2247,10 @@ async function renderTelegramSettings(view){
           <h3 style="margin:0">未发送成功 <span class="tag" id="tgUnresolvedCount">${money(unresolvedInitial.length)}</span></h3>
           <p class="muted" id="tgUnresolvedMeta" style="margin:6px 0 0">这里自动汇总所有最终还没有成功的 Telegram 通知，包括等待发送、自动重试、需要管理员处理、已跳过和旧失败记录。发送成功后会自动从这里消失，不需要你再翻历史记录。</p>
         </div>
-        <button class="btn ghost small" id="tgUnresolvedRefresh">立即刷新</button>
+        <div class="row wrap">
+          <button class="btn secondary small" id="tgRetryAllFailed" ${telegramManualFailureCount(unresolvedInitial)?"":"disabled"}>一键重新发送全部失败</button>
+          <button class="btn ghost small" id="tgUnresolvedRefresh">立即刷新</button>
+        </div>
       </div>
       <div class="table-wrap" style="margin-top:12px">
         <table>
@@ -2251,7 +2258,7 @@ async function renderTelegramSettings(view){
           <tbody id="tgUnresolvedBody">${telegramUnresolvedRowsHtml(unresolvedInitial)}</tbody>
         </table>
       </div>
-      <div class="muted" id="tgUnresolvedAutoHint" style="margin-top:8px;font-size:12px">页面打开时每 5 秒自动检查一次；成功发送的项目会自动消失。</div>
+      <div class="muted" id="tgUnresolvedAutoHint" style="margin-top:8px;font-size:12px">页面打开时每 5 秒自动检查一次；成功发送的项目会自动消失。“一键重新发送全部失败”每批最多处理 10 条，真正发送仍由可靠队列限速，不会一次性同时发送。</div>
     </section>
 
     <section class="card" style="margin-top:16px">
@@ -2423,6 +2430,12 @@ async function renderTelegramSettings(view){
       body.innerHTML=telegramUnresolvedRowsHtml(items);
       const count=document.querySelector("#tgUnresolvedCount");
       if(count)count.textContent=money(items.length);
+      const bulkBtn=document.querySelector("#tgRetryAllFailed");
+      if(bulkBtn && !telegramBulkRetryRunning){
+        const failedCount=telegramManualFailureCount(items);
+        bulkBtn.disabled=failedCount===0;
+        bulkBtn.textContent=failedCount?("一键重新发送全部失败（"+failedCount+"）"):"当前没有失败需要重发";
+      }
       const meta=document.querySelector("#tgUnresolvedMeta");
       if(meta){
         meta.textContent=items.length
@@ -2433,6 +2446,86 @@ async function renderTelegramSettings(view){
       if(showError)toast(e.message);
     }
   }
+
+  document.querySelector("#tgRetryAllFailed").onclick=async()=>{
+    if(telegramBulkRetryRunning)return;
+    const initialFailures=telegramManualFailureCount(
+      Array.from(document.querySelectorAll("#tgUnresolvedBody [data-tg-unresolved-retry]"))
+        .map(btn=>({
+          status:btn.dataset.tgUnresolvedSource==="delivery"?"failed":"needs_admin",
+          source:btn.dataset.tgUnresolvedSource||"queue"
+        }))
+    );
+    if(!initialFailures){
+      toast("当前没有需要重新发送的失败通知");
+      return;
+    }
+
+    const confirmed=await uiConfirm(
+      "系统会把所有真正失败的 Telegram 通知分批重新排队，每批最多 10 条。\n\n已经在等待发送、自动重试或正在发送的消息不会重复加入；真正发送仍按现有限速规则慢慢进行，不会一次性同时发送。\n\n确认开始？",
+      {title:"一键重新发送全部失败",confirmText:"开始分批重新发送"}
+    );
+    if(!confirmed)return;
+
+    const btn=document.querySelector("#tgRetryAllFailed");
+    telegramBulkRetryRunning=true;
+    btn.disabled=true;
+    const skipIds=[];
+    let totalProcessed=0;
+    let totalQueuedMessages=0;
+    let totalBlocked=0;
+    let batches=0;
+
+    try{
+      while(batches<100){
+        batches++;
+        btn.textContent="正在分批处理… 已处理 "+totalProcessed+" 条";
+        const out=await api("/api/admin/telegram/retry-failed-batch",{
+          method:"POST",
+          body:{skipIds}
+        });
+        totalProcessed+=Number(out.processed||0);
+        totalQueuedMessages+=Number(out.queuedMessages||0);
+        const blocked=Array.isArray(out.blocked)?out.blocked:[];
+        for(const item of blocked){
+          const id=String(item?.id||"");
+          if(id&&!skipIds.includes(id))skipIds.push(id);
+        }
+        totalBlocked=skipIds.length;
+
+        await refreshTelegramUnresolved();
+
+        if(!out.hasMoreActionable)break;
+        if(Number(out.processed||0)===0 && blocked.length===0)break;
+
+        // Small pause between database batches. Telegram delivery itself is even
+        // more conservative and continues through the server-side rate-limited queue.
+        await new Promise(resolve=>setTimeout(resolve,900));
+      }
+
+      if(totalBlocked){
+        toast("已重新排队 "+totalProcessed+" 条；还有 "+totalBlocked+" 条因群设置、客户/进度缺失等原因暂时无法重新发送");
+      }else if(totalProcessed){
+        toast("已分批重新排队 "+totalProcessed+" 条失败通知，系统会按限速规则继续发送");
+      }else{
+        toast("没有找到需要重新发送的失败通知");
+      }
+      await refreshTelegramUnresolved({showError:true});
+    }catch(err){
+      toast("批量重新发送已停止："+err.message+"；已经成功排队的部分会继续正常发送");
+      await refreshTelegramUnresolved();
+    }finally{
+      telegramBulkRetryRunning=false;
+      const currentBtn=document.querySelector("#tgRetryAllFailed");
+      if(currentBtn){
+        const out=await api("/api/admin/telegram/unresolved").catch(()=>null);
+        const items=Array.isArray(out?.items)?out.items:[];
+        const failedCount=telegramManualFailureCount(items);
+        currentBtn.disabled=failedCount===0;
+        currentBtn.textContent=failedCount?("一键重新发送全部失败（"+failedCount+"）"):"当前没有失败需要重发";
+      }
+    }
+  };
 
   document.querySelector("#tgUnresolvedRefresh").onclick=()=>refreshTelegramUnresolved({showError:true});
   document.querySelector("#tgUnresolvedBody").onclick=async e=>{
