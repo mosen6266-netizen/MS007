@@ -466,7 +466,7 @@ async function openCustomerEditor(id=null){
           <button class="btn ghost" type="button" id="drawerCancel">取消</button>
         </div>
       </form>`,()=>{
-        document.querySelector("#drawerCancel").onclick=closeDrawer;
+        document.querySelector("#drawerCancel").onclick=requestCloseDrawer;
         document.querySelector("#customerDrawerForm").onsubmit=async e=>{
           e.preventDefault();
           const form=e.currentTarget;
@@ -484,7 +484,7 @@ async function openCustomerEditor(id=null){
             if(document.querySelector("#customerResults")) await loadCustomerPage(true);
           }catch(err){toast(err.message)}
         };
-      });
+      },{draftKey:`customer:${id||"new"}:${state.user.id}`});
   }catch(err){toast(err.message)}
 }
 
@@ -526,8 +526,8 @@ async function openCustomerPreview(id){
       </div>`,()=>{
         document.querySelector("#previewEdit").onclick=()=>{closeDrawer();openCustomerEditor(id)};
         document.querySelector("#previewCopy").onclick=()=>copyCustomerAll(id);
-        document.querySelector("#previewClose").onclick=closeDrawer;
-      });
+        document.querySelector("#previewClose").onclick=requestCloseDrawer;
+      },{draft:false});
   }catch(err){toast(err.message)}
 }
 
@@ -590,7 +590,7 @@ async function renderSales(view){
     <div class="field"><label>初始密码（至少8位）</label><input class="input" type="password" id="mPass"></div>
     <button class="btn full" id="mSave">创建业务员</button>`,()=>{
       document.querySelector("#mSave").onclick=async()=>{try{await api("/api/admin/users",{method:"POST",body:{displayName:val("mName"),username:val("mUser"),password:val("mPass")}});closeModal();toast("业务员已创建");renderSales(view);}catch(e){toast(e.message)}};
-    });
+    },{draftKey:"sales-user:new"});
   document.querySelectorAll("[data-edit-user]").forEach(b=>b.onclick=()=>{
     const u=items.find(x=>x.id===b.dataset.editUser); if(!u)return;
     openModal("业务员账号设置",`
@@ -604,7 +604,7 @@ async function renderSales(view){
           const body={displayName:val("euName"),active:checked("euActive")};if(val("euPass"))body.password=val("euPass");
           await api("/api/admin/users/"+u.id,{method:"PATCH",body});closeModal();toast("业务员账号设置已保存");renderSales(view);
         }catch(e){toast(e.message)}};
-      });
+      },{draftKey:`sales-user:${u.id}`});
   });
 }
 
@@ -764,7 +764,7 @@ function fieldModal(view,f,nextSort=1){
           renderFields(view);
         }catch(e){toast(e.message)}
       };
-    });
+    },{draftKey:`field:${f?.id||"new"}`});
 }
 
 async function renderProgressAdmin(view){
@@ -786,7 +786,7 @@ function progressModal(view,p,nextSort=1){
     <label><input type="checkbox" id="pEnabled" ${p?.enabled!==0?"checked":""}> 启用</label>
     <button class="btn full" id="pSave" style="margin-top:16px">保存</button>`,()=>{
       document.querySelector("#pSave").onclick=async()=>{const body={label:val("pLabel"),description:val("pDesc"),color:val("pColor"),sortOrder:Number(val("pSort")||100),enabled:checked("pEnabled")};try{if(p)await api("/api/admin/progress/"+p.id,{method:"PATCH",body});else await api("/api/admin/progress",{method:"POST",body});closeModal();toast("进度设置已保存");renderProgressAdmin(view)}catch(e){toast(e.message)}};
-    });
+    },{draftKey:`progress:${p?.id||"new"}`});
 }
 
 async function renderSidebarAdmin(view){
@@ -818,7 +818,7 @@ function sidebarModal(view,x){
     <label><input type="checkbox" id="sEnabled" ${x?.enabled!==0?"checked":""}> 启用</label>
     <button class="btn full" id="sSave" style="margin-top:16px">保存并同步</button>`,()=>{
       document.querySelector("#sSave").onclick=async()=>{const body={label:val("sLabel"),audience:val("sAudience"),url:val("sUrl"),icon:val("sIcon"),groupLabel:val("sGroup"),target:val("sTarget"),sortOrder:Number(val("sSort")||100),enabled:checked("sEnabled")};try{if(x)await api("/api/admin/sidebar/"+x.id,{method:"PATCH",body});else await api("/api/admin/sidebar",{method:"POST",body});closeModal();toast("左侧栏已保存并同步");await refreshSidebar(true);renderSidebarAdmin(view)}catch(e){toast(e.message)}};
-    });
+    },{draftKey:`sidebar:${x?.id||"new"}`});
 }
 function enableSidebarDrag(view,items){
   let dragId=null;
@@ -1076,7 +1076,7 @@ function dashboardWidgetModal(view,audience,w){
       if(!w)document.querySelector("#wTitle").value=widgetTypeName[type.value];
       type.onchange=()=>{if(!w||!val("wTitle"))document.querySelector("#wTitle").value=widgetTypeName[type.value]};
       document.querySelector("#wSave").onclick=async()=>{const body={audience,widgetType:val("wType"),title:val("wTitle")||widgetTypeName[val("wType")],sortOrder:Number(val("wSort")||100),enabled:checked("wEnabled")};try{if(w)await api("/api/admin/dashboard-widgets/"+w.id,{method:"PATCH",body});else await api("/api/admin/dashboard-widgets",{method:"POST",body});closeModal();toast("仪表盘设置已保存");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}};
-    });
+    },{draftKey:`dashboard-widget:${audience}:${w?.id||"new"}`});
 }
 
 async function renderCapacity(view){
@@ -1211,25 +1211,182 @@ async function renderBackup(view){
   };
 }
 
-function openDrawer(title,body,onReady){
-  closeDrawer();
+const DRAFT_PREFIX="ms007:draft:v1:";
+
+function draftStorageKey(key){
+  return DRAFT_PREFIX+(state.user?.id||"anonymous")+":"+key;
+}
+
+function draftControlKey(el,index){
+  if(el.id)return "id:"+el.id;
+  if(el.dataset?.field)return "field:"+el.dataset.field;
+  if(el.name)return "name:"+el.name;
+  return "index:"+index;
+}
+
+function draftEligible(el){
+  const type=String(el.type||"").toLowerCase();
+  if(["password","file","submit","button","reset"].includes(type))return false;
+  if(el.disabled)return false;
+  const marker=((el.id||"")+" "+(el.name||"")).toLowerCase();
+  if(/password|passwd|secret|token|authorization|authcode/.test(marker))return false;
+  return ["INPUT","SELECT","TEXTAREA"].includes(el.tagName);
+}
+
+function serializeOverlayDraft(root){
+  const controls=[...root.querySelectorAll("input,select,textarea")].filter(draftEligible);
+  return controls.map((el,index)=>({
+    key:draftControlKey(el,index),
+    tag:el.tagName,
+    type:String(el.type||""),
+    value:(el.type==="checkbox"||el.type==="radio")?undefined:el.value,
+    checked:(el.type==="checkbox"||el.type==="radio")?!!el.checked:undefined
+  }));
+}
+
+function findDraftControl(root,item,index){
+  const controls=[...root.querySelectorAll("input,select,textarea")].filter(draftEligible);
+  if(item.key?.startsWith("id:")){
+    const id=item.key.slice(3);
+    return controls.find(x=>x.id===id)||null;
+  }
+  if(item.key?.startsWith("field:")){
+    const key=item.key.slice(6);
+    return controls.find(x=>x.dataset?.field===key)||null;
+  }
+  if(item.key?.startsWith("name:")){
+    const name=item.key.slice(5);
+    return controls.find(x=>x.name===name)||null;
+  }
+  return controls[index]||null;
+}
+
+function restoreOverlayDraft(root,payload){
+  const items=Array.isArray(payload?.controls)?payload.controls:[];
+  items.forEach((item,index)=>{
+    const el=findDraftControl(root,item,index);
+    if(!el)return;
+    if(el.type==="checkbox"||el.type==="radio")el.checked=!!item.checked;
+    else if(item.value!==undefined)el.value=String(item.value);
+    try{el.dispatchEvent(new Event("change",{bubbles:true}))}catch{}
+  });
+}
+
+function saveOverlayDraft(root){
+  const key=root.dataset.draftStorageKey;
+  if(!key)return;
+  try{
+    localStorage.setItem(key,JSON.stringify({
+      version:1,
+      savedAt:new Date().toISOString(),
+      controls:serializeOverlayDraft(root)
+    }));
+  }catch{}
+}
+
+function clearOverlayDraft(root){
+  const key=root?.dataset?.draftStorageKey;
+  if(!key)return;
+  try{localStorage.removeItem(key)}catch{}
+}
+
+function setupOverlayDraft(root,title,opts={}){
+  if(opts.draft===false)return;
+  const logicalKey=opts.draftKey||((root.id==="drawer"?"drawer:":"modal:")+location.hash+":"+title);
+  const storageKey=draftStorageKey(logicalKey);
+  root.dataset.draftStorageKey=storageKey;
+  root.dataset.dirty="0";
+
+  let payload=null;
+  try{
+    const raw=localStorage.getItem(storageKey);
+    if(raw)payload=JSON.parse(raw);
+  }catch{}
+
+  if(payload?.controls?.length){
+    restoreOverlayDraft(root,payload);
+    root.dataset.dirty="1";
+    setTimeout(()=>toast("已恢复上次未保存的草稿"),80);
+  }
+
+  const onChange=e=>{
+    if(!draftEligible(e.target))return;
+    root.dataset.dirty="1";
+    saveOverlayDraft(root);
+  };
+  root.addEventListener("input",onChange);
+  root.addEventListener("change",onChange);
+}
+
+function hasUnsavedOverlay(root){
+  return !!root && root.dataset.dirty==="1";
+}
+
+function confirmCloseUnsaved(root){
+  if(!hasUnsavedOverlay(root))return true;
+  return confirm("当前内容还没有保存。\n\n关闭后不会丢失，系统已经自动保存为草稿，下次打开这个编辑面板会自动恢复。\n\n确定关闭吗？");
+}
+
+function removeDrawer({clearDraft=false}={}){
+  const el=document.querySelector("#drawer");
+  if(!el)return;
+  if(clearDraft)clearOverlayDraft(el);
+  el.remove();
+}
+
+function removeModal({clearDraft=false}={}){
+  const el=document.querySelector("#modal");
+  if(!el)return;
+  if(clearDraft)clearOverlayDraft(el);
+  el.remove();
+}
+
+function openDrawer(title,body,onReady,opts={}){
+  removeDrawer();
   const el=document.createElement("div");
   el.className="drawer-back";
   el.id="drawer";
   el.innerHTML=`<aside class="drawer-panel"><div class="drawer-head"><div><h2>${esc(title)}</h2></div><button class="btn ghost small" id="drawerClose">关闭</button></div><div class="drawer-body">${body}</div></aside>`;
   document.body.appendChild(el);
-  document.querySelector("#drawerClose").onclick=closeDrawer;
-  el.onclick=e=>{if(e.target===el)closeDrawer()};
+  document.querySelector("#drawerClose").onclick=requestCloseDrawer;
   onReady?.();
+  setupOverlayDraft(el,title,opts);
 }
-function closeDrawer(){document.querySelector("#drawer")?.remove()}
 
-function openModal(title,body,onReady){
-  const el=document.createElement("div");el.className="modal-back";el.id="modal";
-  el.innerHTML=`<div class="modal"><div class="page-head"><div><h1 style="font-size:20px">${esc(title)}</h1></div><button class="btn ghost small" id="mClose">关闭</button></div>${body}</div>`;
-  document.body.appendChild(el);document.querySelector("#mClose").onclick=closeModal;el.onclick=e=>{if(e.target===el)closeModal()};onReady?.();
+function requestCloseDrawer(){
+  const el=document.querySelector("#drawer");
+  if(!el)return;
+  if(!confirmCloseUnsaved(el))return;
+  removeDrawer({clearDraft:false});
 }
-function closeModal(){document.querySelector("#modal")?.remove()}
+
+function closeDrawer(){
+  removeDrawer({clearDraft:true});
+}
+
+function openModal(title,body,onReady,opts={}){
+  removeModal();
+  const el=document.createElement("div");
+  el.className="modal-back";
+  el.id="modal";
+  el.innerHTML=`<div class="modal"><div class="page-head"><div><h1 style="font-size:20px">${esc(title)}</h1></div><button class="btn ghost small" id="mClose">关闭</button></div>${body}</div>`;
+  document.body.appendChild(el);
+  document.querySelector("#mClose").onclick=requestCloseModal;
+  onReady?.();
+  setupOverlayDraft(el,title,opts);
+}
+
+function requestCloseModal(){
+  const el=document.querySelector("#modal");
+  if(!el)return;
+  if(!confirmCloseUnsaved(el))return;
+  removeModal({clearDraft:false});
+}
+
+function closeModal(){
+  removeModal({clearDraft:true});
+}
+
 function val(id){return document.querySelector("#"+id)?.value||""}
 function checked(id){return !!document.querySelector("#"+id)?.checked}
 
