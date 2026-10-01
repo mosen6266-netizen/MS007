@@ -235,8 +235,8 @@ textarea.input{min-height:100px;resize:vertical}.row{display:flex;gap:10px;align
 }
 
 /* Right-click insert menu */
-tr[data-field-row],tr[data-progress-row]{cursor:context-menu}
-tr[data-field-row]:hover,tr[data-progress-row]:hover{background:#f8fafc}
+tr[data-field-row],tr[data-progress-row],tr[data-dashboard-row]{cursor:context-menu}
+tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hover{background:#f8fafc}
 .row-context-menu{
   position:fixed;z-index:1200;min-width:210px;
   background:#fff;border:1px solid #dbe3ee;border-radius:12px;
