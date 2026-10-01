@@ -1504,17 +1504,114 @@ async function saveRegistrationLayout(request,env,user) {
 }
 
 async function listSidebar(env, user) {
+  const audience=normalizedRole(user.role);
   const r=await env.DB.prepare(
-    "SELECT id,audience,label,icon,url,target,enabled,sort_order,group_label FROM sidebar_items WHERE enabled=1 AND (audience=? OR audience='all') ORDER BY sort_order,label"
-  ).bind(user.role).all();
+    `SELECT si.id,si.audience,si.label,si.icon,si.url,si.target,si.enabled,si.sort_order,
+       COALESCE(sc.label,si.group_label,'') AS group_label
+     FROM sidebar_items si
+     LEFT JOIN sidebar_item_categories sic
+       ON sic.item_id=si.id AND sic.audience=?
+     LEFT JOIN sidebar_categories sc
+       ON sc.id=sic.category_id AND sc.audience=?
+     WHERE si.enabled=1 AND (si.audience=? OR si.audience='all')
+     ORDER BY
+       CASE WHEN COALESCE(sc.label,si.group_label,'')='' THEN 0 ELSE 1 END,
+       COALESCE(sc.sort_order,si.sort_order),
+       si.sort_order,
+       si.label`
+  ).bind(audience,audience,audience).all();
   const version = await getSystemSetting(env,"sidebar_version",0);
   return responseJson({ok:true,version:Number(version||0),items:r.results||[]});
 }
 
 async function adminSidebar(env) {
-  const r=await env.DB.prepare("SELECT * FROM sidebar_items ORDER BY audience,sort_order,label").all();
+  const [items,categories,mappings]=await Promise.all([
+    env.DB.prepare("SELECT * FROM sidebar_items ORDER BY audience,sort_order,label").all(),
+    env.DB.prepare("SELECT * FROM sidebar_categories ORDER BY audience,sort_order,label").all(),
+    env.DB.prepare("SELECT item_id,audience,category_id FROM sidebar_item_categories").all()
+  ]);
   const version=await getSystemSetting(env,"sidebar_version",0);
-  return responseJson({ok:true,version:Number(version||0),items:r.results||[]});
+  return responseJson({
+    ok:true,
+    version:Number(version||0),
+    items:items.results||[],
+    categories:categories.results||[],
+    mappings:mappings.results||[]
+  });
+}
+
+async function getSidebarCategory(env,id,audience){
+  const categoryId=String(id||"").trim();
+  if(!categoryId)return null;
+  return env.DB.prepare(
+    "SELECT id,audience,label,sort_order FROM sidebar_categories WHERE id=? AND audience=?"
+  ).bind(categoryId,audience).first();
+}
+
+async function createSidebarCategory(request,env,user){
+  const b=await readBody(request);
+  const audience=b.audience==="admin"?"admin":b.audience==="sales"?"sales":"";
+  const label=String(b.label||"").trim().slice(0,80);
+  if(!audience)return fail("请选择管理员或业务员区域");
+  if(!label)return fail("请输入分类名称");
+
+  const exists=await env.DB.prepare(
+    "SELECT id FROM sidebar_categories WHERE audience=? AND label=?"
+  ).bind(audience,label).first();
+  if(exists)return fail("这个区域已经存在同名分类",409);
+
+  let sortOrder;
+  if(b.sortOrder!==undefined && b.sortOrder!==null && String(b.sortOrder)!==""){
+    sortOrder=safeInt(b.sortOrder,1,0,100000);
+  }else{
+    const maxRow=await env.DB.prepare(
+      "SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM sidebar_categories WHERE audience=?"
+    ).bind(audience).first();
+    sortOrder=Number(maxRow?.max_sort||0)+1;
+  }
+
+  const id=uid("sc_"),t=now();
+  await env.DB.prepare(
+    "INSERT INTO sidebar_categories(id,audience,label,sort_order,created_at,updated_at) VALUES(?,?,?,?,?,?)"
+  ).bind(id,audience,label,sortOrder,t,t).run();
+  await bumpVersion(env,"sidebar_version");
+  await audit(env,user,"create","sidebar_category",id,{audience,label,sortOrder});
+  return responseJson({ok:true,id,sortOrder},201);
+}
+
+async function updateSidebarCategory(request,env,user,id){
+  const old=await env.DB.prepare("SELECT * FROM sidebar_categories WHERE id=?").bind(id).first();
+  if(!old)return fail("分类不存在",404);
+  const b=await readBody(request);
+  const label=b.label!==undefined?String(b.label).trim().slice(0,80):old.label;
+  if(!label)return fail("分类名称不能为空");
+
+  const dup=await env.DB.prepare(
+    "SELECT id FROM sidebar_categories WHERE audience=? AND label=? AND id<>?"
+  ).bind(old.audience,label,id).first();
+  if(dup)return fail("这个区域已经存在同名分类",409);
+
+  const sortOrder=b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order;
+  await env.DB.prepare(
+    "UPDATE sidebar_categories SET label=?,sort_order=?,updated_at=? WHERE id=?"
+  ).bind(label,sortOrder,now(),id).run();
+  await bumpVersion(env,"sidebar_version");
+  await audit(env,user,"update","sidebar_category",id,{label,sortOrder});
+  return responseJson({ok:true});
+}
+
+async function deleteSidebarCategory(env,user,id){
+  const old=await env.DB.prepare("SELECT * FROM sidebar_categories WHERE id=?").bind(id).first();
+  if(!old)return fail("分类不存在",404);
+  const used=await env.DB.prepare(
+    "SELECT COUNT(*) n FROM sidebar_item_categories WHERE category_id=?"
+  ).bind(id).first();
+  if(Number(used?.n||0)>0)return fail("这个分类里面还有按钮，请先把按钮移动到其他分类或未分类后再删除",409,"CATEGORY_NOT_EMPTY");
+
+  await env.DB.prepare("DELETE FROM sidebar_categories WHERE id=?").bind(id).run();
+  await bumpVersion(env,"sidebar_version");
+  await audit(env,user,"delete","sidebar_category",id,{audience:old.audience,label:old.label});
+  return responseJson({ok:true});
 }
 
 async function createSidebarItem(request, env, user) {
@@ -1535,11 +1632,35 @@ async function createSidebarItem(request, env, user) {
     sortOrder=Number(maxRow?.max_sort||0)+1;
   }
 
+  const adminCategory=(audience==="admin"||audience==="all")
+    ? await getSidebarCategory(env,b.adminCategoryId||b.categoryId,"admin")
+    : null;
+  const salesCategory=(audience==="sales"||audience==="all")
+    ? await getSidebarCategory(env,b.salesCategoryId||b.categoryId,"sales")
+    : null;
+
+  if((b.adminCategoryId||((audience==="admin")&&b.categoryId))&&!adminCategory)return fail("选择的管理员分类不存在，请刷新后重试");
+  if((b.salesCategoryId||((audience==="sales")&&b.categoryId))&&!salesCategory)return fail("选择的业务员分类不存在，请刷新后重试");
+
+  const legacyGroup=String(
+    b.groupLabel!==undefined?b.groupLabel:(adminCategory?.label||salesCategory?.label||"")
+  ).trim();
+
   await env.DB.prepare(
     `INSERT INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
      VALUES(?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(id,audience,String(b.label).trim(),String(b.icon||"link"),String(b.url).trim(),
-    b.target==="new"?"new":"same",b.enabled===false?0:1,sortOrder,String(b.groupLabel||""),t,t).run();
+    b.target==="new"?"new":"same",b.enabled===false?0:1,sortOrder,legacyGroup,t,t).run();
+
+  const mappings=[];
+  if(adminCategory)mappings.push(env.DB.prepare(
+    "INSERT OR REPLACE INTO sidebar_item_categories(item_id,audience,category_id) VALUES(?,?,?)"
+  ).bind(id,"admin",adminCategory.id));
+  if(salesCategory)mappings.push(env.DB.prepare(
+    "INSERT OR REPLACE INTO sidebar_item_categories(item_id,audience,category_id) VALUES(?,?,?)"
+  ).bind(id,"sales",salesCategory.id));
+  if(mappings.length)await env.DB.batch(mappings);
+
   await bumpVersion(env,"sidebar_version");
   await audit(env,user,"create","sidebar_item",id,{...b,sortOrder});
   return responseJson({ok:true,id,sortOrder},201);
@@ -1550,13 +1671,50 @@ async function updateSidebarItem(request, env, user, id) {
   if(!old) return fail("按钮不存在",404);
   const b=await readBody(request),t=now();
   const audience=b.audience!==undefined&&["admin","sales","all"].includes(b.audience)?b.audience:old.audience;
-  await env.DB.prepare(
-    `UPDATE sidebar_items SET audience=?,label=?,icon=?,url=?,target=?,enabled=?,sort_order=?,group_label=?,updated_at=? WHERE id=?`
-  ).bind(audience,b.label!==undefined?String(b.label):old.label,b.icon!==undefined?String(b.icon):old.icon,
-    b.url!==undefined?String(b.url):old.url,b.target!==undefined?(b.target==="new"?"new":"same"):old.target,
-    b.enabled!==undefined?(b.enabled?1:0):old.enabled,
-    b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
-    b.groupLabel!==undefined?String(b.groupLabel):old.group_label,t,id).run();
+
+  const oldMappingsResult=await env.DB.prepare(
+    "SELECT audience,category_id FROM sidebar_item_categories WHERE item_id=?"
+  ).bind(id).all();
+  const oldMappings=Object.fromEntries((oldMappingsResult.results||[]).map(x=>[x.audience,x.category_id]));
+
+  const adminCategoryId=b.adminCategoryId!==undefined
+    ? String(b.adminCategoryId||"")
+    : (audience===old.audience?String(oldMappings.admin||""):"");
+  const salesCategoryId=b.salesCategoryId!==undefined
+    ? String(b.salesCategoryId||"")
+    : (audience===old.audience?String(oldMappings.sales||""):"");
+
+  const adminCategory=(audience==="admin"||audience==="all")
+    ? await getSidebarCategory(env,adminCategoryId,"admin")
+    : null;
+  const salesCategory=(audience==="sales"||audience==="all")
+    ? await getSidebarCategory(env,salesCategoryId,"sales")
+    : null;
+
+  if(adminCategoryId&&!adminCategory)return fail("选择的管理员分类不存在，请刷新后重试");
+  if(salesCategoryId&&!salesCategory)return fail("选择的业务员分类不存在，请刷新后重试");
+
+  let groupLabel=b.groupLabel!==undefined?String(b.groupLabel):old.group_label;
+  if(adminCategory||salesCategory)groupLabel=adminCategory?.label||salesCategory?.label||groupLabel;
+
+  const statements=[
+    env.DB.prepare(
+      `UPDATE sidebar_items SET audience=?,label=?,icon=?,url=?,target=?,enabled=?,sort_order=?,group_label=?,updated_at=? WHERE id=?`
+    ).bind(audience,b.label!==undefined?String(b.label):old.label,b.icon!==undefined?String(b.icon):old.icon,
+      b.url!==undefined?String(b.url):old.url,b.target!==undefined?(b.target==="new"?"new":"same"):old.target,
+      b.enabled!==undefined?(b.enabled?1:0):old.enabled,
+      b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
+      groupLabel,t,id),
+    env.DB.prepare("DELETE FROM sidebar_item_categories WHERE item_id=?").bind(id)
+  ];
+  if(adminCategory)statements.push(env.DB.prepare(
+    "INSERT INTO sidebar_item_categories(item_id,audience,category_id) VALUES(?,?,?)"
+  ).bind(id,"admin",adminCategory.id));
+  if(salesCategory)statements.push(env.DB.prepare(
+    "INSERT INTO sidebar_item_categories(item_id,audience,category_id) VALUES(?,?,?)"
+  ).bind(id,"sales",salesCategory.id));
+
+  await env.DB.batch(statements);
   await bumpVersion(env,"sidebar_version");
   await audit(env,user,"update","sidebar_item",id,b);
   return responseJson({ok:true});
@@ -1919,11 +2077,20 @@ async function importChunk(request,env,user){
       `INSERT OR REPLACE INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
        VALUES(?,?,?,CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM users WHERE id=?) THEN ? ELSE NULL END,?)`
     ).bind(x.customer_id,x.progress_id,x.completed,x.completed_by,x.completed_by,x.completed_by,x.completed_at));
+  } else if(section==="sidebarCategories"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      `INSERT OR REPLACE INTO sidebar_categories(id,audience,label,sort_order,created_at,updated_at)
+       VALUES(?,?,?,?,?,?)`
+    ).bind(x.id,x.audience,x.label,x.sort_order,x.created_at||t,x.updated_at||t));
   } else if(section==="sidebarItems"){
     for(const x of rows) stmts.push(env.DB.prepare(
       `INSERT OR REPLACE INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
        VALUES(?,?,?,?,?,?,?,?,?,?,?)`
     ).bind(x.id,x.audience,x.label,x.icon,x.url,x.target,x.enabled,x.sort_order,x.group_label,x.created_at||t,x.updated_at||t));
+  } else if(section==="sidebarItemCategories"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      "INSERT OR REPLACE INTO sidebar_item_categories(item_id,audience,category_id) VALUES(?,?,?)"
+    ).bind(x.item_id,x.audience,x.category_id));
   } else if(section==="listColumns"){
     for(const x of rows) stmts.push(env.DB.prepare(
       "INSERT OR REPLACE INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order) VALUES(?,?,?,?,?,?,?)"
@@ -1995,7 +2162,7 @@ async function auditList(request,env){
 }
 
 async function exportBusinessData(env,user){
-  const [users,customers,fields,values,progressDefs,customerProgress,sidebars,listCols,dash,settings] = await Promise.all([
+  const [users,customers,fields,values,progressDefs,customerProgress,sidebars,sidebarCategories,sidebarItemCategories,listCols,dash,settings] = await Promise.all([
     env.DB.prepare("SELECT id,username,display_name,role,active,created_at,updated_at FROM users ORDER BY created_at").all(),
     env.DB.prepare("SELECT * FROM customers ORDER BY created_at").all(),
     env.DB.prepare("SELECT * FROM field_definitions ORDER BY sort_order").all(),
@@ -2003,6 +2170,8 @@ async function exportBusinessData(env,user){
     env.DB.prepare("SELECT * FROM progress_definitions ORDER BY sort_order").all(),
     env.DB.prepare("SELECT * FROM customer_progress").all(),
     env.DB.prepare("SELECT * FROM sidebar_items ORDER BY audience,sort_order").all(),
+    env.DB.prepare("SELECT * FROM sidebar_categories ORDER BY audience,sort_order,label").all(),
+    env.DB.prepare("SELECT * FROM sidebar_item_categories ORDER BY audience,category_id,item_id").all(),
     env.DB.prepare("SELECT * FROM list_columns ORDER BY audience,sort_order").all(),
     env.DB.prepare("SELECT * FROM dashboard_widgets ORDER BY audience,sort_order").all(),
     env.DB.prepare("SELECT setting_key,value_json,updated_at FROM system_settings ORDER BY setting_key").all()
@@ -2011,7 +2180,7 @@ async function exportBusinessData(env,user){
   return responseJson({
     ok:true,
     format:"MS007-BUSINESS-BACKUP",
-    version:1,
+    version:2,
     exportedAt:now(),
     data:{
       users:users.results||[],
@@ -2021,6 +2190,8 @@ async function exportBusinessData(env,user){
       progressDefinitions:progressDefs.results||[],
       customerProgress:customerProgress.results||[],
       sidebarItems:sidebars.results||[],
+      sidebarCategories:sidebarCategories.results||[],
+      sidebarItemCategories:sidebarItemCategories.results||[],
       listColumns:listCols.results||[],
       dashboardWidgets:dash.results||[],
       systemSettings:settings.results||[]
@@ -2070,10 +2241,17 @@ async function importBusinessData(request,env,user){
   if(batch2.length) await env.DB.batch(batch2);
 
   const batch3=[];
+  for(const x of d.sidebarCategories||[]) batch3.push(env.DB.prepare(
+    `INSERT OR REPLACE INTO sidebar_categories(id,audience,label,sort_order,created_at,updated_at)
+     VALUES(?,?,?,?,?,?)`
+  ).bind(x.id,x.audience,x.label,x.sort_order,x.created_at||t,x.updated_at||t));
   for(const x of d.sidebarItems||[]) batch3.push(env.DB.prepare(
     `INSERT OR REPLACE INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
      VALUES(?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(x.id,x.audience,x.label,x.icon,x.url,x.target,x.enabled,x.sort_order,x.group_label,x.created_at||t,x.updated_at||t));
+  for(const x of d.sidebarItemCategories||[]) batch3.push(env.DB.prepare(
+    "INSERT OR REPLACE INTO sidebar_item_categories(item_id,audience,category_id) VALUES(?,?,?)"
+  ).bind(x.item_id,x.audience,x.category_id));
   for(const x of d.listColumns||[]) batch3.push(env.DB.prepare(
     "INSERT OR REPLACE INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order) VALUES(?,?,?,?,?,?,?)"
   ).bind(x.id,x.audience,x.column_key,x.field_id,x.label,x.enabled,x.sort_order));
@@ -2163,10 +2341,17 @@ async function api(request, env, ctx) {
 
   if (path === "/api/admin/sidebar" && method === "GET") return adminSidebar(env);
   if (path === "/api/admin/sidebar" && method === "POST") return createSidebarItem(request,env,user);
+  if (path === "/api/admin/sidebar-categories" && method === "POST") return createSidebarCategory(request,env,user);
+  m=path.match(/^\/api\/admin\/sidebar-categories\/([^/]+)$/);
+  if(m && method==="PATCH") return updateSidebarCategory(request,env,user,m[1]);
+  if(m && method==="DELETE") return deleteSidebarCategory(env,user,m[1]);
   m=path.match(/^\/api\/admin\/sidebar\/([^/]+)$/);
   if(m && method==="PATCH") return updateSidebarItem(request,env,user,m[1]);
   if(m && method==="DELETE"){
-    await env.DB.prepare("DELETE FROM sidebar_items WHERE id=?").bind(m[1]).run();
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM sidebar_item_categories WHERE item_id=?").bind(m[1]),
+      env.DB.prepare("DELETE FROM sidebar_items WHERE id=?").bind(m[1])
+    ]);
     await bumpVersion(env,"sidebar_version");
     await audit(env,user,"delete","sidebar_item",m[1],{});
     return responseJson({ok:true});
