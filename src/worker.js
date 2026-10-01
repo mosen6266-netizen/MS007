@@ -2652,7 +2652,12 @@ async function api(request, env, ctx) {
   const path = url.pathname;
   const method = request.method.toUpperCase();
 
-  if (path === "/api/health") return responseJson({ ok: true, app: env.APP_NAME || "MS007" });
+  if (path === "/api/health") return responseJson({
+    ok:true,
+    app:env.APP_NAME||"MS007",
+    version:env.APP_VERSION||"dev",
+    channel:env.DEPLOY_CHANNEL||"development"
+  });
   if (path === "/api/bootstrap-status" && method === "GET") return responseJson({ ok:true, needsBootstrap: await bootstrapStatus(env) });
   if (path === "/api/bootstrap-token-check" && method === "GET") {
     const token = request.headers.get("x-bootstrap-token") || "";
