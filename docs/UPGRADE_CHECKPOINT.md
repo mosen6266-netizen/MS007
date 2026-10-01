@@ -127,4 +127,33 @@ Verification:
 - Production migrations applied successfully; no unapplied migrations remained.
 - Production deployment and smoke test: success.
 
-Next work: Batch 4 - Performance.
+Next work: Batch 4 - Performance. (completed below)
+
+
+## Batch 4 completed verification
+
+Final verified commit: 4050a9fcb2f906ef6e212e8b821f63f993a73b01
+
+Implemented:
+- Added one-row-per-customer derived search index for customer name plus enabled searchable fields, with explicit phone/email/case-number coverage.
+- Added safe add -> background backfill -> count verification -> switch behavior. Until verification is complete, customer search continues using the authoritative legacy path.
+- Added incremental search-index synchronization for customer create/update/atomic save/restore, and full index rebuild scheduling after searchable-field semantics or restored business data changes.
+- Replaced synchronous all-customer progress recalculation with a bounded background maintenance job processed by the existing minute cron.
+- Added administrator-visible maintenance status to the dashboard/capacity page.
+- Added a 45-minute capacity snapshot cache so opening the capacity/dashboard view no longer rescans the large customer/value/audit tables every time.
+- Converted audit history, recycle bin, and full Telegram history from OFFSET pagination to stable keyset/cursor pagination.
+- Added migration 0003_batch4_performance.sql for derived search-index and maintenance-state tables only; existing customer/progress records remain authoritative.
+- Added Batch 4 regression checks and required-table validation to both quality and deployment gates.
+- Restored and regression-protected bootstrap/login/logout handlers after staging safely detected an accidental block-removal during the first Batch 4 attempt.
+
+Verification:
+- Quality Check run 36924446172: success.
+- Deploy run 36924446377: success.
+- Frontend/Worker syntax, database safety gate, fresh schema+migrations, Batch 1, Batch 2, Batch 3, and Batch 4 regressions: success.
+- Staging migration, deployment, /api/health, and /api/bootstrap-status smoke: success.
+- Production recovery point was recorded and uploaded before applying migration 0003.
+- Production migration applied successfully and no unapplied migration remained.
+- Production deployment and smoke test: success.
+- Production database was not bootstrapped/recreated.
+
+Next work: Batch 5 - Draft and Telegram reliability.
