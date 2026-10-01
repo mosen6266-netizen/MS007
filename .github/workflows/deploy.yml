@@ -171,17 +171,23 @@ jobs:
             return 1
           }
 
-          retry_get "/api/health" /tmp/staging-health.json
+          EXPECTED="${GITHUB_SHA:0:12}"
+          export EXPECTED
+          VERSION_OK=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS "$URL/api/health" > /tmp/staging-health.json; then
+              if node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync("/tmp/staging-health.json","utf8"));process.exit(x.ok&&x.channel==="staging"&&x.version===process.env.EXPECTED?0:1)' ; then
+                VERSION_OK=1
+                break
+              fi
+            fi
+            sleep 3
+          done
           cat /tmp/staging-health.json
-          node - <<'NODE'
-          const fs=require("fs");
-          const x=JSON.parse(fs.readFileSync("/tmp/staging-health.json","utf8"));
-          const expected=process.env.GITHUB_SHA.slice(0,12);
-          if(!x.ok||x.channel!=="staging"||x.version!==expected){
-            console.error("Staging version check failed",x,expected);
-            process.exit(1);
-          }
-          NODE
+          if [ "$VERSION_OK" != "1" ]; then
+            echo "Staging did not converge to expected version $EXPECTED" >&2
+            exit 1
+          fi
 
           retry_get "/api/bootstrap-status" /tmp/staging-bootstrap.json
           cat /tmp/staging-bootstrap.json
@@ -299,18 +305,23 @@ jobs:
             return 1
           }
 
-          retry_get "/api/health" /tmp/health.json
+          EXPECTED="${GITHUB_SHA:0:12}"
+          export EXPECTED
+          VERSION_OK=0
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS "$URL/api/health" > /tmp/health.json; then
+              if node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync("/tmp/health.json","utf8"));process.exit(x.ok&&x.channel==="production"&&x.version===process.env.EXPECTED?0:1)' ; then
+                VERSION_OK=1
+                break
+              fi
+            fi
+            sleep 3
+          done
           cat /tmp/health.json
-
-          node - <<'NODE'
-          const fs=require("fs");
-          const x=JSON.parse(fs.readFileSync("/tmp/health.json","utf8"));
-          const expected=process.env.GITHUB_SHA.slice(0,12);
-          if(!x.ok||x.channel!=="production"||x.version!==expected){
-            console.error("Production version check failed",x,expected);
-            process.exit(1);
-          }
-          NODE
+          if [ "$VERSION_OK" != "1" ]; then
+            echo "Production did not converge to expected version $EXPECTED" >&2
+            exit 1
+          fi
 
           retry_get "/api/bootstrap-status" /tmp/bootstrap-status.json
           cat /tmp/bootstrap-status.json
