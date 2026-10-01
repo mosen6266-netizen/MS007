@@ -339,6 +339,41 @@ async function telegramAdminGet(env){
   });
 }
 
+async function telegramLogs(request,env){
+  const url=new URL(request.url);
+  const page=safeInt(url.searchParams.get("page"),1,1,1000000);
+  const limit=safeInt(url.searchParams.get("limit"),50,1,100);
+  const status=String(url.searchParams.get("status")||"").trim();
+  const where=[];
+  const binds=[];
+
+  if(["success","failed","skipped"].includes(status)){
+    where.push("l.status=?");
+    binds.push(status);
+  }
+
+  const whereSql=where.length?("WHERE "+where.join(" AND ")):"";
+  const totalRow=await env.DB.prepare(
+    `SELECT COUNT(*) n FROM telegram_delivery_logs l ${whereSql}`
+  ).bind(...binds).first();
+  const total=Number(totalRow?.n||0);
+  const pages=Math.max(1,Math.ceil(total/limit));
+  const offset=(page-1)*limit;
+
+  const r=await env.DB.prepare(
+    `SELECT l.id,l.status,l.error_text,l.created_at,c.name customer_name,u.display_name actor_name,p.label progress_name
+     FROM telegram_delivery_logs l
+     LEFT JOIN customers c ON c.id=l.customer_id
+     LEFT JOIN users u ON u.id=l.actor_user_id
+     LEFT JOIN progress_definitions p ON p.id=l.progress_id
+     ${whereSql}
+     ORDER BY l.created_at DESC,l.id DESC
+     LIMIT ? OFFSET ?`
+  ).bind(...binds,limit,offset).all();
+
+  return responseJson({ok:true,items:r.results||[],page,limit,total,pages,status});
+}
+
 async function telegramAdminSave(request,env,user){
   const b=await readBody(request);
   const old=await telegramSettingsRow(env);
@@ -1963,11 +1998,18 @@ async function capacity(env) {
   });
 }
 
-async function usersList(env) {
+async function usersList(request,env) {
+  const url=new URL(request.url);
+  const page=safeInt(url.searchParams.get("page"),1,1,1000000);
+  const limit=safeInt(url.searchParams.get("limit"),50,1,100);
+  const offset=(page-1)*limit;
+  const totalRow=await env.DB.prepare("SELECT COUNT(*) n FROM users").first();
+  const total=Number(totalRow?.n||0);
+  const pages=Math.max(1,Math.ceil(total/limit));
   const r=await env.DB.prepare(
-    "SELECT id,username,display_name,role,active,created_at,updated_at FROM users ORDER BY role,display_name"
-  ).all();
-  return responseJson({ok:true,items:r.results||[]});
+    "SELECT id,username,display_name,role,active,created_at,updated_at FROM users ORDER BY role,display_name,id LIMIT ? OFFSET ?"
+  ).bind(limit,offset).all();
+  return responseJson({ok:true,items:r.results||[],page,limit,total,pages});
 }
 
 async function createUser(request, env, admin) {
@@ -2129,14 +2171,54 @@ async function softDeleteCustomer(env,user,id){
 }
 
 
-async function recycleList(env) {
-  const r=await env.DB.prepare(
-    `SELECT c.id,c.name,c.deleted_at,c.updated_at,u.display_name owner_name
-     FROM customers c LEFT JOIN users u ON u.id=c.assigned_user_id
-     WHERE c.deleted_at IS NOT NULL
-     ORDER BY c.deleted_at DESC LIMIT 200`
-  ).all();
-  return responseJson({ok:true,items:r.results||[]});
+async function recycleList(request,env) {
+  const url=new URL(request.url);
+  const page=safeInt(url.searchParams.get("page"),1,1,1000000);
+  const limit=safeInt(url.searchParams.get("limit"),50,1,100);
+  const q=String(url.searchParams.get("q")||"").trim();
+  const owner=String(url.searchParams.get("owner")||"").trim();
+  const where=["c.deleted_at IS NOT NULL"];
+  const binds=[];
+
+  if(q){
+    where.push("c.name LIKE ?");
+    binds.push("%"+q+"%");
+  }
+  if(owner==="__none__"){
+    where.push("c.assigned_user_id IS NULL");
+  }else if(owner){
+    where.push("c.assigned_user_id=?");
+    binds.push(owner);
+  }
+
+  const whereSql=where.join(" AND ");
+  const totalRow=await env.DB.prepare(
+    `SELECT COUNT(*) n FROM customers c WHERE ${whereSql}`
+  ).bind(...binds).first();
+  const total=Number(totalRow?.n||0);
+  const pages=Math.max(1,Math.ceil(total/limit));
+  const offset=(page-1)*limit;
+
+  const [r,owners]=await Promise.all([
+    env.DB.prepare(
+      `SELECT c.id,c.name,c.deleted_at,c.updated_at,c.assigned_user_id,u.display_name owner_name
+       FROM customers c
+       LEFT JOIN users u ON u.id=c.assigned_user_id
+       WHERE ${whereSql}
+       ORDER BY c.deleted_at DESC,c.id DESC
+       LIMIT ? OFFSET ?`
+    ).bind(...binds,limit,offset).all(),
+    env.DB.prepare(
+      "SELECT id,display_name,active FROM users WHERE role='sales' ORDER BY display_name,id"
+    ).all()
+  ]);
+
+  return responseJson({
+    ok:true,
+    items:r.results||[],
+    owners:owners.results||[],
+    page,limit,total,pages
+  });
 }
 
 async function restoreCustomer(env,user,id){
@@ -2149,16 +2231,56 @@ async function restoreCustomer(env,user,id){
 
 async function auditList(request,env){
   const url=new URL(request.url);
-  const limit=safeInt(url.searchParams.get("limit"),100,1,200);
-  const r=await env.DB.prepare(
-    `SELECT a.id,a.action,a.entity_type,a.entity_id,a.detail_json,a.created_at,u.display_name actor_name
-     FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id
-     ORDER BY a.created_at DESC LIMIT ?`
-  ).bind(limit).all();
-  return responseJson({ok:true,items:(r.results||[]).map(x=>({
-    ...x,
-    detail:(()=>{try{return JSON.parse(x.detail_json||"{}")}catch{return{}}})()
-  }))});
+  const page=safeInt(url.searchParams.get("page"),1,1,1000000);
+  const limit=safeInt(url.searchParams.get("limit"),50,1,100);
+  const actor=String(url.searchParams.get("actor")||"").trim();
+  const action=String(url.searchParams.get("action")||"").trim();
+  const from=String(url.searchParams.get("from")||"").trim();
+  const to=String(url.searchParams.get("to")||"").trim();
+
+  const where=["1=1"];
+  const binds=[];
+  if(actor==="__system__")where.push("a.actor_user_id IS NULL");
+  else if(actor){where.push("a.actor_user_id=?");binds.push(actor);}
+  if(action){where.push("a.action=?");binds.push(action);}
+  if(from){where.push("a.created_at>=?");binds.push(from);}
+  if(to){where.push("a.created_at<?");binds.push(to);}
+
+  const whereSql=where.join(" AND ");
+  const totalRow=await env.DB.prepare(
+    `SELECT COUNT(*) n FROM audit_logs a WHERE ${whereSql}`
+  ).bind(...binds).first();
+  const total=Number(totalRow?.n||0);
+  const pages=Math.max(1,Math.ceil(total/limit));
+  const offset=(page-1)*limit;
+
+  const [r,actors,actions]=await Promise.all([
+    env.DB.prepare(
+      `SELECT a.id,a.action,a.entity_type,a.entity_id,a.detail_json,a.created_at,u.display_name actor_name
+       FROM audit_logs a
+       LEFT JOIN users u ON u.id=a.actor_user_id
+       WHERE ${whereSql}
+       ORDER BY a.created_at DESC,a.id DESC
+       LIMIT ? OFFSET ?`
+    ).bind(...binds,limit,offset).all(),
+    env.DB.prepare(
+      "SELECT id,display_name,role FROM users ORDER BY role,display_name,id"
+    ).all(),
+    env.DB.prepare(
+      "SELECT DISTINCT action FROM audit_logs ORDER BY action"
+    ).all()
+  ]);
+
+  return responseJson({
+    ok:true,
+    items:(r.results||[]).map(x=>({
+      ...x,
+      detail:(()=>{try{return JSON.parse(x.detail_json||"{}")}catch{return{}}})()
+    })),
+    actors:actors.results||[],
+    actions:(actions.results||[]).map(x=>x.action),
+    page,limit,total,pages
+  });
 }
 
 async function exportBusinessData(env,user){
@@ -2313,7 +2435,7 @@ async function api(request, env, ctx) {
 
   if (!requireRole(user,"admin")) return fail("需要管理员权限",403,"ADMIN_REQUIRED");
 
-  if (path === "/api/admin/users" && method === "GET") return usersList(env);
+  if (path === "/api/admin/users" && method === "GET") return usersList(request,env);
   if (path === "/api/admin/users" && method === "POST") return createUser(request,env,user);
   m=path.match(/^\/api\/admin\/users\/([^/]+)$/);
   if(m && method==="PATCH") return updateUser(request,env,user,m[1]);
@@ -2359,11 +2481,12 @@ async function api(request, env, ctx) {
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
   if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
+  if (path === "/api/admin/telegram/logs" && method === "GET") return telegramLogs(request,env);
   if (path === "/api/admin/telegram" && method === "PUT") return telegramAdminSave(request,env,user);
   if (path === "/api/admin/telegram/test" && method === "POST") return telegramAdminTest(request,env,user);
   if (path === "/api/admin/registration-layout" && method === "GET") return adminRegistrationLayout(env);
   if (path === "/api/admin/registration-layout" && method === "PUT") return saveRegistrationLayout(request,env,user);
-  if (path === "/api/admin/recycle" && method === "GET") return recycleList(env);
+  if (path === "/api/admin/recycle" && method === "GET") return recycleList(request,env);
   m=path.match(/^\/api\/admin\/recycle\/([^/]+)\/restore$/);
   if(m && method==="POST") return restoreCustomer(env,user,m[1]);
   if (path === "/api/admin/audit" && method === "GET") return auditList(request,env);
