@@ -1,0 +1,65 @@
+name: MS007 Quality Check
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "public/**"
+      - "src/**"
+      - "schema.sql"
+      - ".github/workflows/test.yml"
+  pull_request:
+    branches: [main]
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Check frontend JavaScript syntax
+        run: node --check public/app.js
+
+      - name: Check Worker JavaScript syntax
+        shell: bash
+        run: |
+          cp src/worker.js /tmp/worker.mjs
+          node --check /tmp/worker.mjs
+
+      - name: Validate SQLite schema
+        shell: bash
+        run: |
+          python - <<'PY'
+          import sqlite3, pathlib
+          sql = pathlib.Path("schema.sql").read_text(encoding="utf-8")
+          con = sqlite3.connect(":memory:")
+          con.executescript(sql)
+          required = {
+              "users","sessions","customers","field_definitions","customer_values",
+              "progress_definitions","customer_progress","sidebar_items","list_columns",
+              "dashboard_widgets","audit_logs","system_settings"
+          }
+          tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+          missing = sorted(required - tables)
+          if missing:
+              raise SystemExit("Missing tables: " + ", ".join(missing))
+          print("Schema OK. Tables:", len(tables))
+          PY
+
+      - name: Check required project files
+        shell: bash
+        run: |
+          test -f public/index.html
+          test -f public/styles.css
+          test -f public/app.js
+          test -f src/worker.js
+          test -f schema.sql
+          test -f wrangler.toml
+          echo "Required files OK"
