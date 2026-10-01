@@ -1,0 +1,29 @@
+{
+  "project": "MS007",
+  "release": "seven-batch-hardening-final",
+  "repository": "mosen6266-netizen/MS007",
+  "branch": "main",
+  "production_worker": "ms007-crm",
+  "production_d1": "ms007-crm",
+  "version_source": "Git commit SHA exposed by /api/health",
+  "status": "final_validation_and_deployment",
+  "data_policy": {
+    "customer_records_are_authoritative": true,
+    "derived_indexes_and_statistics_cache_are_rebuildable": true,
+    "normal_upgrade_must_not_recreate_production_database": true,
+    "normal_upgrade_must_not_apply_schema_sql_to_existing_production_database": true
+  },
+  "batch7": {
+    "statistics_cache": "implemented",
+    "migration": "0005_batch7_statistics_cache.sql",
+    "scale_regression": "tests/batch7_scale.py",
+    "tested_customer_scale": 20000,
+    "file_resource_optimization": "not applicable in MS007",
+    "tool_iframe_loading_optimization": "not applicable in MS007"
+  },
+  "recovery_sources": [
+    "GitHub main branch for code/configuration",
+    "D1 Time Travel recovery point when the Cloudflare account/database still exists",
+    "MS007 V3 business-data backup for portable business-data restoration"
+  ]
+}
