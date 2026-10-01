@@ -10,7 +10,7 @@ Production D1: ms007-crm
 
 Agreed seven-batch hardening plan is documented in docs/UPGRADE_PLAN.md.
 
-Batch 0 is IN PROGRESS.
+Batch 0 is COMPLETE.
 
 Changes already committed in Batch 0:
 - Added migrations/0000_baseline_migration_system.sql.
@@ -24,7 +24,18 @@ Changes already committed in Batch 0:
 - Added scripts/resolve-d1.mjs and scripts/build-deploy-config.mjs.
 - Reworked deployment pipeline to validate -> staging -> production, apply schema only to newly created DBs, use D1 migrations for existing DBs, and record a Time Travel recovery point before production migrations.
 
-Do not start Batch 1 until the latest Batch 0 staging and production workflows are confirmed successful.
+Batch 0 verification:
+- Quality Check run 36917222505: success.
+- Deploy run 36917222633: success.
+- Staging validation: success.
+- Production recovery point recorded and uploaded before migration.
+- Existing production database was detected, so fresh bootstrap schema was SKIPPED.
+- Production D1 migration applied successfully.
+- No unapplied migrations remained.
+- Production deployment and smoke test succeeded.
+- Production code version deployed: 14663efc44bc.
+
+Next work: Batch 1 - first-priority data correctness.
 
 ## Resume instruction for a new chat
 
