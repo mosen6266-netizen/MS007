@@ -90,13 +90,44 @@ async function renderLogin(role){
   let needsBootstrap=false;
   try{ needsBootstrap=(await api("/api/bootstrap-status")).needsBootstrap; }catch{}
   const roleName=role==="admin"?"管理员":"业务员";
+
+  if(needsBootstrap && role==="admin"){
+    app.innerHTML=`
+      <main class="login-wrap">
+        <section class="login-card">
+          <button class="back" id="backHome">← 返回入口</button>
+          <h2>首次创建管理员</h2>
+          <div class="sub">这一步只在系统第一次上线时出现。以后不会再显示。</div>
+          <div class="notice warning" style="margin-bottom:14px">请输入部署时设置的“一次性初始化授权码”。这个授权码不是你的登录密码。</div>
+          <form id="setupForm">
+            <div class="field"><label>一次性初始化授权码</label><input class="input" name="token" type="password" required></div>
+            <div class="field"><label>管理员显示名称</label><input class="input" name="displayName" value="管理员" required></div>
+            <div class="field"><label>管理员登录账号</label><input class="input" name="username" autocomplete="username" required></div>
+            <div class="field"><label>管理员登录密码（至少8位）</label><input class="input" name="password" type="password" autocomplete="new-password" required></div>
+            <button class="btn full" type="submit">创建管理员账号</button>
+          </form>
+        </section>
+      </main>`;
+    document.querySelector("#backHome").onclick=renderHome;
+    document.querySelector("#setupForm").onsubmit=async e=>{
+      e.preventDefault();const fd=new FormData(e.currentTarget);
+      try{
+        await api("/api/bootstrap",{method:"POST",headers:{"x-bootstrap-token":String(fd.get("token")||"")},body:{
+          username:fd.get("username"),displayName:fd.get("displayName"),password:fd.get("password")
+        }});
+        toast("管理员创建成功，请登录");
+        renderLogin("admin");
+      }catch(err){toast(err.message)}
+    };
+    return;
+  }
+
   app.innerHTML=`
     <main class="login-wrap">
       <section class="login-card">
         <button class="back" id="backHome">← 返回入口</button>
         <h2>${roleName}登录</h2>
         <div class="sub">使用你的 ${roleName} 账号进入系统</div>
-        ${needsBootstrap&&role==="admin"?`<div class="notice warning" style="margin-bottom:14px">系统尚未完成首次管理员初始化。部署完成后会由系统配置，不需要你写代码。</div>`:""}
         <form id="loginForm">
           <div class="field"><label>账号</label><input class="input" name="username" autocomplete="username" required></div>
           <div class="field"><label>密码</label><input class="input" type="password" name="password" autocomplete="current-password" required></div>
@@ -114,6 +145,7 @@ async function renderLogin(role){
     }catch(err){toast(err.message);}
   };
 }
+
 async function enterApp(){
   await refreshSidebar(true);
   startSidebarSync();
@@ -212,6 +244,9 @@ async function renderRoute(){
     if(role==="admin"&&page==="list-settings")return renderListSettings(view);
     if(role==="admin"&&page==="dashboard-settings")return renderDashboardSettings(view);
     if(role==="admin"&&page==="capacity")return renderCapacity(view);
+    if(role==="admin"&&page==="audit")return renderAudit(view);
+    if(role==="admin"&&page==="recycle")return renderRecycle(view);
+    if(role==="admin"&&page==="backup")return renderBackup(view);
     view.innerHTML=pageHead("页面不存在");
   }catch(err){
     if(err.status===401){renderHome();return;}
@@ -388,8 +423,8 @@ async function renderCustomerDetail(view,id){
 async function renderSales(view){
   const r=await api("/api/admin/users");const items=r.items||[];
   view.innerHTML=pageHead("业务员管理","业务员只能看到分配给自己的客户",`<button class="btn" id="addSales">＋ 添加业务员</button>`)+
-    `<div class="table-wrap"><table><thead><tr><th>姓名</th><th>账号</th><th>角色</th><th>状态</th><th>创建时间</th></tr></thead><tbody>
-    ${items.map(x=>`<tr><td>${esc(x.display_name)}</td><td>${esc(x.username)}</td><td>${x.role==="admin"?"管理员":"业务员"}</td><td>${x.active?"启用":"停用"}</td><td>${esc((x.created_at||"").slice(0,10))}</td></tr>`).join("")}</tbody></table></div>`;
+    `<div class="table-wrap"><table><thead><tr><th>姓名</th><th>账号</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>
+    ${items.map(x=>`<tr><td>${esc(x.display_name)}</td><td>${esc(x.username)}</td><td>${x.role==="admin"?"管理员":"业务员"}</td><td><span class="tag">${x.active?"启用":"停用"}</span></td><td>${esc((x.created_at||"").slice(0,10))}</td><td>${x.role==="sales"?`<button class="btn ghost small" data-edit-user="${esc(x.id)}">设置</button>`:""}</td></tr>`).join("")}</tbody></table></div>`;
   document.querySelector("#addSales").onclick=()=>openModal("添加业务员",`
     <div class="field"><label>业务员姓名</label><input class="input" id="mName"></div>
     <div class="field"><label>登录账号</label><input class="input" id="mUser"></div>
@@ -397,6 +432,21 @@ async function renderSales(view){
     <button class="btn full" id="mSave">创建业务员</button>`,()=>{
       document.querySelector("#mSave").onclick=async()=>{try{await api("/api/admin/users",{method:"POST",body:{displayName:val("mName"),username:val("mUser"),password:val("mPass")}});closeModal();toast("业务员已创建");renderSales(view);}catch(e){toast(e.message)}};
     });
+  document.querySelectorAll("[data-edit-user]").forEach(b=>b.onclick=()=>{
+    const u=items.find(x=>x.id===b.dataset.editUser); if(!u)return;
+    openModal("业务员账号设置",`
+      <div class="field"><label>业务员姓名</label><input class="input" id="euName" value="${esc(u.display_name)}"></div>
+      <div class="field"><label>登录账号</label><input class="input" value="${esc(u.username)}" disabled></div>
+      <div class="field"><label>重新设置密码</label><input class="input" type="password" id="euPass" placeholder="不修改密码请留空"></div>
+      <label><input type="checkbox" id="euActive" ${u.active?"checked":""}> 启用这个业务员账号</label>
+      <div class="notice warning" style="margin:14px 0">修改密码后，这个业务员当前已经登录的会话会被退出，需要使用新密码重新登录。</div>
+      <button class="btn full" id="euSave">保存设置</button>`,()=>{
+        document.querySelector("#euSave").onclick=async()=>{try{
+          const body={displayName:val("euName"),active:checked("euActive")};if(val("euPass"))body.password=val("euPass");
+          await api("/api/admin/users/"+u.id,{method:"PATCH",body});closeModal();toast("业务员账号设置已保存");renderSales(view);
+        }catch(e){toast(e.message)}};
+      });
+  });
 }
 
 async function renderFields(view){
@@ -649,6 +699,95 @@ async function renderCapacity(view){
         <tr><td>D1 账户总存储</td><td>${c.free_account_gb} GB</td></tr>
       </tbody></table></div>
     </div>`;
+}
+
+
+const actionName={
+  login:"登录",logout:"退出登录",create:"新增",update:"修改",delete:"删除",
+  restore:"恢复",disable:"停用",replace:"替换配置",progress_complete:"完成进度",
+  progress_uncomplete:"取消进度",export:"导出备份",import:"导入备份",bootstrap_admin:"创建首个管理员"
+};
+const entityName={
+  customer:"客户",user:"账号",field:"登记字段",progress_definition:"客户进度",
+  sidebar_item:"左侧栏按钮",dashboard_widget:"仪表盘组件",list_columns:"客户列表设置",
+  business_data:"业务数据",session:"登录会话"
+};
+
+async function renderAudit(view){
+  const r=await api("/api/admin/audit?limit=200");
+  const items=r.items||[];
+  view.innerHTML=pageHead("操作记录","查看谁在什么时候对系统做了什么操作")+
+    `<div class="table-wrap"><table><thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>对象ID</th></tr></thead><tbody>
+    ${items.map(x=>`<tr><td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td><td>${esc(x.actor_name||"系统")}</td><td>${esc(actionName[x.action]||x.action)}</td><td>${esc(entityName[x.entity_type]||x.entity_type)}</td><td><span class="muted">${esc(x.entity_id||"")}</span></td></tr>`).join("")||`<tr><td colspan="5" class="muted">还没有操作记录</td></tr>`}</tbody></table></div>`;
+}
+
+async function renderRecycle(view){
+  const r=await api("/api/admin/recycle");
+  const items=r.items||[];
+  view.innerHTML=pageHead("回收站","删除客户不会立即永久消失，可以在这里恢复")+
+    `<div class="table-wrap"><table><thead><tr><th>客户姓名</th><th>业务员</th><th>删除时间</th><th>操作</th></tr></thead><tbody>
+    ${items.map(x=>`<tr><td><strong>${esc(x.name)}</strong></td><td>${esc(x.owner_name||"未分配")}</td><td>${esc((x.deleted_at||"").replace("T"," ").slice(0,19))}</td><td><button class="btn secondary small" data-restore="${esc(x.id)}">恢复客户</button></td></tr>`).join("")||`<tr><td colspan="4" class="muted">回收站为空</td></tr>`}</tbody></table></div>`;
+  document.querySelectorAll("[data-restore]").forEach(b=>b.onclick=async()=>{
+    try{await api("/api/admin/recycle/"+b.dataset.restore+"/restore",{method:"POST"});toast("客户已恢复");renderRecycle(view)}catch(e){toast(e.message)}
+  });
+}
+
+async function renderBackup(view){
+  view.innerHTML=pageHead("数据备份与恢复","备份只包含业务数据和配置，不包含管理员密码、业务员密码或登录会话")+
+    `<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(300px,1fr))">
+      <div class="card">
+        <h3 style="margin-top:0">导出完整业务备份</h3>
+        <p class="muted">导出客户资料、业务员基础资料、客户进度、登记字段、左侧栏、列表设置和仪表盘配置。</p>
+        <button class="btn" id="exportBackup">导出备份文件</button>
+      </div>
+      <div class="card">
+        <h3 style="margin-top:0">从备份恢复</h3>
+        <p class="muted">支持大数据量分批恢复。恢复过程不会把密码从备份带回系统，业务员会为了安全保持停用，管理员重新设置密码后再启用。</p>
+        <input class="input" type="file" id="backupFile" accept="application/json,.json">
+        <button class="btn secondary" id="importBackup" style="margin-top:10px">开始恢复</button>
+        <div id="restoreProgress" class="muted" style="margin-top:10px"></div>
+      </div>
+    </div>
+    <div class="notice warning" style="margin-top:16px">建议你每隔一段时间手动导出一份备份保存到自己的电脑。以后还会继续增加自动备份机制。</div>`;
+
+  document.querySelector("#exportBackup").onclick=async()=>{
+    const btn=document.querySelector("#exportBackup");btn.disabled=true;btn.textContent="正在生成...";
+    try{
+      const data=await api("/api/admin/export");
+      const blob=new Blob([JSON.stringify(data,null,2)],{type:"application/json"});
+      const a=document.createElement("a");a.href=URL.createObjectURL(blob);
+      const d=new Date().toISOString().replace(/[:.]/g,"-");
+      a.download=`MS007-业务数据备份-${d}.json`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(a.href),2000);
+      toast("备份文件已生成");
+    }catch(e){toast(e.message)}
+    btn.disabled=false;btn.textContent="导出备份文件";
+  };
+
+  document.querySelector("#importBackup").onclick=async()=>{
+    const file=document.querySelector("#backupFile").files?.[0];
+    if(!file){toast("请先选择备份文件");return}
+    let backup;
+    try{backup=JSON.parse(await file.text())}catch{toast("这个文件不是有效的 JSON 备份");return}
+    if(backup?.format!=="MS007-BUSINESS-BACKUP"||!backup?.data){toast("这不是 MS007 业务备份文件");return}
+    if(!confirm("确认开始恢复这份备份？同ID数据会按备份内容覆盖。"))return;
+
+    const order=["users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress","sidebarItems","listColumns","dashboardWidgets","systemSettings"];
+    const total=order.reduce((n,k)=>n+(Array.isArray(backup.data[k])?backup.data[k].length:0),0);
+    let done=0;const progress=document.querySelector("#restoreProgress");
+    try{
+      for(const section of order){
+        const rows=Array.isArray(backup.data[section])?backup.data[section]:[];
+        for(let i=0;i<rows.length;i+=100){
+          const chunk=rows.slice(i,i+100);
+          await api("/api/admin/import-chunk",{method:"POST",body:{format:"MS007-BUSINESS-BACKUP",section,rows:chunk}});
+          done+=chunk.length;progress.textContent=`正在恢复：${done} / ${total} 条`;
+        }
+      }
+      await api("/api/admin/import-finish",{method:"POST"});
+      progress.textContent=`恢复完成：${done} 条数据`;toast("业务数据恢复完成");
+      await refreshSidebar(true);
+    }catch(e){progress.textContent=`恢复中断：${e.message}`;toast(e.message)}
+  };
 }
 
 function openModal(title,body,onReady){
