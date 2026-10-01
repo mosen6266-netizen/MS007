@@ -2073,6 +2073,27 @@ async function renderTelegramSettings(view){
     chatId:""
   });
 
+  const queueMonitor=r.queueMonitor||{};
+  const formatQueueWait=seconds=>{
+    const value=Math.max(0,Number(seconds||0));
+    if(!value)return "无等待";
+    if(value<60)return Math.floor(value)+" 秒";
+    if(value<3600)return Math.floor(value/60)+" 分钟";
+    return Math.floor(value/3600)+" 小时 "+Math.floor((value%3600)/60)+" 分钟";
+  };
+  const telegramStatusText=x=>x.status==="success"?"发送成功":
+    x.status==="failed"?"发送失败":
+    x.status==="pending"?"等待发送":
+    x.status==="retry"?"自动重试":
+    x.status==="needs_admin"?"需要管理员处理":"已跳过";
+  const telegramLogReason=x=>x.status==="pending"
+    ?("群 "+(x.chat_id||"")+" · 等待发送")
+    :x.status==="retry"
+      ?("群 "+(x.chat_id||"")+" · "+(x.error_text||"系统会自动重试"))
+      :x.status==="needs_admin"
+        ?("群 "+(x.chat_id||"")+" · "+(x.error_text||"需要管理员检查后手动重试"))
+        :(x.error_text||"");
+
   view.innerHTML=pageHead("Telegram 通知","业务员完成客户进度后，机器人自动按你设置的群组规则播报。")+
     `<div class="grid telegram-settings-grid">
       <section class="card">
@@ -2173,6 +2194,22 @@ async function renderTelegramSettings(view){
     <section class="card" style="margin-top:16px">
       <div class="telegram-log-head">
         <div>
+          <h3 style="margin:0">Telegram 队列监控</h3>
+          <p class="muted" style="margin:6px 0 0">自动重试不会丢消息；连续失败或永久错误会保留为“需要管理员处理”，修好设置后可手动重试。</p>
+        </div>
+      </div>
+      <div class="grid metrics" style="margin-top:14px">
+        <div class="card metric"><div class="label">等待发送</div><div class="value">${money(queueMonitor.pendingCount||0)}</div></div>
+        <div class="card metric"><div class="label">自动重试</div><div class="value">${money(queueMonitor.retryCount||0)}</div></div>
+        <div class="card metric"><div class="label">需要管理员处理</div><div class="value">${money(queueMonitor.needsAdminCount||0)}</div></div>
+        <div class="card metric"><div class="label">最早等待</div><div class="value" style="font-size:20px">${esc(formatQueueWait(queueMonitor.oldestWaitSeconds))}</div></div>
+        <div class="card metric"><div class="label">近 24 小时成功率</div><div class="value" style="font-size:20px">${queueMonitor.recentSuccessRate===null||queueMonitor.recentSuccessRate===undefined?"暂无":money(queueMonitor.recentSuccessRate)+"%"}</div><div class="muted" style="font-size:12px">${money(queueMonitor.recentSuccessCount||0)} 成功 / ${money(queueMonitor.recentFailedCount||0)} 失败</div></div>
+      </div>
+    </section>
+
+    <section class="card" style="margin-top:16px">
+      <div class="telegram-log-head">
+        <div>
           <h3 id="tgLogTitle" style="margin:0">最近发送记录</h3>
           <p class="muted" id="tgLogMeta" style="margin:6px 0 0">这里先显示最近 20 条，需要时可以查看全部历史记录。</p>
         </div>
@@ -2181,6 +2218,7 @@ async function renderTelegramSettings(view){
             <option value="">全部状态</option>
             <option value="pending">等待发送</option>
             <option value="retry">自动重试</option>
+            <option value="needs_admin">需要管理员处理</option>
             <option value="success">发送成功</option>
             <option value="failed">发送失败</option>
             <option value="skipped">已跳过</option>
@@ -2190,16 +2228,17 @@ async function renderTelegramSettings(view){
       </div>
       <div class="table-wrap" style="margin-top:12px">
         <table>
-          <thead><tr><th>时间</th><th>业务员</th><th>客户</th><th>进度</th><th>状态</th><th>群/说明</th></tr></thead>
+          <thead><tr><th>时间</th><th>业务员</th><th>客户</th><th>进度</th><th>状态</th><th>群/说明</th><th>操作</th></tr></thead>
           <tbody id="tgLogBody">
             ${(r.logs||[]).map(x=>`<tr>
               <td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td>
               <td>${esc(x.actor_name||"")}</td>
               <td>${esc(x.customer_name||"")}</td>
               <td>${esc(x.progress_name||"")}</td>
-              <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":x.status==="pending"?"等待发送":x.status==="retry"?"自动重试":"已跳过"}</span></td>
-              <td>${esc(x.status==="pending"?("群 "+(x.chat_id||"")+" · 等待发送"):x.status==="retry"?("群 "+(x.chat_id||"")+" · "+(x.error_text||"系统会自动重试")):(x.error_text||""))}</td>
-            </tr>`).join("")||'<tr><td colspan="6" class="muted">还没有发送记录</td></tr>'}
+              <td><span class="tag">${esc(telegramStatusText(x))}</span></td>
+              <td>${esc(telegramLogReason(x))}</td>
+              <td>${x.status==="needs_admin"?`<button class="btn secondary small" data-tg-retry="${esc(x.id)}">手动重试</button>`:""}</td>
+            </tr>`).join("")||'<tr><td colspan="7" class="muted">还没有发送记录</td></tr>'}
           </tbody>
         </table>
       </div>
@@ -2339,9 +2378,11 @@ async function renderTelegramSettings(view){
     <td>${esc(x.actor_name||"")}</td>
     <td>${esc(x.customer_name||"")}</td>
     <td>${esc(x.progress_name||"")}</td>
-    <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":x.status==="pending"?"等待发送":x.status==="retry"?"自动重试":"已跳过"}</span></td>
-    <td>${esc(x.status==="pending"?("群 "+(x.chat_id||"")+" · 等待发送"):x.status==="retry"?("群 "+(x.chat_id||"")+" · "+(x.error_text||"系统会自动重试")):(x.error_text||""))}</td>
-  </tr>`).join(""):'<tr><td colspan="6" class="muted">还没有发送记录</td></tr>';
+    <td><span class="tag">${esc(telegramStatusText(x))}</span></td>
+    <td>${esc(telegramLogReason(x))}</td>
+    <td>${x.status==="needs_admin"?`<button class="btn secondary small" data-tg-retry="${esc(x.id)}">手动重试</button>`:""}</td>
+  </tr>`).join(""):'<tr><td colspan="7" class="muted">还没有发送记录</td></tr>';
+
 
   function showRecentTelegramLogs(){
     telegramLogMode="recent";
@@ -2364,7 +2405,7 @@ async function renderTelegramSettings(view){
     if(status)qs.set("status",status);
 
     const body=document.querySelector("#tgLogBody");
-    body.innerHTML='<tr><td colspan="6" class="muted">正在加载发送记录...</td></tr>';
+    body.innerHTML='<tr><td colspan="7" class="muted">正在加载发送记录...</td></tr>';
     try{
       const out=await api("/api/admin/telegram/logs?"+qs.toString());
       document.querySelector("#tgLogTitle").textContent="全部发送记录";
@@ -2388,9 +2429,25 @@ async function renderTelegramSettings(view){
         loadTelegramLogPage(out.nextCursor,[...telegramLogBack,telegramLogCursor]);
       };
     }catch(e){
-      body.innerHTML='<tr><td colspan="6" class="muted">'+esc(e.message)+'</td></tr>';
+      body.innerHTML='<tr><td colspan="7" class="muted">'+esc(e.message)+'</td></tr>';
     }
   }
+
+  document.querySelector("#tgLogBody").onclick=async e=>{
+    const btn=e.target.closest("[data-tg-retry]");
+    if(!btn)return;
+    btn.disabled=true;
+    btn.textContent="正在重试...";
+    try{
+      await api("/api/admin/telegram/queue/"+encodeURIComponent(btn.dataset.tgRetry)+"/retry",{method:"POST"});
+      toast("这条消息已重新进入发送队列");
+      await renderTelegramSettings(view);
+    }catch(err){
+      toast(err.message);
+      btn.disabled=false;
+      btn.textContent="手动重试";
+    }
+  };
 
   document.querySelector("#tgViewAllLogs").onclick=()=>{
     if(telegramLogMode==="all")showRecentTelegramLogs();
