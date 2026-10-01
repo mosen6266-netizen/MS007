@@ -143,3 +143,30 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover{background:#f8fafc}
   border-radius:8px;padding:10px 11px;font:inherit;color:#1e293b;cursor:pointer
 }
 .row-context-menu button:hover{background:#eff6ff;color:#1d4ed8}
+
+/* Customer progress editor */
+.progress-editor-head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+.progress-editor-summary{min-width:76px;text-align:right}
+.progress-editor-summary strong{display:block;font-size:22px;line-height:1}
+.progress-editor-summary span{display:block;margin-top:5px;font-size:12px;color:var(--muted)}
+.progress-check-grid{display:grid;grid-template-columns:1fr 1fr;gap:9px}
+.progress-check-item{
+  display:grid;grid-template-columns:22px minmax(0,1fr);gap:9px;align-items:start;
+  border:1px solid #e3e8ef;border-radius:10px;padding:11px 12px;background:#f8fafc;cursor:pointer
+}
+.progress-check-item:hover{border-color:#bfdbfe;background:#f8fbff}
+.progress-check-item input{position:absolute;opacity:0;pointer-events:none}
+.progress-check-mark{
+  width:19px;height:19px;border:2px solid #cbd5e1;border-radius:6px;background:#fff;
+  display:flex;align-items:center;justify-content:center;margin-top:1px
+}
+.progress-check-item input:checked + .progress-check-mark{border-color:#2563eb;background:#2563eb}
+.progress-check-item input:checked + .progress-check-mark:after{content:"✓";color:#fff;font-size:13px;font-weight:800}
+.progress-check-content{min-width:0}.progress-check-content strong{display:flex;align-items:center;gap:7px;font-size:13px}
+.progress-check-content strong i{width:8px;height:8px;border-radius:999px;display:inline-block;flex:0 0 auto}
+.progress-check-content small{display:block;color:var(--muted);font-size:11px;margin-top:4px;line-height:1.4}
+@media(max-width:620px){
+  .progress-check-grid{grid-template-columns:1fr}
+  .progress-editor-head{flex-direction:column}
+  .progress-editor-summary{text-align:left}
+}
