@@ -37,7 +37,11 @@ async function api(path, options={}){
   const res=await fetch(path,opts);
   const data=await res.json().catch(()=>({message:"系统返回了无法识别的内容"}));
   if(!res.ok){
-    const e=new Error(data.message||"操作失败"); e.status=res.status; e.code=data.code; throw e;
+    const e=new Error(data.message||"操作失败");
+    e.status=res.status;
+    e.code=data.code;
+    e.data=data;
+    throw e;
   }
   return data;
 }
@@ -1003,7 +1007,7 @@ async function renderFields(view){
   });
   document.querySelectorAll("[data-hard-del-field]").forEach(b=>b.onclick=async()=>{
     const item=items.find(x=>x.id===b.dataset.hardDelField);if(!item)return;
-    if(!await uiConfirm("永久删除登记条目「"+item.label+"」？\n\n这会同时删除所有客户在这个条目下已经填写的数据，并且无法恢复。",{title:"永久删除登记条目",confirmText:"继续删除",danger:true}))return;
+    if(!await uiConfirm("永久删除登记条目「"+item.label+"」？\n\n这会同时删除所有客户在这个条目下已经填写的数据，并自动清理客户列表、登记面板和 Telegram 模板中的相关引用。此操作无法恢复。",{title:"永久删除登记条目",confirmText:"继续删除",danger:true}))return;
     if(!await uiConfirm("请再次确认：真的要永久删除「"+item.label+"」吗？\n\n此操作无法撤销。",{title:"最后确认",confirmText:"永久删除",danger:true}))return;
     try{
       const r=await api("/api/admin/fields/"+encodeURIComponent(item.id)+"/hard-delete",{method:"DELETE"});
@@ -1152,10 +1156,40 @@ function fieldModal(view,f,nextSort=1,insert=null){
           body.insertPosition=insert.position;
         }
         try{
-          if(f)await api("/api/admin/fields/"+f.id,{method:"PATCH",body});
-          else await api("/api/admin/fields",{method:"POST",body});
+          let preservedOldOptions=0;
+          if(f){
+            const impact=await api("/api/admin/fields/"+encodeURIComponent(f.id)+"/option-impact",{
+              method:"POST",
+              body:{fieldType:body.fieldType,options:body.options}
+            });
+            if(impact.totalAffected>0){
+              const details=(impact.items||[]).slice(0,8)
+                .map(x=>"「"+x.value+"」："+x.count+" 个客户")
+                .join("\n");
+              const keep=await uiConfirm(
+                "检测到你准备删除的旧选项仍然存在客户资料中：\n\n"+
+                details+
+                (impact.items?.length>8?"\n……":"")+
+                "\n\n为了避免客户资料失效，系统不会直接删除这些仍在使用的选项。\n\n选择“保留旧选项并保存”，系统会把这些旧选项自动加回，其他修改正常保存；选择取消后，你可以先修改相关客户资料，再回来删除这些选项。",
+                {title:"旧选项仍被客户使用",confirmText:"保留旧选项并保存",cancelText:"取消保存"}
+              );
+              if(!keep)return;
+              const set=new Set(body.options||[]);
+              for(const item of impact.items||[]){
+                if(!set.has(item.value)){set.add(item.value);preservedOldOptions++}
+              }
+              body.options=[...set];
+            }
+            await api("/api/admin/fields/"+f.id,{method:"PATCH",body});
+          }else{
+            await api("/api/admin/fields",{method:"POST",body});
+          }
           closeModal();
-          toast(insert?"字段已插入并自动调整排序":"字段设置已保存");
+          toast(
+            preservedOldOptions
+              ?"字段设置已保存，并保留了 "+preservedOldOptions+" 个仍被客户使用的旧选项"
+              :(insert?"字段已插入并自动调整排序":"字段设置已保存")
+          );
           renderFields(view);
         }catch(e){toast(e.message)}
       };
@@ -1177,18 +1211,22 @@ async function renderProgressAdmin(view){
   document.querySelectorAll("[data-toggle-prog]").forEach(b=>b.onclick=async()=>{
     const enabled=b.dataset.enableProg==="1";
     try{
-      await api("/api/admin/progress/"+b.dataset.toggleProg,{method:"PATCH",body:{enabled}});
-      toast(enabled?"客户进度已启用":"客户进度已停用");
+      const out=await api("/api/admin/progress/"+b.dataset.toggleProg,{method:"PATCH",body:{enabled}});
+      toast(enabled
+        ?"客户进度已启用"
+        :("客户进度已停用"+(out.disabledDashboardWidgets?("，并自动隐藏 "+out.disabledDashboardWidgets+" 个引用它的仪表盘组件"):"")));
       renderProgressAdmin(view);
     }catch(e){toast(e.message)}
   });
   document.querySelectorAll("[data-hard-del-prog]").forEach(b=>b.onclick=async()=>{
     const item=items.find(x=>x.id===b.dataset.hardDelProg);if(!item)return;
-    if(!await uiConfirm("永久删除客户进度「"+item.label+"」？\n\n这会同时删除所有客户在这个进度上的完成记录，并重新计算所有客户的完成百分比。",{title:"永久删除客户进度",confirmText:"继续删除",danger:true}))return;
+    if(!await uiConfirm("永久删除客户进度「"+item.label+"」？\n\n这会同时删除所有客户在这个进度上的完成记录、Telegram 路由/待发通知，以及引用这个进度的仪表盘组件，并重新计算所有客户的完成百分比。",{title:"永久删除客户进度",confirmText:"继续删除",danger:true}))return;
     if(!await uiConfirm("请再次确认：真的要永久删除「"+item.label+"」吗？\n\n此操作无法撤销。",{title:"最后确认",confirmText:"永久删除",danger:true}))return;
     try{
       const r=await api("/api/admin/progress/"+encodeURIComponent(item.id)+"/hard-delete",{method:"DELETE"});
-      toast("客户进度已永久删除"+(r.deletedCustomerProgress?("，同时删除 "+r.deletedCustomerProgress+" 条完成记录"):""));
+      toast("客户进度已永久删除"+
+        (r.deletedCustomerProgress?("，删除 "+r.deletedCustomerProgress+" 条完成记录"):"")+
+        (r.deletedDashboardWidgets?("，并移除 "+r.deletedDashboardWidgets+" 个仪表盘组件"):""));
       renderProgressAdmin(view);
     }catch(e){toast(e.message)}
   });
@@ -2186,6 +2224,7 @@ async function renderTelegramSettings(view){
       }else{
         const sample=String(v.key||"").startsWith("field:")?"示例内容":(samples[v.key]||"");
         rendered=replaceAllPreview(rendered,tokenEsc,esc(sample));
+        if(v.legacyToken)rendered=replaceAllPreview(rendered,esc(v.legacyToken),esc(sample));
       }
     }
     preview.innerHTML=rendered;
