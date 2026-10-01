@@ -14,6 +14,8 @@ Batch 0 is COMPLETE.
 
 Batch 1 is COMPLETE.
 
+Batch 2 is COMPLETE.
+
 Changes already committed in Batch 0:
 - Added migrations/0000_baseline_migration_system.sql.
 - Configured Wrangler migrations directory.
@@ -69,3 +71,30 @@ Verification:
 - Production deploy/smoke: success.
 
 Next work: Batch 2 - referential consistency and detailed auditing.
+
+
+## Batch 2 completed verification
+
+Final verified commit: c8a0ebc4111c8f3d14451afb6d8e3b23c2fee0a8
+
+Implemented:
+- Progress disable automatically hides dashboard widgets that depend on that progress.
+- Permanent progress deletion atomically cleans progress records, Telegram routing/queue references, and dependent dashboard widgets before recalculation.
+- Telegram custom registration-field variables now use stable field-ID tokens while preserving legacy token compatibility; field rename no longer breaks saved templates.
+- Permanent field deletion cleans customer values, customer-list references, registration layout, Telegram selected fields, and Telegram template references in one D1 batch.
+- Select-option impact preflight prevents removing options still used by customer data; admin can safely keep those old options and save other changes without data loss.
+- Operation records now surface before/after details for important customer, field, progress, dashboard, user, and Telegram setting changes.
+- Added duplicate named-function guard after detecting and removing an obsolete duplicate progress updater.
+- Added Batch 2 referential integrity regression tests.
+
+Verification:
+- Quality Check run 36920040435: success.
+- Deploy run 36920040463: success.
+- Validation + Batch 1 + Batch 2 regression checks: success.
+- Staging deploy/smoke: success.
+- Production recovery point: success.
+- Production bootstrap schema: skipped.
+- Production migrations: success/no unapplied migrations.
+- Production deploy/smoke: success.
+
+Next work: Batch 3 - Backup/Restore V3.
