@@ -1,0 +1,21 @@
+{
+  "upgrade": "MS007 Batch 7 Performance",
+  "status": "started",
+  "protection_rules": {
+    "customer_data_modified": false,
+    "production_records_touched": false,
+    "schema_change": false
+  },
+  "targets": [
+    "customer list scalability",
+    "statistics caching preparation",
+    "asset loading optimization",
+    "large dataset stability"
+  ],
+  "execution_order": [
+    "audit current hotspots",
+    "add performance guards",
+    "optimize without changing business data model",
+    "run regression checks"
+  ]
+}
