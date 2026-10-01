@@ -10,6 +10,7 @@ on:
       - "schema.sql"
       - "migrations/**"
       - "scripts/**"
+      - "tests/**"
       - "wrangler.toml"
       - ".github/workflows/deploy.yml"
       - ".github/workflows/test.yml"
@@ -67,6 +68,9 @@ jobs:
               raise SystemExit("Missing tables: "+", ".join(missing))
           print("Database validation OK")
           PY
+
+      - name: Batch 1 customer integrity regression
+        run: python tests/batch1_integrity.py
 
   staging:
     needs: validate
