@@ -1,0 +1,23 @@
+MS007 RECOVERY INSTRUCTION
+
+Work only on repository mosen6266-netizen/MS007, branch main. Do not modify any other repository.
+
+Read these files first:
+- docs/DISASTER_RECOVERY.md
+- docs/DEPLOYMENT.md
+- docs/UPGRADE_PLAN.md
+- docs/UPGRADE_CHECKPOINT.md
+
+Goal:
+Restore or deploy MS007 from the repository while preserving any existing production customer data and settings.
+
+Mandatory rules:
+1. Never delete, reset, recreate, or overwrite an existing production D1 database just to deploy code.
+2. Never use schema.sql as an upgrade against an existing production database; use only versioned migrations/.
+3. Preserve customers, customer field values, owners, progress completion/timestamps, archived/deleted state, users, field/progress definitions, registration/list/sidebar/dashboard settings, and Telegram configuration.
+4. Derived search indexes, maintenance state, capacity snapshots, and dashboard_statistics_cache may be rebuilt.
+5. Configure required repository/cloud authorization only according to docs/DEPLOYMENT.md; never ask me to paste credential values into chat or commit them to the repository.
+6. Run and verify the normal quality and deployment workflows; do not bypass staging, pre-migration recovery-point recording, migration checks, or production smoke checks.
+7. Confirm no unapplied production migrations remain and /api/health reports the expected commit/channel.
+8. If production D1 no longer exists, create a fresh deployment and restore business data only from the latest verified MS007 V3 backup after preview/conflict validation. Do not invent missing customer data.
+9. Execute the safe recovery path directly and report the data source used and final deployment/health status.
