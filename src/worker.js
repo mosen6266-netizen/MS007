@@ -1522,14 +1522,27 @@ async function createSidebarItem(request, env, user) {
   if(!String(b.label||"").trim()||!String(b.url||"").trim()) return fail("按钮名称和跳转链接不能为空");
   const audience=["admin","sales","all"].includes(b.audience)?b.audience:"sales";
   const id=uid("sb_"),t=now();
+
+  let sortOrder;
+  if(b.sortOrder!==undefined && b.sortOrder!==null && String(b.sortOrder)!==""){
+    sortOrder=safeInt(b.sortOrder,1,0,100000);
+  }else{
+    const maxRow=audience==="all"
+      ? await env.DB.prepare("SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM sidebar_items").first()
+      : await env.DB.prepare(
+          "SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM sidebar_items WHERE audience=? OR audience='all'"
+        ).bind(audience).first();
+    sortOrder=Number(maxRow?.max_sort||0)+1;
+  }
+
   await env.DB.prepare(
     `INSERT INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
      VALUES(?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(id,audience,String(b.label).trim(),String(b.icon||"link"),String(b.url).trim(),
-    b.target==="new"?"new":"same",b.enabled===false?0:1,safeInt(b.sortOrder,100,0,100000),String(b.groupLabel||""),t,t).run();
+    b.target==="new"?"new":"same",b.enabled===false?0:1,sortOrder,String(b.groupLabel||""),t,t).run();
   await bumpVersion(env,"sidebar_version");
-  await audit(env,user,"create","sidebar_item",id,b);
-  return responseJson({ok:true,id},201);
+  await audit(env,user,"create","sidebar_item",id,{...b,sortOrder});
+  return responseJson({ok:true,id,sortOrder},201);
 }
 
 async function updateSidebarItem(request, env, user, id) {
