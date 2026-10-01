@@ -14,7 +14,7 @@ for token in [
     assert token in worker,token
 
 # Search switches only after derived-index verification and keeps a safe fallback beforehand.
-list_block=worker[worker.index("async function listCustomers"):worker.index("async function validateCustomerName")]
+list_block=worker[worker.index("async function listCustomers"):worker.index("function validateCustomerName")]
 assert 'getSystemSetting(env,"search_index_ready_v1",false)' in list_block
 assert "customer_search_index" in list_block
 assert "customer_values cv" in list_block
