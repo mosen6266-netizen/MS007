@@ -394,6 +394,16 @@ function renderCustomerRows(host,items,hasMore){
         <div class="muted" style="font-size:12px">更新：${esc((c.updatedAt||"").replace("T"," ").slice(0,16))}</div>
       </div>
       <div class="customer-fields">${details.join("")||'<div class="muted">暂无其他列表字段</div>'}</div>
+      <div class="customer-step-status">
+        <div class="step-status current-step">
+          <span>当前进度</span>
+          <strong><i style="background:${esc(c.currentProgress?.color||"#94a3b8")}"></i>${esc(c.currentProgress?.label||"未开始")}</strong>
+        </div>
+        <div class="step-status next-step">
+          <span>下一步进度</span>
+          <strong><i style="background:${esc(c.nextProgress?.color||"#22c55e")}"></i>${esc(c.nextProgress?.label||"暂无进度")}</strong>
+        </div>
+      </div>
       <div class="customer-row-progress">
         <strong>${c.progressPercent}%</strong>
         <span>${c.progressDone}/${c.progressTotal}</span>
