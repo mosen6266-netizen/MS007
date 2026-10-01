@@ -1674,27 +1674,144 @@ async function createField(request, env, user) {
   return responseJson({ok:true,id,sortOrder},201);
 }
 
+function normalizedFieldOptions(value){
+  const input=Array.isArray(value)?value:[];
+  const out=[],seen=new Set();
+  for(const raw of input){
+    const option=String(raw??"").trim();
+    if(!option||seen.has(option))continue;
+    seen.add(option);out.push(option);
+  }
+  return out;
+}
+
+async function calculateFieldOptionImpact(env,id,nextType,nextOptions){
+  if(nextType!=="select"&&nextType!=="single"){
+    return {totalAffected:0,activeAffected:0,recycleAffected:0,items:[]};
+  }
+  const allowed=new Set(normalizedFieldOptions(nextOptions));
+  const r=await env.DB.prepare(
+    `SELECT cv.value,c.deleted_at
+     FROM customer_values cv
+     JOIN customers c ON c.id=cv.customer_id
+     WHERE cv.field_id=? AND TRIM(cv.value)<>''`
+  ).bind(id).all();
+
+  const grouped=new Map();
+  for(const row of r.results||[]){
+    const value=String(row.value??"");
+    if(allowed.has(value))continue;
+    const item=grouped.get(value)||{value,count:0,activeCount:0,recycleCount:0};
+    item.count++;
+    if(row.deleted_at)item.recycleCount++;
+    else item.activeCount++;
+    grouped.set(value,item);
+  }
+  const items=[...grouped.values()].sort((a,b)=>b.count-a.count||a.value.localeCompare(b.value));
+  return {
+    totalAffected:items.reduce((n,x)=>n+x.count,0),
+    activeAffected:items.reduce((n,x)=>n+x.activeCount,0),
+    recycleAffected:items.reduce((n,x)=>n+x.recycleCount,0),
+    items
+  };
+}
+
+async function fieldOptionImpact(request,env,id){
+  const old=await env.DB.prepare("SELECT * FROM field_definitions WHERE id=?").bind(id).first();
+  if(!old)return fail("字段不存在",404);
+  const b=await readBody(request);
+  const nextType=String(b.fieldType||old.field_type);
+  const options=normalizedFieldOptions(b.options!==undefined?b.options:(()=>{try{return JSON.parse(old.options_json||"[]")}catch{return[]}})());
+  const impact=await calculateFieldOptionImpact(env,id,nextType,options);
+  return responseJson({ok:true,fieldId:id,fieldLabel:old.label,nextType,options,...impact});
+}
+
 async function updateField(request, env, user, id) {
   const old = await env.DB.prepare("SELECT * FROM field_definitions WHERE id=?").bind(id).first();
   if (!old) return fail("字段不存在",404);
   const b=await readBody(request), t=now();
-  await env.DB.prepare(
-    `UPDATE field_definitions SET label=?,field_type=?,required=?,enabled=?,list_visible=?,list_sort_order=?,sort_order=?,options_json=?,searchable=?,updated_at=? WHERE id=?`
-  ).bind(
-    b.label!==undefined?String(b.label):old.label,
-    b.fieldType!==undefined?String(b.fieldType):old.field_type,
-    b.required!==undefined?(b.required?1:0):old.required,
-    b.enabled!==undefined?(b.enabled?1:0):old.enabled,
-    b.listVisible!==undefined?(b.listVisible?1:0):old.list_visible,
-    b.listSortOrder!==undefined?safeInt(b.listSortOrder,old.list_sort_order,0,100000):old.list_sort_order,
-    b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
-    b.options!==undefined?JSON.stringify(b.options):old.options_json,
-    b.searchable!==undefined?(b.searchable?1:0):old.searchable,t,id
-  ).run();
-  await audit(env,user,"update","field",id,b);
+
+  const label=b.label!==undefined?String(b.label).trim():old.label;
+  if(!label)return fail("字段名称不能为空");
+  const allowedTypes=new Set(["text","textarea","phone","email","number","date","time","url","select","single"]);
+  const fieldType=b.fieldType!==undefined?String(b.fieldType):old.field_type;
+  if(!allowedTypes.has(fieldType))return fail("字段类型无效");
+
+  let options;
+  if(b.options!==undefined)options=normalizedFieldOptions(b.options);
+  else{try{options=normalizedFieldOptions(JSON.parse(old.options_json||"[]"))}catch{options=[]}}
+  if((fieldType==="select"||fieldType==="single")&&!options.length)return fail("选择字段至少需要一个选项");
+
+  const impact=await calculateFieldOptionImpact(env,id,fieldType,options);
+  if(impact.totalAffected>0){
+    return responseJson({
+      ok:false,
+      code:"FIELD_OPTION_IN_USE",
+      message:"有 "+impact.totalAffected+" 个客户仍在使用将被移除的旧选项。为避免客户资料失效，系统已阻止本次删除。你可以保留这些仍在使用的旧选项后再保存。",
+      impact
+    },409);
+  }
+
+  // Convert any old human-readable Telegram token to the stable field-id token
+  // before a field label changes. Renaming a field can therefore never break
+  // an already saved Telegram template.
+  const templateRow=await env.DB.prepare(
+    "SELECT value_json FROM system_settings WHERE setting_key='telegram_message_template'"
+  ).first();
+  let normalizedTemplate=null;
+  if(templateRow?.value_json){
+    try{
+      const current=JSON.parse(templateRow.value_json);
+      normalizedTemplate=replaceAllLiteral(
+        String(current||""),
+        "{{"+String(old.label||"")+"}}",
+        telegramStableFieldToken(id)
+      );
+    }catch{}
+  }
+
+  const after={
+    label,
+    fieldType,
+    required:b.required!==undefined?!!b.required:!!old.required,
+    enabled:b.enabled!==undefined?!!b.enabled:!!old.enabled,
+    listVisible:b.listVisible!==undefined?!!b.listVisible:!!old.list_visible,
+    listSortOrder:b.listSortOrder!==undefined?safeInt(b.listSortOrder,old.list_sort_order,0,100000):old.list_sort_order,
+    sortOrder:b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
+    options,
+    searchable:b.searchable!==undefined?!!b.searchable:!!old.searchable
+  };
+
+  const statements=[
+    env.DB.prepare(
+      `UPDATE field_definitions SET
+       label=?,field_type=?,required=?,enabled=?,list_visible=?,list_sort_order=?,
+       sort_order=?,options_json=?,searchable=?,updated_at=? WHERE id=?`
+    ).bind(
+      after.label,after.fieldType,after.required?1:0,after.enabled?1:0,
+      after.listVisible?1:0,after.listSortOrder,after.sortOrder,
+      JSON.stringify(after.options),after.searchable?1:0,t,id
+    )
+  ];
+  if(normalizedTemplate!==null){
+    statements.push(env.DB.prepare(
+      `UPDATE system_settings SET value_json=?,updated_at=?
+       WHERE setting_key='telegram_message_template'`
+    ).bind(JSON.stringify(normalizedTemplate),t));
+  }
+  await env.DB.batch(statements);
+
+  await audit(env,user,"update","field",id,{
+    before:{
+      label:old.label,fieldType:old.field_type,required:!!old.required,enabled:!!old.enabled,
+      listVisible:!!old.list_visible,listSortOrder:old.list_sort_order,sortOrder:old.sort_order,
+      options:(()=>{try{return JSON.parse(old.options_json||"[]")}catch{return[]}})(),
+      searchable:!!old.searchable
+    },
+    after
+  });
   return responseJson({ok:true});
 }
-
 
 async function hardDeleteField(env,user,id){
   const field=await env.DB.prepare("SELECT * FROM field_definitions WHERE id=?").bind(id).first();
@@ -1704,14 +1821,13 @@ async function hardDeleteField(env,user,id){
   const valueCount=Number(valueCountRow?.n||0);
   const t=now();
 
-  // Remove references first because these tables intentionally do not use ON DELETE CASCADE.
-  await env.DB.batch([
-    env.DB.prepare("DELETE FROM customer_values WHERE field_id=?").bind(id),
-    env.DB.prepare("DELETE FROM list_columns WHERE field_id=?").bind(id)
+  const [layoutRow,tg,templateRow]=await Promise.all([
+    env.DB.prepare("SELECT value_json FROM system_settings WHERE setting_key='sales_registration_layout'").first(),
+    env.DB.prepare("SELECT fields_json FROM telegram_settings WHERE id=1").first(),
+    env.DB.prepare("SELECT value_json FROM system_settings WHERE setting_key='telegram_message_template'").first()
   ]);
 
-  // Remove the field from the registration panel layout.
-  const layoutRow=await env.DB.prepare("SELECT value_json FROM system_settings WHERE setting_key='sales_registration_layout'").first();
+  let nextLayout=null;
   if(layoutRow?.value_json){
     try{
       const layout=JSON.parse(layoutRow.value_json);
@@ -1719,28 +1835,52 @@ async function hardDeleteField(env,user,id){
         for(const section of layout.sections){
           if(Array.isArray(section.items))section.items=section.items.filter(x=>String(x)!==id);
         }
-        await env.DB.prepare(
-          "UPDATE system_settings SET value_json=?,updated_at=? WHERE setting_key='sales_registration_layout'"
-        ).bind(JSON.stringify(layout),t).run();
+        nextLayout=layout;
       }
     }catch{}
   }
 
-  // Remove the field from Telegram notification templates.
-  const tg=await env.DB.prepare("SELECT fields_json FROM telegram_settings WHERE id=1").first();
+  let nextTelegramFields=null;
   if(tg?.fields_json){
     try{
       const items=JSON.parse(tg.fields_json);
-      if(Array.isArray(items)){
-        const filtered=items.filter(x=>String(x?.key||"")!=="field:"+id);
-        await env.DB.prepare("UPDATE telegram_settings SET fields_json=?,updated_at=? WHERE id=1")
-          .bind(JSON.stringify(filtered),t).run();
-      }
+      if(Array.isArray(items))nextTelegramFields=items.filter(x=>String(x?.key||"")!=="field:"+id);
     }catch{}
   }
 
-  await env.DB.prepare("DELETE FROM field_definitions WHERE id=?").bind(id).run();
-  await audit(env,user,"delete_permanent","field",id,{label:field.label,deletedCustomerValues:valueCount});
+  let nextTemplate=null;
+  if(templateRow?.value_json){
+    try{
+      const current=String(JSON.parse(templateRow.value_json)||"");
+      nextTemplate=replaceAllLiteral(current,telegramStableFieldToken(id),"");
+      nextTemplate=replaceAllLiteral(nextTemplate,"{{"+String(field.label||"")+"}}","");
+    }catch{}
+  }
+
+  const statements=[
+    env.DB.prepare("DELETE FROM customer_values WHERE field_id=?").bind(id),
+    env.DB.prepare("DELETE FROM list_columns WHERE field_id=?").bind(id)
+  ];
+  if(nextLayout!==null)statements.push(env.DB.prepare(
+    "UPDATE system_settings SET value_json=?,updated_at=? WHERE setting_key='sales_registration_layout'"
+  ).bind(JSON.stringify(nextLayout),t));
+  if(nextTelegramFields!==null)statements.push(env.DB.prepare(
+    "UPDATE telegram_settings SET fields_json=?,updated_at=? WHERE id=1"
+  ).bind(JSON.stringify(nextTelegramFields),t));
+  if(nextTemplate!==null)statements.push(env.DB.prepare(
+    "UPDATE system_settings SET value_json=?,updated_at=? WHERE setting_key='telegram_message_template'"
+  ).bind(JSON.stringify(nextTemplate),t));
+  statements.push(env.DB.prepare("DELETE FROM field_definitions WHERE id=?").bind(id));
+
+  await env.DB.batch(statements);
+  await audit(env,user,"delete_permanent","field",id,{
+    before:{
+      label:field.label,fieldType:field.field_type,required:!!field.required,
+      enabled:!!field.enabled,options:(()=>{try{return JSON.parse(field.options_json||"[]")}catch{return[]}})()
+    },
+    deletedCustomerValues:valueCount,
+    referencesCleaned:true
+  });
   return responseJson({ok:true,deletedCustomerValues:valueCount,label:field.label});
 }
 
@@ -1760,17 +1900,79 @@ async function hardDeleteProgressDef(env,user,id){
   const progress=await env.DB.prepare("SELECT * FROM progress_definitions WHERE id=?").bind(id).first();
   if(!progress)return fail("客户进度不存在",404);
 
-  const valueCountRow=await env.DB.prepare("SELECT COUNT(*) n FROM customer_progress WHERE progress_id=?").bind(id).first();
+  const [valueCountRow,widgetRefs]=await Promise.all([
+    env.DB.prepare("SELECT COUNT(*) n FROM customer_progress WHERE progress_id=?").bind(id).first(),
+    dashboardWidgetsForProgress(env,id)
+  ]);
   const valueCount=Number(valueCountRow?.n||0);
 
-  await env.DB.prepare("DELETE FROM customer_progress WHERE progress_id=?").bind(id).run();
-  await env.DB.prepare("DELETE FROM telegram_progress_routes WHERE progress_id=?").bind(id).run();
-  await env.DB.prepare("DELETE FROM telegram_send_queue WHERE progress_id=?").bind(id).run();
-  await env.DB.prepare("DELETE FROM progress_definitions WHERE id=?").bind(id).run();
+  const statements=[
+    env.DB.prepare("DELETE FROM customer_progress WHERE progress_id=?").bind(id),
+    env.DB.prepare("DELETE FROM telegram_progress_routes WHERE progress_id=?").bind(id),
+    env.DB.prepare("DELETE FROM telegram_send_queue WHERE progress_id=?").bind(id)
+  ];
+  for(const widget of widgetRefs){
+    statements.push(env.DB.prepare("DELETE FROM dashboard_widgets WHERE id=?").bind(widget.id));
+  }
+  statements.push(env.DB.prepare("DELETE FROM progress_definitions WHERE id=?").bind(id));
+
+  await env.DB.batch(statements);
   await recalcAllProgress(env);
-  await audit(env,user,"delete_permanent","progress_definition",id,{label:progress.label,deletedCustomerProgress:valueCount});
-  return responseJson({ok:true,deletedCustomerProgress:valueCount,label:progress.label});
+  await audit(env,user,"delete_permanent","progress_definition",id,{
+    before:{
+      label:progress.label,description:progress.description,enabled:!!progress.enabled,
+      sortOrder:progress.sort_order,color:progress.color
+    },
+    deletedCustomerProgress:valueCount,
+    deletedDashboardWidgets:widgetRefs.map(x=>({id:x.id,audience:x.audience,title:x.title}))
+  });
+  return responseJson({
+    ok:true,
+    deletedCustomerProgress:valueCount,
+    deletedDashboardWidgets:widgetRefs.length,
+    label:progress.label
+  });
 }
+
+async function updateProgressDef(request, env, user, id) {
+  const old=await env.DB.prepare("SELECT * FROM progress_definitions WHERE id=?").bind(id).first();
+  if(!old) return fail("进度不存在",404);
+  const b=await readBody(request),t=now();
+  const after={
+    label:b.label!==undefined?String(b.label):old.label,
+    description:b.description!==undefined?String(b.description):old.description,
+    enabled:b.enabled!==undefined?!!b.enabled:!!old.enabled,
+    sortOrder:b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
+    color:b.color!==undefined?String(b.color):old.color
+  };
+
+  const widgetRefs=!after.enabled && old.enabled
+    ?await dashboardWidgetsForProgress(env,id)
+    :[];
+
+  const statements=[
+    env.DB.prepare(
+      "UPDATE progress_definitions SET label=?,description=?,enabled=?,sort_order=?,color=?,updated_at=? WHERE id=?"
+    ).bind(after.label,after.description,after.enabled?1:0,after.sortOrder,after.color,t,id)
+  ];
+  for(const widget of widgetRefs){
+    statements.push(env.DB.prepare(
+      "UPDATE dashboard_widgets SET enabled=0 WHERE id=?"
+    ).bind(widget.id));
+  }
+  await env.DB.batch(statements);
+  await recalcAllProgress(env);
+  await audit(env,user,"update","progress_definition",id,{
+    before:{
+      label:old.label,description:old.description,enabled:!!old.enabled,
+      sortOrder:old.sort_order,color:old.color
+    },
+    after,
+    disabledDashboardWidgets:widgetRefs.map(x=>({id:x.id,audience:x.audience,title:x.title}))
+  });
+  return responseJson({ok:true,disabledDashboardWidgets:widgetRefs.length});
+}
+
 
 async function listProgressDefs(env, user) {
   const sql = normalizedRole(user.role)==="admin"
@@ -3044,6 +3246,8 @@ async function api(request, env, ctx) {
     await audit(env,user,"disable","field",m[1],{});
     return responseJson({ok:true});
   }
+  m=path.match(/^\/api\/admin\/fields\/([^/]+)\/option-impact$/);
+  if(m && method==="POST") return fieldOptionImpact(request,env,m[1]);
   m=path.match(/^\/api\/admin\/fields\/([^/]+)\/hard-delete$/);
   if(m && method==="DELETE") return hardDeleteField(env,user,m[1]);
 
