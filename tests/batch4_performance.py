@@ -13,6 +13,16 @@ for token in [
 ]:
     assert token in worker,token
 
+# Core bootstrap/authentication handlers must survive performance refactors.
+for token in [
+    "async function bootstrapStatus",
+    "async function bootstrapDiagnostic",
+    "async function handleBootstrap",
+    "async function handleLogin",
+    "async function handleLogout",
+]:
+    assert token in worker,token
+
 # Search switches only after derived-index verification and keeps a safe fallback beforehand.
 list_block=worker[worker.index("async function listCustomers"):worker.index("function validateCustomerName")]
 assert 'getSystemSetting(env,"search_index_ready_v1",false)' in list_block

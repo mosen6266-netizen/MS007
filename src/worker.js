@@ -1151,6 +1151,141 @@ async function recalcAllProgress(env) {
   await queueMaintenanceJob(env,"progress_recalc");
 }
 
+async function bootstrapStatus(env) {
+  const row = await env.DB.prepare("SELECT COUNT(*) AS n FROM users").first();
+  return Number(row?.n || 0) === 0;
+}
+
+async function bootstrapDiagnostic(request, env) {
+  const token = request.headers.get("x-bootstrap-token") || "";
+  if (!env.BOOTSTRAP_TOKEN || token !== env.BOOTSTRAP_TOKEN) {
+    return fail("初始化授权无效", 403, "BOOTSTRAP_FORBIDDEN");
+  }
+
+  let step = "start";
+  let testUserId = null;
+  let testUsername = null;
+  try {
+    step = "bootstrap_status";
+    const empty = await bootstrapStatus(env);
+    if (!empty) return responseJson({ ok:true, skipped:true, reason:"already_initialized" });
+
+    step = "password_hash";
+    const salt = newSalt();
+    const iterations = 100000;
+    const hash = await derivePassword("MS007-diagnostic-password", salt, iterations);
+
+    step = "insert_test_user";
+    testUserId = uid("diag_");
+    testUsername = "diag_" + crypto.randomUUID().replace(/-/g,"").slice(0,16);
+    const t = now();
+    await env.DB.prepare(
+      `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,'admin',0,?,?)`
+    ).bind(testUserId, testUsername, "Diagnostic", hash, salt, iterations, t, t).run();
+
+    step = "insert_audit";
+    const auditId = uid("diag_a_");
+    await env.DB.prepare(
+      "INSERT INTO audit_logs(id,actor_user_id,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?)"
+    ).bind(auditId, testUserId, "diagnostic", "user", testUserId, "{}", now()).run();
+
+    step = "cleanup_audit";
+    await env.DB.prepare("DELETE FROM audit_logs WHERE id=?").bind(auditId).run();
+
+    step = "cleanup_user";
+    await env.DB.prepare("DELETE FROM users WHERE id=?").bind(testUserId).run();
+
+    return responseJson({ ok:true, diagnostic:true });
+  } catch (e) {
+    try {
+      if (testUserId) {
+        await env.DB.prepare("DELETE FROM audit_logs WHERE actor_user_id=? OR entity_id=?").bind(testUserId,testUserId).run();
+        await env.DB.prepare("DELETE FROM users WHERE id=?").bind(testUserId).run();
+      }
+    } catch {}
+    return responseJson({
+      ok:false,
+      diagnostic:true,
+      step,
+      errorName:String(e?.name||"Error"),
+      errorMessage:String(e?.message||e)
+    },500);
+  }
+}
+
+async function handleBootstrap(request, env) {
+  const empty = await bootstrapStatus(env);
+  if (!empty) return fail("系统已经初始化", 409, "ALREADY_INITIALIZED");
+  const token = request.headers.get("x-bootstrap-token") || "";
+  if (!env.BOOTSTRAP_TOKEN || token !== env.BOOTSTRAP_TOKEN) {
+    return fail("初始化授权无效", 403, "BOOTSTRAP_FORBIDDEN");
+  }
+  const body = await readBody(request);
+  const username = String(body.username || "").trim();
+  const displayName = String(body.displayName || "管理员").trim();
+  const password = String(body.password || "");
+  if (username.length < 3 || password.length < 8) {
+    return fail("管理员账号至少3位，密码至少8位");
+  }
+  const salt = newSalt();
+  const iterations = 100000;
+  const hash = await derivePassword(password, salt, iterations);
+  const id = uid("u_");
+  const t = now();
+  await env.DB.prepare(
+    `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
+     VALUES(?,?,?,?,?,?,'admin',1,?,?)`
+  ).bind(id, username, displayName, hash, salt, iterations, t, t).run();
+  await audit(env, { id }, "bootstrap_admin", "user", id, { username });
+  return responseJson({ ok: true });
+}
+
+async function handleLogin(request, env) {
+  const body = await readBody(request);
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "");
+  const wantedRole = normalizedRole(body.role) || null;
+  const u = await env.DB.prepare(
+    "SELECT * FROM users WHERE username=? AND active=1"
+  ).bind(username).first();
+  if (!u) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
+  const hash = await derivePassword(password, u.password_salt, Number(u.password_iterations || 100000));
+  if (hash !== u.password_hash) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
+  const actualRole=normalizedRole(u.role);
+  if (wantedRole && actualRole !== wantedRole) return fail("该账号没有这个入口的权限", 403, "WRONG_ROLE");
+
+  const rawToken = newSessionToken();
+  const tokenHash = await sha256Hex(rawToken);
+  const days = safeInt(env.SESSION_DAYS || "7", 7, 1, 30);
+  const expires = new Date(Date.now() + days * 86400000).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO sessions(token_hash,user_id,expires_at,created_at) VALUES(?,?,?,?)"
+  ).bind(tokenHash, u.id, expires, now()).run();
+  await audit(env, u, "login", "session", null, {});
+  const cookieName=actualRole==="admin"?"sid_admin":"sid_sales";
+  const cookie = `${cookieName}=${encodeURIComponent(rawToken)}; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=${days * 86400}`;
+  return responseJson({
+    ok: true,
+    user: { id: u.id, username: u.username, displayName: u.display_name, role: actualRole }
+  }, 200, { "set-cookie": cookie });
+}
+
+async function handleLogout(request, env, user) {
+  const cookies=parseCookies(request);
+  const role=normalizedRole(user?.role);
+  const cookieName=role==="admin"?"sid_admin":"sid_sales";
+  const sid=cookies[cookieName]||cookies.sid;
+  if(sid){
+    const hash=await sha256Hex(sid);
+    await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?").bind(hash).run();
+  }
+  await audit(env,user,"logout","session",null,{});
+  return responseJson({ok:true},200,{
+    "set-cookie":cookieName+"=; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=0"
+  });
+}
+
 async function listCustomers(request, env, user) {
   const url = new URL(request.url);
   const limit = safeInt(url.searchParams.get("limit"), 50, 1, 100);
