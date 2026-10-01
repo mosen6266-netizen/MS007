@@ -2460,13 +2460,24 @@ function auditDetailRows(detail){
   const after=detail?.after&&typeof detail.after==="object"?detail.after:null;
   if(before||after){
     const keys=[...new Set([...Object.keys(before||{}),...Object.keys(after||{})])];
-    return keys
+    const rows=keys
       .filter(key=>JSON.stringify(before?.[key])!==JSON.stringify(after?.[key]))
       .map(key=>({
         label:auditKeyName[key]||key,
         before:auditValueText(before?.[key]),
         after:auditValueText(after?.[key])
       }));
+    for(const [key,value] of Object.entries(detail||{})){
+      if(key==="before"||key==="after")continue;
+      if(value===undefined||value===null||value===false)continue;
+      if(Array.isArray(value)&&!value.length)continue;
+      rows.push({
+        label:auditKeyName[key]||key,
+        before:"",
+        after:auditValueText(value)
+      });
+    }
+    return rows;
   }
   return Object.entries(detail||{}).map(([key,value])=>({
     label:auditKeyName[key]||key,
