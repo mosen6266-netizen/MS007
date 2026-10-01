@@ -580,12 +580,15 @@ async function createProgressDef(request, env, user) {
   const b=await readBody(request), label=String(b.label||"").trim();
   if(!label) return fail("请输入进度名称");
   const id=uid("p_"),t=now();
+  const maxRow=await env.DB.prepare("SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM progress_definitions WHERE enabled=1").first();
+  const nextSort=Number(maxRow?.max_sort||0)+1;
+  const sortOrder=b.sortOrder!==undefined?safeInt(b.sortOrder,nextSort,0,100000):nextSort;
   await env.DB.prepare(
     "INSERT INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)"
-  ).bind(id,label,String(b.description||""),b.enabled===false?0:1,safeInt(b.sortOrder,100,0,100000),String(b.color||"#2563eb"),t,t).run();
+  ).bind(id,label,String(b.description||""),b.enabled===false?0:1,sortOrder,String(b.color||"#2563eb"),t,t).run();
   await recalcAllProgress(env);
-  await audit(env,user,"create","progress_definition",id,{label});
-  return responseJson({ok:true,id},201);
+  await audit(env,user,"create","progress_definition",id,{label,sortOrder});
+  return responseJson({ok:true,id,sortOrder},201);
 }
 
 async function updateProgressDef(request, env, user, id) {
