@@ -748,8 +748,27 @@ async function telegramAdminSave(request,env,user){
   }
   await env.DB.batch(stmts);
 
+  let oldFields=[];try{oldFields=JSON.parse(old.fields_json||"[]")}catch{}
   await audit(env,user,"update","telegram_settings","1",{
-    enabled,chatId,hasToken:!!encToken,fieldCount:fields.length,notifyAdmin,routeCount:routes.length,templateLength:messageTemplate.length
+    before:{
+      enabled:!!old.enabled,
+      chatId:old.chat_id||"",
+      hasToken:!!old.bot_token_enc,
+      fieldCount:Array.isArray(oldFields)?oldFields.length:0,
+      notifyAdmin:!!old.notify_admin,
+      linkLabel:old.link_label||"查看客户详情"
+    },
+    after:{
+      enabled,
+      chatId,
+      hasToken:!!encToken,
+      fieldCount:fields.length,
+      notifyAdmin,
+      linkLabel,
+      routeCount:routes.length,
+      templateLength:messageTemplate.length
+    },
+    tokenChanged:!!newToken
   });
   return responseJson({ok:true,tokenHint:hint,hasToken:!!encToken,routeCount:routes.length});
 }
@@ -1433,7 +1452,18 @@ async function updateCustomer(request, env, user, id) {
 
   await env.DB.batch(statements);
   await audit(env,user,"update","customer",id,{
-    name:nameCheck.value,assignedUserId:ownerCheck.ownerId,archived:!!archived
+    before:{
+      name:current.name,
+      assignedUserId:current.assigned_user_id,
+      archived:!!current.archived,
+      editVersion:Number(current.edit_version||1)
+    },
+    after:{
+      name:nameCheck.value,
+      assignedUserId:ownerCheck.ownerId,
+      archived:!!archived,
+      editVersion:Number(current.edit_version||1)+1
+    }
   });
   return responseJson({ok:true,editVersion:Number(current.edit_version||1)+1,updatedAt:t});
 }
@@ -1475,6 +1505,15 @@ async function saveCustomerAtomic(request,env,user,id,ctx){
     if(!valuesCheck.ok)return fail(valuesCheck.message);
   }
 
+  const previousValues={};
+  if(Object.keys(valuesCheck.values||{}).length){
+    const oldVals=await env.DB.prepare(
+      "SELECT field_id,value FROM customer_values WHERE customer_id=?"
+    ).bind(id).all();
+    for(const row of oldVals.results||[])previousValues[row.field_id]=String(row.value??"");
+  }
+  const fieldLabelById=new Map((valuesCheck.fields||[]).map(x=>[x.id,x.label]));
+
   const progressInput=Array.isArray(body.progressChanges)?body.progressChanges:[];
   const uniqueProgress=new Map();
   for(const p of progressInput){
@@ -1498,9 +1537,18 @@ async function saveCustomerAtomic(request,env,user,id,ctx){
 
   const completedMap=new Map((progressResult.results||[]).map(x=>[x.progress_id,Number(x.completed||0)===1]));
   const transitioned=[];
+  const progressAuditChanges=[];
   for(const [pid,completed] of uniqueProgress.entries()){
     const before=completedMap.get(pid)===true;
     if(completed&&!before)transitioned.push(defsById.get(pid));
+    if(before!==completed){
+      progressAuditChanges.push({
+        progressId:pid,
+        progressLabel:defsById.get(pid)?.label||pid,
+        before,
+        after:completed
+      });
+    }
     completedMap.set(pid,completed);
   }
 
@@ -1554,12 +1602,38 @@ async function saveCustomerAtomic(request,env,user,id,ctx){
     );
   }
 
+  const fieldChanges=Object.entries(valuesCheck.values||{})
+    .filter(([fieldId,value])=>String(previousValues[fieldId]??"")!==String(value??""))
+    .map(([fieldId,value])=>({
+      fieldId,
+      fieldLabel:fieldLabelById.get(fieldId)||fieldId,
+      before:String(previousValues[fieldId]??""),
+      after:String(value??"")
+    }));
+
   await audit(env,user,"update","customer",id,{
+    before:{
+      name:current.name,
+      assignedUserId:current.assigned_user_id,
+      archived:!!current.archived,
+      progressDone:Number(current.progress_done||0),
+      progressTotal:Number(current.progress_total||0),
+      progressPercent:Number(current.progress_percent||0),
+      editVersion:currentVersion
+    },
+    after:{
+      name:nameCheck.value,
+      assignedUserId:ownerCheck.ownerId,
+      archived:!!archived,
+      progressDone:done,
+      progressTotal:total,
+      progressPercent:percent,
+      editVersion:currentVersion+1
+    },
+    fieldChanges,
+    progressChanges:progressAuditChanges,
     atomic:true,
-    profileChanged:!!hasProfile,
-    progressChanges:[...uniqueProgress.entries()].map(([progressId,completed])=>({progressId,completed})),
-    editVersionBefore:currentVersion,
-    editVersionAfter:currentVersion+1
+    profileChanged:!!hasProfile
   });
   for(const [progressId,completed] of uniqueProgress.entries()){
     await audit(
@@ -2846,7 +2920,11 @@ async function updateUser(request,env,admin,id){
   }else{
     await env.DB.prepare("UPDATE users SET display_name=?,active=?,updated_at=? WHERE id=?").bind(displayName,active,t,id).run();
   }
-  await audit(env,admin,"update","user",id,{displayName,active:!!active,passwordReset:!!b.password});
+  await audit(env,admin,"update","user",id,{
+    before:{displayName:old.display_name,active:!!old.active},
+    after:{displayName,active:!!active},
+    passwordReset:!!b.password
+  });
   return responseJson({ok:true});
 }
 
