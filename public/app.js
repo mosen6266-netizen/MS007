@@ -89,7 +89,8 @@ function renderHome(){
     <main class="home">
       <div class="home-box">
         <div class="brand">
-          <h1>MS007 客户登记系统</h1>
+          <img class="brand-logo-home" src="/branding/ms007-logo.svg" alt="MS007">
+          <div class="brand-system-name">客户登记系统</div>
           <p>请选择你的入口</p>
         </div>
         <div class="entry-grid">
@@ -121,6 +122,7 @@ async function renderLogin(role){
       <main class="login-wrap">
         <section class="login-card">
           <button class="back" id="backHome">← 返回入口</button>
+          <img class="login-brand-logo" src="/branding/ms007-logo.svg" alt="MS007">
           <h2>首次创建管理员</h2>
           <div class="sub">这一步只在系统第一次上线时出现。以后不会再显示。</div>
           <div class="notice warning" style="margin-bottom:14px">请输入部署时设置的“一次性初始化授权码”。这个授权码不是你的登录密码。</div>
@@ -151,6 +153,7 @@ async function renderLogin(role){
     <main class="login-wrap">
       <section class="login-card">
         <button class="back" id="backHome">← 返回入口</button>
+        <img class="login-brand-logo" src="/branding/ms007-logo.svg" alt="MS007">
         <h2>${roleName}登录</h2>
         <div class="sub">使用你的 ${roleName} 账号进入系统</div>
         <form id="loginForm">
@@ -239,7 +242,7 @@ async function renderShell(){
   app.innerHTML=`
     <div class="shell">
       <aside class="sidebar">
-        <div class="logo"><strong>MS007</strong><small>${roleLabel}系统</small></div>
+        <div class="logo"><img class="sidebar-brand-logo" src="/branding/ms007-logo.svg" alt="MS007"><small>${roleLabel}系统</small></div>
         <nav id="sideNav">${sideHtml()}</nav>
         <div class="side-footer">
           ${state.appVersion?`<div class="system-version">版本 ${esc(state.appVersion)}${state.deployChannel&&state.deployChannel!=="production"?` · ${esc(state.deployChannel)}`:""}</div>`:""}
