@@ -608,11 +608,24 @@ async function renderSales(view){
   });
 }
 
+const fieldTypeName={
+  text:"单行文本",
+  textarea:"多行文本",
+  phone:"手机号",
+  email:"邮箱",
+  number:"数字",
+  date:"日期",
+  time:"时间",
+  url:"网址",
+  select:"下拉选择",
+  single:"单选"
+};
+
 async function renderFields(view){
   const r=await api("/api/fields");const items=r.items||[];
   view.innerHTML=pageHead("登记字段管理","添加、编辑、排序并决定哪些字段显示在客户列表",`<button class="btn" id="addField">＋ 添加字段</button>`)+
     `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>名称</th><th>类型</th><th>必填</th><th>列表显示</th><th>可搜索</th><th>状态</th><th>操作</th></tr></thead><tbody>
-    ${items.map(f=>`<tr><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button> <button class="btn danger small" data-del-field="${esc(f.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
+    ${items.map(f=>`<tr><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(fieldTypeName[f.field_type]||f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button> <button class="btn danger small" data-del-field="${esc(f.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
   document.querySelector("#addField").onclick=()=>fieldModal(view,null);
   document.querySelectorAll("[data-edit-field]").forEach(b=>b.onclick=()=>fieldModal(view,items.find(x=>x.id===b.dataset.editField)));
   document.querySelectorAll("[data-del-field]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/fields/"+b.dataset.delField,{method:"DELETE"});toast("字段已停用");renderFields(view)}catch(e){toast(e.message)}});
@@ -621,7 +634,7 @@ function fieldModal(view,f){
   openModal(f?"编辑字段":"添加字段",`
     <div class="field"><label>字段名称</label><input class="input" id="fLabel" value="${esc(f?.label||"")}"></div>
     <div class="field"><label>字段类型</label><select class="input" id="fType">
-      ${["text","textarea","phone","email","number","date","time","url","select"].map(x=>`<option ${x===f?.field_type?"selected":""} value="${x}">${x}</option>`).join("")}
+      ${["text","textarea","phone","email","number","date","time","url","select"].map(x=>`<option ${x===f?.field_type?"selected":""} value="${x}">${esc(fieldTypeName[x]||x)}</option>`).join("")}
     </select></div>
     <div class="row wrap">
       <label><input type="checkbox" id="fRequired" ${f?.required?"checked":""}> 必填</label>
