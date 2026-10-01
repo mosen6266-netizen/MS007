@@ -759,3 +759,53 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
     flex-direction:column;
   }
 }
+
+
+/* Paginated admin lists */
+.list-filter-card{
+  margin-bottom:14px;
+}
+.list-filter-grid{
+  display:grid;
+  gap:10px 12px;
+  align-items:end;
+}
+.audit-filter-grid{
+  grid-template-columns:repeat(4,minmax(150px,1fr));
+}
+.recycle-filter-grid{
+  grid-template-columns:minmax(220px,1.4fr) minmax(180px,1fr);
+}
+.list-filter-card .field{
+  margin-bottom:0;
+}
+.list-pager{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-top:14px;
+  padding:10px 2px 2px;
+}
+.telegram-log-head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:14px;
+}
+@media(max-width:900px){
+  .audit-filter-grid{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+  }
+}
+@media(max-width:620px){
+  .audit-filter-grid,
+  .recycle-filter-grid{
+    grid-template-columns:1fr;
+  }
+  .list-pager,
+  .telegram-log-head{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+}
