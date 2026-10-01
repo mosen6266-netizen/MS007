@@ -712,3 +712,50 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
     grid-column:2;
   }
 }
+
+
+/* Sidebar category management */
+.sidebar-area-head{
+  justify-content:space-between;
+  align-items:center;
+  margin-bottom:14px;
+}
+.sidebar-category-list{
+  display:grid;
+  gap:12px;
+}
+.sidebar-category-card{
+  border:1px solid var(--line);
+  border-radius:12px;
+  padding:12px;
+  background:#f8fafc;
+  margin-top:12px;
+}
+.sidebar-category-card.uncategorized{
+  background:#fff;
+  border-style:dashed;
+}
+.sidebar-category-head{
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin-bottom:10px;
+}
+.sidebar-category-title{
+  font-weight:700;
+  font-size:14px;
+}
+.sidebar-category-card .settings-list{
+  gap:7px;
+}
+@media(max-width:760px){
+  .sidebar-category-head{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+  .sidebar-area-head{
+    align-items:flex-start;
+    flex-direction:column;
+  }
+}
