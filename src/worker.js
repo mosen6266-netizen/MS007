@@ -215,7 +215,7 @@ function telegramStableFieldToken(fieldId){
 
 async function telegramTemplateVariables(env){
   const fields=await env.DB.prepare(
-    "SELECT id,label FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+    "SELECT id,label,enabled FROM field_definitions ORDER BY sort_order,label"
   ).all();
   return [
     ...telegramBuiltInTemplateVariables(),
@@ -224,7 +224,8 @@ async function telegramTemplateVariables(env){
       legacyToken:"{{"+String(x.label||"登记字段")+"}}",
       key:"field:"+x.id,
       fieldId:x.id,
-      label:String(x.label||"登记字段")
+      label:String(x.label||"登记字段")+(x.enabled?"":"（已停用）"),
+      enabled:!!x.enabled
     }))
   ];
 }
