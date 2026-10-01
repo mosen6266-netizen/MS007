@@ -689,3 +689,26 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
     width:100%;
   }
 }
+
+
+/* Sidebar admin split sections */
+.sidebar-admin-section .setting-row{
+  grid-template-columns:36px minmax(220px,1fr) 96px 130px 70px 170px;
+}
+@media(max-width:1050px){
+  .sidebar-admin-section .setting-row{
+    grid-template-columns:30px minmax(180px,1fr) 90px 120px;
+  }
+  .sidebar-admin-section .setting-row>*:nth-child(5),
+  .sidebar-admin-section .setting-row>*:nth-child(6){
+    grid-column:auto;
+  }
+}
+@media(max-width:720px){
+  .sidebar-admin-section .setting-row{
+    grid-template-columns:30px 1fr;
+  }
+  .sidebar-admin-section .setting-row>*:nth-child(n+3){
+    grid-column:2;
+  }
+}
