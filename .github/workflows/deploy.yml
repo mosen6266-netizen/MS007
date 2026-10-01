@@ -157,12 +157,21 @@ jobs:
         run: |
           set -euo pipefail
           URL="https://ms007-crm-staging.${{ steps.subdomain.outputs.subdomain }}.workers.dev"
-          for i in 1 2 3 4 5 6; do
-            if curl -fsS "$URL/api/health" > /tmp/staging-health.json; then
-              break
-            fi
-            sleep 3
-          done
+
+          retry_get(){
+            local endpoint="$1"
+            local output="$2"
+            rm -f "$output"
+            for i in 1 2 3 4 5 6 7 8; do
+              if curl -fsS "$URL$endpoint" > "$output"; then
+                return 0
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
+          retry_get "/api/health" /tmp/staging-health.json
           cat /tmp/staging-health.json
           node - <<'NODE'
           const fs=require("fs");
@@ -173,7 +182,9 @@ jobs:
             process.exit(1);
           }
           NODE
-          curl -fsS "$URL/api/bootstrap-status"
+
+          retry_get "/api/bootstrap-status" /tmp/staging-bootstrap.json
+          cat /tmp/staging-bootstrap.json
           echo
 
   production:
@@ -274,12 +285,21 @@ jobs:
         run: |
           set -euo pipefail
           URL="https://ms007-crm.${{ needs.staging.outputs.subdomain }}.workers.dev"
-          for i in 1 2 3 4 5 6; do
-            if curl -fsS "$URL/api/health" > /tmp/health.json; then
-              break
-            fi
-            sleep 3
-          done
+
+          retry_get(){
+            local endpoint="$1"
+            local output="$2"
+            rm -f "$output"
+            for i in 1 2 3 4 5 6 7 8; do
+              if curl -fsS "$URL$endpoint" > "$output"; then
+                return 0
+              fi
+              sleep 3
+            done
+            return 1
+          }
+
+          retry_get "/api/health" /tmp/health.json
           cat /tmp/health.json
 
           node - <<'NODE'
@@ -292,10 +312,16 @@ jobs:
           }
           NODE
 
-          curl -fsS "$URL/api/bootstrap-status"
+          retry_get "/api/bootstrap-status" /tmp/bootstrap-status.json
+          cat /tmp/bootstrap-status.json
           echo
 
-          curl -fsS -H "x-bootstrap-token: $BOOTSTRAP_TOKEN" "$URL/api/bootstrap-token-check" > /tmp/bootstrap-token-check.json
+          for i in 1 2 3 4 5 6 7 8; do
+            if curl -fsS -H "x-bootstrap-token: $BOOTSTRAP_TOKEN" "$URL/api/bootstrap-token-check" > /tmp/bootstrap-token-check.json; then
+              break
+            fi
+            sleep 3
+          done
           cat /tmp/bootstrap-token-check.json
           node - <<'NODE'
           const fs=require("fs");
