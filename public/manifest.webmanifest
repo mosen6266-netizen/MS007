@@ -1,0 +1,16 @@
+{
+  "name": "MS007 客户登记系统",
+  "short_name": "MS007",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f7fb",
+  "theme_color": "#0f172a",
+  "icons": [
+    {
+      "src": "/branding/ms007-icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
