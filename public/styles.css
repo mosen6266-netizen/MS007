@@ -124,3 +124,22 @@ textarea.input{min-height:100px;resize:vertical}.row{display:flex;gap:10px;align
   .telegram-field-row{grid-template-columns:24px minmax(0,1fr) 38px 38px}
   .telegram-field-row .danger{grid-column:2/-1}
 }
+
+/* Right-click insert menu */
+tr[data-field-row],tr[data-progress-row]{cursor:context-menu}
+tr[data-field-row]:hover,tr[data-progress-row]:hover{background:#f8fafc}
+.row-context-menu{
+  position:fixed;z-index:1200;min-width:210px;
+  background:#fff;border:1px solid #dbe3ee;border-radius:12px;
+  box-shadow:0 14px 36px rgba(15,23,42,.18);padding:7px
+}
+.row-context-title{
+  padding:7px 10px 8px;font-size:12px;color:var(--muted);
+  border-bottom:1px solid #eef2f7;margin-bottom:4px;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:280px
+}
+.row-context-menu button{
+  width:100%;display:block;text-align:left;border:0;background:transparent;
+  border-radius:8px;padding:10px 11px;font:inherit;color:#1e293b;cursor:pointer
+}
+.row-context-menu button:hover{background:#eff6ff;color:#1d4ed8}
