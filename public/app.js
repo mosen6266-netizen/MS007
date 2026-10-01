@@ -416,11 +416,11 @@ function renderCustomerRows(host,items,hasMore){
       <div class="customer-fields customer-fields-configurable">${details.join("")||'<div class="muted">未设置客户资料显示项</div>'}</div>
       <div class="customer-step-status">
         <div class="step-status current-step">
-          <span>当前</span>
+          <span>当前进度</span>
           <strong><i></i>${esc(c.currentProgress?.label||"未开始")}</strong>
         </div>
         <div class="step-status next-step">
-          <span>下一步</span>
+          <span>下一步进度</span>
           <strong><i></i>${esc(c.nextProgress?.label||"暂无进度")}</strong>
         </div>
       </div>
