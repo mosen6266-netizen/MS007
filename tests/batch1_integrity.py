@@ -91,12 +91,6 @@ assert cur.rowcount==1
 # Stale version 2 cannot undo the version 3 progress.
 con.execute(
     """INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
-       SELECT ?,?,?,?,?,?
-       WHERE 0""",
-    ("noop","noop",0,None,None,None),
-)
-con.execute(
-    """INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
        SELECT ?,?,?,?,NULL
        WHERE EXISTS(SELECT 1 FROM customers WHERE id=? AND edit_version=?)
        ON CONFLICT(customer_id,progress_id) DO UPDATE SET
