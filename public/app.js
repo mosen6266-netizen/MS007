@@ -546,7 +546,7 @@ async function copyCustomerAll(id){
       `创建时间：${(c.createdAt||"").replace("T"," ").slice(0,19)}`,
       `更新时间：${(c.updatedAt||"").replace("T"," ").slice(0,19)}`
     ];
-    const copyText=lines.join("\\n");
+    const copyText=lines.join("\n");
     try{
       await navigator.clipboard.writeText(copyText);
     }catch{
