@@ -166,3 +166,14 @@ jobs:
             process.exit(1);
           }
           NODE
+
+          curl -sS -X POST -H "x-bootstrap-token: $BOOTSTRAP_TOKEN" "$URL/api/bootstrap-diagnostic" > /tmp/bootstrap-diagnostic.json
+          cat /tmp/bootstrap-diagnostic.json
+          node - <<'NODE'
+          const fs=require('fs');
+          const x=JSON.parse(fs.readFileSync('/tmp/bootstrap-diagnostic.json','utf8'));
+          if(!x.ok){
+            console.error("Bootstrap diagnostic failed at step:", x.step, x.errorName, x.errorMessage);
+            process.exit(1);
+          }
+          NODE
