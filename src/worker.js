@@ -1529,6 +1529,14 @@ async function saveCustomerAtomic(request,env,user,id,ctx){
     editVersionBefore:currentVersion,
     editVersionAfter:currentVersion+1
   });
+  for(const [progressId,completed] of uniqueProgress.entries()){
+    await audit(
+      env,user,
+      completed?"progress_complete":"progress_uncomplete",
+      "customer",id,
+      {progressId,atomic:true}
+    );
+  }
 
   if(transitioned.length){
     const summary={done,total,percent};
