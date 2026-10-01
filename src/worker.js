@@ -680,6 +680,119 @@ async function updateDashboardWidget(request,env,user,id){
   return responseJson({ok:true});
 }
 
+
+function defaultRegistrationLayout() {
+  return {
+    sections: [
+      { id:"basic", title:"基本信息", description:"", items:["name","f_phone","f_email"] },
+      { id:"details", title:"其他信息", description:"", items:["f_case_no","f_country","f_city","f_notes"] }
+    ]
+  };
+}
+
+async function resolvedRegistrationLayout(env) {
+  const raw = await getSystemSetting(env,"sales_registration_layout",defaultRegistrationLayout());
+  const fieldsResult = await env.DB.prepare(
+    "SELECT * FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  const fields = fieldsResult.results || [];
+  const fieldMap = new Map(fields.map(x=>[x.id,x]));
+  const seen = new Set();
+  const sections = [];
+
+  for (const source of Array.isArray(raw?.sections) ? raw.sections.slice(0,30) : []) {
+    const items = [];
+    for (const key of Array.isArray(source.items) ? source.items : []) {
+      const k = String(key||"");
+      if (!k || seen.has(k)) continue;
+      if (k === "name" || fieldMap.has(k)) {
+        seen.add(k);
+        items.push(k);
+      }
+    }
+    if (items.length || String(source.title||"").trim()) {
+      sections.push({
+        id:String(source.id||uid("sec_")),
+        title:String(source.title||"信息分组").slice(0,80),
+        description:String(source.description||"").slice(0,240),
+        items
+      });
+    }
+  }
+
+  if (!seen.has("name")) {
+    if (!sections.length) sections.push({id:"basic",title:"基本信息",description:"",items:[]});
+    sections[0].items.unshift("name");
+    seen.add("name");
+  }
+
+  const unassigned = fields.filter(x=>!seen.has(x.id)).map(x=>x.id);
+  if (unassigned.length) {
+    sections.push({
+      id:"__unassigned",
+      title:"其他信息",
+      description:"尚未在管理员中分组的登记条目会自动显示在这里，避免遗漏。",
+      items:unassigned,
+      system:true
+    });
+  }
+
+  return { sections, fields };
+}
+
+async function getRegistrationLayout(env) {
+  const r = await resolvedRegistrationLayout(env);
+  return responseJson({ok:true,...r});
+}
+
+async function adminRegistrationLayout(env) {
+  const raw = await getSystemSetting(env,"sales_registration_layout",defaultRegistrationLayout());
+  const fieldsResult = await env.DB.prepare(
+    "SELECT id,field_key,label,field_type,required,sort_order FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  return responseJson({ok:true,layout:raw,fields:fieldsResult.results||[]});
+}
+
+async function saveRegistrationLayout(request,env,user) {
+  const b=await readBody(request);
+  const input=Array.isArray(b?.sections)?b.sections:[];
+  const active=await env.DB.prepare("SELECT id FROM field_definitions WHERE enabled=1").all();
+  const allowed=new Set((active.results||[]).map(x=>x.id));
+  allowed.add("name");
+  const seen=new Set();
+  const sections=[];
+
+  for(const source of input.slice(0,30)){
+    const title=String(source?.title||"").trim().slice(0,80);
+    if(!title) continue;
+    const items=[];
+    for(const rawKey of Array.isArray(source?.items)?source.items:[]){
+      const key=String(rawKey||"");
+      if(!allowed.has(key)||seen.has(key)) continue;
+      seen.add(key);items.push(key);
+    }
+    sections.push({
+      id:String(source?.id||uid("sec_")).slice(0,120),
+      title,
+      description:String(source?.description||"").slice(0,240),
+      items
+    });
+  }
+
+  if(!seen.has("name")){
+    if(!sections.length) sections.push({id:"basic",title:"基本信息",description:"",items:[]});
+    sections[0].items.unshift("name");
+  }
+
+  const value={sections};
+  await env.DB.prepare(
+    `INSERT INTO system_settings(setting_key,value_json,updated_at) VALUES('sales_registration_layout',?,?)
+     ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
+  ).bind(JSON.stringify(value),now()).run();
+  await audit(env,user,"update","registration_layout","sales",{sections:sections.length});
+  return responseJson({ok:true,layout:value});
+}
+
 async function listSidebar(env, user) {
   const r=await env.DB.prepare(
     "SELECT id,audience,label,icon,url,target,enabled,sort_order,group_label FROM sidebar_items WHERE enabled=1 AND (audience=? OR audience='all') ORDER BY sort_order,label"
@@ -922,8 +1035,9 @@ async function finishImport(env,user){
 }
 
 async function softDeleteCustomer(env,user,id){
-  const row=await env.DB.prepare("SELECT id FROM customers WHERE id=? AND deleted_at IS NULL").bind(id).first();
+  const row=await env.DB.prepare("SELECT id,assigned_user_id FROM customers WHERE id=? AND deleted_at IS NULL").bind(id).first();
   if(!row)return fail("客户不存在",404);
+  if(user.role==="sales" && row.assigned_user_id!==user.id) return fail("无权删除该客户",403);
   await env.DB.prepare("UPDATE customers SET deleted_at=?,updated_at=? WHERE id=?").bind(now(),now(),id).run();
   await audit(env,user,"delete","customer",id,{soft:true});
   return responseJson({ok:true});
@@ -1084,6 +1198,7 @@ async function api(request, env) {
   }});
   if (path === "/api/logout" && method === "POST") return handleLogout(request, env, user);
   if (path === "/api/sidebar" && method === "GET") return listSidebar(env,user);
+  if (path === "/api/registration-layout" && method === "GET") return getRegistrationLayout(env);
   if (path === "/api/list-columns" && method === "GET") return listColumns(env,user);
   if (path === "/api/dashboard-widgets" && method === "GET") return dashboardWidgets(env,user);
   if (path === "/api/fields" && method === "GET") return listFields(env,user);
@@ -1095,10 +1210,7 @@ async function api(request, env) {
   let m=path.match(/^\/api\/customers\/([^/]+)$/);
   if(m && method==="GET") return getCustomer(env,user,m[1]);
   if(m && method==="PATCH") return updateCustomer(request,env,user,m[1]);
-  if(m && method==="DELETE"){
-    if(user.role!=="admin") return fail("只有管理员可以删除客户",403);
-    return softDeleteCustomer(env,user,m[1]);
-  }
+  if(m && method==="DELETE") return softDeleteCustomer(env,user,m[1]);
   m=path.match(/^\/api\/customers\/([^/]+)\/progress\/([^/]+)$/);
   if(m && method==="PUT") return toggleProgress(request,env,user,m[1],m[2]);
 
@@ -1138,6 +1250,8 @@ async function api(request, env) {
   }
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
+  if (path === "/api/admin/registration-layout" && method === "GET") return adminRegistrationLayout(env);
+  if (path === "/api/admin/registration-layout" && method === "PUT") return saveRegistrationLayout(request,env,user);
   if (path === "/api/admin/recycle" && method === "GET") return recycleList(env);
   m=path.match(/^\/api\/admin\/recycle\/([^/]+)\/restore$/);
   if(m && method==="POST") return restoreCustomer(env,user,m[1]);
