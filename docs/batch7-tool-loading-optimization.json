@@ -1,0 +1,14 @@
+{
+  "batch": "Batch 7",
+  "step": "Tool Loading Optimization",
+  "goals": [
+    "replace heavy hover iframe previews with lightweight thumbnails",
+    "load full tools only after user opens them",
+    "reduce unnecessary frontend resource loading"
+  ],
+  "protection": {
+    "customer_data_modified": false,
+    "schema_migration_required": false,
+    "production_records_touched": false
+  }
+}
