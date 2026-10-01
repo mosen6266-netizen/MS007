@@ -47,7 +47,7 @@ async function sha256Hex(value) {
   return bytesToHex(await crypto.subtle.digest("SHA-256", enc.encode(value)));
 }
 
-async function derivePassword(password, saltB64, iterations = 150000) {
+async function derivePassword(password, saltB64, iterations = 100000) {
   const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
   const bits = await crypto.subtle.deriveBits(
     { name: "PBKDF2", salt: b64ToBytes(saltB64), iterations, hash: "SHA-256" },
@@ -192,7 +192,7 @@ async function bootstrapDiagnostic(request, env) {
 
     step = "password_hash";
     const salt = newSalt();
-    const iterations = 150000;
+    const iterations = 100000;
     const hash = await derivePassword("MS007-diagnostic-password", salt, iterations);
 
     step = "insert_test_user";
@@ -249,7 +249,7 @@ async function handleBootstrap(request, env) {
     return fail("管理员账号至少3位，密码至少8位");
   }
   const salt = newSalt();
-  const iterations = 150000;
+  const iterations = 100000;
   const hash = await derivePassword(password, salt, iterations);
   const id = uid("u_");
   const t = now();
@@ -270,7 +270,7 @@ async function handleLogin(request, env) {
     "SELECT * FROM users WHERE username=? AND active=1"
   ).bind(username).first();
   if (!u) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
-  const hash = await derivePassword(password, u.password_salt, Number(u.password_iterations || 150000));
+  const hash = await derivePassword(password, u.password_salt, Number(u.password_iterations || 100000));
   if (hash !== u.password_hash) return fail("账号或密码不正确", 401, "LOGIN_FAILED");
   if (wantedRole && u.role !== wantedRole) return fail("该账号没有这个入口的权限", 403, "WRONG_ROLE");
 
@@ -799,7 +799,7 @@ async function createUser(request, env, admin) {
   if(username.length<3||!displayName||password.length<8) return fail("账号至少3位、姓名不能为空、密码至少8位");
   const exists=await env.DB.prepare("SELECT id FROM users WHERE username=?").bind(username).first();
   if(exists) return fail("这个账号已经存在",409);
-  const salt=newSalt(),iterations=150000,hash=await derivePassword(password,salt,iterations),id=uid("u_"),t=now();
+  const salt=newSalt(),iterations=100000,hash=await derivePassword(password,salt,iterations),id=uid("u_"),t=now();
   await env.DB.prepare(
     `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
      VALUES(?,?,?,?,?,?,'sales',1,?,?)`
@@ -819,7 +819,7 @@ async function updateUser(request,env,admin,id){
   if(b.password!==undefined && String(b.password).length>0){
     const password=String(b.password);
     if(password.length<8)return fail("新密码至少8位");
-    const salt=newSalt(),iterations=150000,hash=await derivePassword(password,salt,iterations);
+    const salt=newSalt(),iterations=100000,hash=await derivePassword(password,salt,iterations);
     await env.DB.prepare(
       "UPDATE users SET display_name=?,active=?,password_hash=?,password_salt=?,password_iterations=?,updated_at=? WHERE id=?"
     ).bind(displayName,active,hash,salt,iterations,t,id).run();
@@ -844,10 +844,10 @@ async function importChunk(request,env,user){
       if(u.role!=="sales") continue;
       const exists=await env.DB.prepare("SELECT id FROM users WHERE id=? OR username=?").bind(u.id,u.username).first();
       if(!exists){
-        const salt=newSalt(),hash=await derivePassword(uid("disabled_"),salt,150000);
+        const salt=newSalt(),hash=await derivePassword(uid("disabled_"),salt,100000);
         stmts.push(env.DB.prepare(
           `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
-           VALUES(?,?,?,?,?,150000,'sales',0,?,?)`
+           VALUES(?,?,?,?,?,100000,'sales',0,?,?)`
         ).bind(u.id,u.username,u.display_name,hash,salt,u.created_at||t,t));
       }
     }
@@ -1007,10 +1007,10 @@ async function importBusinessData(request,env,user){
     if(u.role!=="sales") continue;
     const exists=await env.DB.prepare("SELECT id FROM users WHERE id=? OR username=?").bind(u.id,u.username).first();
     if(!exists){
-      const salt=newSalt(), hash=await derivePassword(uid("disabled_"),salt,150000);
+      const salt=newSalt(), hash=await derivePassword(uid("disabled_"),salt,100000);
       tx.push(env.DB.prepare(
         `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
-         VALUES(?,?,?,?,?,150000,'sales',0,?,?)`
+         VALUES(?,?,?,?,?,100000,'sales',0,?,?)`
       ).bind(u.id,u.username,u.display_name,hash,salt,u.created_at||t,t));
     }
   }
