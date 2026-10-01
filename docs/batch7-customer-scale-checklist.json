@@ -1,0 +1,18 @@
+{
+  "batch": "Batch 7",
+  "step": "Customer data scale optimization",
+  "purpose": "Prepare customer management system for large datasets without changing existing customer records",
+  "protected": {
+    "customer_data": true,
+    "customer_progress": true,
+    "sales_data": true,
+    "configuration_data": true
+  },
+  "optimization_targets": [
+    "customer list pagination",
+    "incremental statistics cache",
+    "avoid full table scans",
+    "large dataset query review"
+  ],
+  "status": "planned-safe-migration"
+}
