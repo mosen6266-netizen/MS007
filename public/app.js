@@ -9,6 +9,7 @@ const state = {
   fields: [],
   sales: [],
   sidebarTimer: null,
+  pendingCustomerId: null,
 };
 
 const iconMap = {
@@ -50,6 +51,8 @@ function progressTone(p){
 function money(v){ return new Intl.NumberFormat("zh-CN").format(Number(v||0)); }
 
 async function bootstrap(){
+  const deep=location.hash.match(/^#\/customer\/([^/]+)$/);
+  if(deep)state.pendingCustomerId=decodeURIComponent(deep[1]);
   try{
     const me=await api("/api/me");
     state.user=me.user;
@@ -141,7 +144,9 @@ async function renderLogin(role){
     const fd=new FormData(e.currentTarget);
     try{
       const r=await api("/api/login",{method:"POST",body:{username:fd.get("username"),password:fd.get("password"),role}});
-      state.user=r.user; location.hash=`#/${role}/dashboard`; await enterApp();
+      state.user=r.user;
+      location.hash=state.pendingCustomerId?`#/${role}/customer/${encodeURIComponent(state.pendingCustomerId)}`:`#/${role}/dashboard`;
+      await enterApp();
     }catch(err){toast(err.message);}
   };
 }
@@ -149,7 +154,11 @@ async function renderLogin(role){
 async function enterApp(){
   await refreshSidebar(true);
   startSidebarSync();
-  if(!location.hash.startsWith("#/")){
+  const direct=location.hash.match(/^#\/customer\/([^/]+)$/);
+  if(direct){
+    state.pendingCustomerId=decodeURIComponent(direct[1]);
+    location.hash=`#/${state.user.role}/customer/${encodeURIComponent(state.pendingCustomerId)}`;
+  }else if(!location.hash.startsWith("#/")){
     location.hash=`#/${state.user.role}/dashboard`;
   }
   await renderShell();
@@ -250,6 +259,7 @@ async function renderRoute(){
     if(role==="admin"&&page==="list-settings")return renderListSettings(view);
     if(role==="admin"&&page==="dashboard-settings")return renderDashboardSettings(view);
     if(role==="admin"&&page==="capacity")return renderCapacity(view);
+    if(role==="admin"&&page==="telegram")return renderTelegramSettings(view);
     if(role==="admin"&&page==="audit")return renderAudit(view);
     if(role==="admin"&&page==="recycle")return renderRecycle(view);
     if(role==="admin"&&page==="backup")return renderBackup(view);
@@ -1087,6 +1097,153 @@ function dashboardWidgetModal(view,audience,w){
       type.onchange=()=>{if(!w||!val("wTitle"))document.querySelector("#wTitle").value=widgetTypeName[type.value]};
       document.querySelector("#wSave").onclick=async()=>{const body={audience,widgetType:val("wType"),title:val("wTitle")||widgetTypeName[val("wType")],sortOrder:Number(val("wSort")||100),enabled:checked("wEnabled")};try{if(w)await api("/api/admin/dashboard-widgets/"+w.id,{method:"PATCH",body});else await api("/api/admin/dashboard-widgets",{method:"POST",body});closeModal();toast("仪表盘设置已保存");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}};
     },{draftKey:`dashboard-widget:${audience}:${w?.id||"new"}`});
+}
+
+
+async function renderTelegramSettings(view){
+  const r=await api("/api/admin/telegram");
+  const s=r.settings||{};
+  const available=r.availableFields||[];
+  let fields=(s.fields||[]).map(x=>({...x}));
+
+  view.innerHTML=pageHead("Telegram 通知","业务员完成客户进度后，机器人自动在指定 Telegram 群播报。")+
+    `<div class="grid telegram-settings-grid">
+      <section class="card">
+        <h3 style="margin-top:0">机器人连接</h3>
+        <div class="field">
+          <label>Telegram Bot Token</label>
+          <input class="input" id="tgBotToken" type="password" autocomplete="new-password"
+            placeholder="${s.hasToken?"已保存 "+esc(s.tokenHint||"")+"，不修改请留空":"粘贴 BotFather 给你的机器人 Token"}">
+          <div class="muted" style="font-size:12px;margin-top:5px">Token 保存后不会在页面回显明文，也不会进入普通业务数据备份。</div>
+        </div>
+        <div class="field">
+          <label>Telegram 群 ID</label>
+          <input class="input" id="tgChatId" value="${esc(s.chatId||"")}" placeholder="例如：-1001234567890">
+        </div>
+        <div class="field">
+          <label>详情链接文字</label>
+          <input class="input" id="tgLinkLabel" value="${esc(s.linkLabel||"查看客户详情")}">
+        </div>
+        <div class="row wrap" style="margin:10px 0 16px">
+          <label><input type="checkbox" id="tgEnabled" ${s.enabled?"checked":""}> 启用 Telegram 自动播报</label>
+          <label><input type="checkbox" id="tgNotifyAdmin" ${s.notifyAdmin?"checked":""}> 管理员勾选进度时也播报</label>
+        </div>
+        <div class="row wrap">
+          <button class="btn" id="tgSave">保存设置</button>
+          <button class="btn secondary" id="tgTest">保存并发送测试消息</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h3 style="margin-top:0">播报内容</h3>
+        <p class="muted">这里决定 Telegram 群里每条通知显示哪些客户资料。可以添加、删除、改标题和调整顺序。</p>
+        <div id="tgFieldRows" class="telegram-field-list"></div>
+        <div class="row wrap" style="margin-top:12px">
+          <select class="input grow" id="tgAddField"></select>
+          <button class="btn secondary" id="tgAddFieldBtn">＋ 添加显示内容</button>
+        </div>
+      </section>
+    </div>
+
+    <section class="card" style="margin-top:16px">
+      <h3 style="margin-top:0">最近发送记录</h3>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>时间</th><th>业务员</th><th>客户</th><th>状态</th><th>说明</th></tr></thead>
+          <tbody>
+            ${(r.logs||[]).map(x=>`<tr>
+              <td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td>
+              <td>${esc(x.actor_name||"")}</td>
+              <td>${esc(x.customer_name||"")}</td>
+              <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":"已跳过"}</span></td>
+              <td>${esc(x.error_text||"")}</td>
+            </tr>`).join("")||'<tr><td colspan="5" class="muted">还没有发送记录</td></tr>'}
+          </tbody>
+        </table>
+      </div>
+    </section>`;
+
+  const rows=document.querySelector("#tgFieldRows");
+  const add=document.querySelector("#tgAddField");
+
+  function syncLabels(){
+    rows.querySelectorAll("[data-tg-field-row]").forEach(el=>{
+      const i=Number(el.dataset.tgFieldRow);
+      if(fields[i])fields[i].label=el.querySelector(".tg-field-label")?.value||fields[i].label;
+    });
+  }
+
+  function refillAdd(){
+    const used=new Set(fields.map(x=>x.key));
+    add.innerHTML=available.filter(x=>!used.has(x.key)).map(x=>
+      `<option value="${esc(x.key)}">${esc(x.label)}</option>`
+    ).join("")||'<option value="">没有其他可添加内容</option>';
+  }
+
+  function redraw(){
+    rows.innerHTML=fields.map((x,i)=>`<div class="telegram-field-row" data-tg-field-row="${i}">
+      <span class="drag">⋮⋮</span>
+      <div class="grow">
+        <input class="input tg-field-label" value="${esc(x.label||"")}" placeholder="Telegram 中显示的标题">
+        <div class="muted" style="font-size:11px;margin-top:3px">${esc(available.find(a=>a.key===x.key)?.label||x.key)}</div>
+      </div>
+      <button class="btn ghost small" data-tg-up="${i}" ${i===0?"disabled":""}>↑</button>
+      <button class="btn ghost small" data-tg-down="${i}" ${i===fields.length-1?"disabled":""}>↓</button>
+      <button class="btn danger small" data-tg-del="${i}">删除</button>
+    </div>`).join("")||'<div class="empty-options">当前没有播报内容。</div>';
+
+    rows.querySelectorAll("[data-tg-up]").forEach(b=>b.onclick=()=>{
+      syncLabels();const i=Number(b.dataset.tgUp);if(i>0)[fields[i-1],fields[i]]=[fields[i],fields[i-1]];redraw();
+    });
+    rows.querySelectorAll("[data-tg-down]").forEach(b=>b.onclick=()=>{
+      syncLabels();const i=Number(b.dataset.tgDown);if(i<fields.length-1)[fields[i+1],fields[i]]=[fields[i],fields[i+1]];redraw();
+    });
+    rows.querySelectorAll("[data-tg-del]").forEach(b=>b.onclick=()=>{
+      syncLabels();fields.splice(Number(b.dataset.tgDel),1);redraw();
+    });
+    refillAdd();
+  }
+
+  document.querySelector("#tgAddFieldBtn").onclick=()=>{
+    syncLabels();
+    const key=add.value;if(!key)return;
+    const x=available.find(a=>a.key===key);if(!x)return;
+    fields.push({key:x.key,label:x.label});
+    redraw();
+  };
+
+  async function saveSettings(showToast=true){
+    syncLabels();
+    const body={
+      botToken:val("tgBotToken"),
+      chatId:val("tgChatId"),
+      linkLabel:val("tgLinkLabel"),
+      enabled:checked("tgEnabled"),
+      notifyAdmin:checked("tgNotifyAdmin"),
+      fields
+    };
+    const out=await api("/api/admin/telegram",{method:"PUT",body});
+    document.querySelector("#tgBotToken").value="";
+    document.querySelector("#tgBotToken").placeholder="已保存 "+(out.tokenHint||"")+"，不修改请留空";
+    if(showToast)toast("Telegram 设置已保存");
+  }
+
+  document.querySelector("#tgSave").onclick=async()=>{
+    try{await saveSettings(true)}catch(e){toast(e.message)}
+  };
+  document.querySelector("#tgTest").onclick=async()=>{
+    const btn=document.querySelector("#tgTest");
+    btn.disabled=true;btn.textContent="正在测试...";
+    try{
+      await saveSettings(false);
+      await api("/api/admin/telegram/test",{method:"POST"});
+      toast("测试消息已发送到 Telegram 群");
+      setTimeout(()=>renderTelegramSettings(view),500);
+    }catch(e){toast(e.message)}
+    btn.disabled=false;btn.textContent="保存并发送测试消息";
+  };
+
+  redraw();
 }
 
 async function renderCapacity(view){
