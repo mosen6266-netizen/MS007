@@ -750,6 +750,119 @@ async function createUser(request, env, admin) {
   return responseJson({ok:true,id},201);
 }
 
+
+async function updateUser(request,env,admin,id){
+  const old=await env.DB.prepare("SELECT * FROM users WHERE id=?").bind(id).first();
+  if(!old)return fail("账号不存在",404);
+  const b=await readBody(request),t=now();
+  let displayName=b.displayName!==undefined?String(b.displayName).trim():old.display_name;
+  let active=b.active!==undefined?(b.active?1:0):old.active;
+  if(id===admin.id && !active) return fail("不能停用当前登录的管理员账号");
+  if(b.password!==undefined && String(b.password).length>0){
+    const password=String(b.password);
+    if(password.length<8)return fail("新密码至少8位");
+    const salt=newSalt(),iterations=150000,hash=await derivePassword(password,salt,iterations);
+    await env.DB.prepare(
+      "UPDATE users SET display_name=?,active=?,password_hash=?,password_salt=?,password_iterations=?,updated_at=? WHERE id=?"
+    ).bind(displayName,active,hash,salt,iterations,t,id).run();
+    await env.DB.prepare("DELETE FROM sessions WHERE user_id=?").bind(id).run();
+  }else{
+    await env.DB.prepare("UPDATE users SET display_name=?,active=?,updated_at=? WHERE id=?").bind(displayName,active,t,id).run();
+  }
+  await audit(env,admin,"update","user",id,{displayName,active:!!active,passwordReset:!!b.password});
+  return responseJson({ok:true});
+}
+
+async function importChunk(request,env,user){
+  const body=await readBody(request);
+  if(body?.format!=="MS007-BUSINESS-BACKUP" || !body?.section || !Array.isArray(body.rows)) return fail("导入分片格式不正确");
+  const rows=body.rows.slice(0,100);
+  const section=String(body.section);
+  const t=now();
+  const stmts=[];
+
+  if(section==="users"){
+    for(const u of rows){
+      if(u.role!=="sales") continue;
+      const exists=await env.DB.prepare("SELECT id FROM users WHERE id=? OR username=?").bind(u.id,u.username).first();
+      if(!exists){
+        const salt=newSalt(),hash=await derivePassword(uid("disabled_"),salt,150000);
+        stmts.push(env.DB.prepare(
+          `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
+           VALUES(?,?,?,?,?,150000,'sales',0,?,?)`
+        ).bind(u.id,u.username,u.display_name,hash,salt,u.created_at||t,t));
+      }
+    }
+  } else if(section==="fieldDefinitions"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      `INSERT OR REPLACE INTO field_definitions(id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,sort_order,options_json,searchable,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(x.id,x.field_key,x.label,x.field_type,x.required,x.enabled,x.list_visible,x.list_sort_order,x.sort_order,x.options_json,x.searchable,x.created_at||t,x.updated_at||t));
+  } else if(section==="progressDefinitions"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      `INSERT OR REPLACE INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?)`
+    ).bind(x.id,x.label,x.description,x.enabled,x.sort_order,x.color,x.created_at||t,x.updated_at||t));
+  } else if(section==="customers"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      `INSERT OR REPLACE INTO customers(
+        id,assigned_user_id,name,progress_done,progress_total,progress_percent,archived,deleted_at,created_by_id,created_at,updated_at
+       ) VALUES(
+        ?,
+        CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM users WHERE id=?) THEN ? ELSE NULL END,
+        ?,?,?,?,?,?,
+        CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM users WHERE id=?) THEN ? ELSE ? END,
+        ?,?
+       )`
+    ).bind(
+      x.id,
+      x.assigned_user_id,x.assigned_user_id,x.assigned_user_id,
+      x.name,x.progress_done||0,x.progress_total||0,x.progress_percent||0,x.archived||0,x.deleted_at||null,
+      x.created_by_id,x.created_by_id,x.created_by_id,user.id,
+      x.created_at||t,x.updated_at||t
+    ));
+  } else if(section==="customerValues"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      "INSERT OR REPLACE INTO customer_values(customer_id,field_id,value,updated_at) VALUES(?,?,?,?)"
+    ).bind(x.customer_id,x.field_id,x.value,x.updated_at||t));
+  } else if(section==="customerProgress"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      `INSERT OR REPLACE INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
+       VALUES(?,?,?,CASE WHEN ? IS NOT NULL AND EXISTS(SELECT 1 FROM users WHERE id=?) THEN ? ELSE NULL END,?)`
+    ).bind(x.customer_id,x.progress_id,x.completed,x.completed_by,x.completed_by,x.completed_by,x.completed_at));
+  } else if(section==="sidebarItems"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      `INSERT OR REPLACE INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(x.id,x.audience,x.label,x.icon,x.url,x.target,x.enabled,x.sort_order,x.group_label,x.created_at||t,x.updated_at||t));
+  } else if(section==="listColumns"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      "INSERT OR REPLACE INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order) VALUES(?,?,?,?,?,?,?)"
+    ).bind(x.id,x.audience,x.column_key,x.field_id,x.label,x.enabled,x.sort_order));
+  } else if(section==="dashboardWidgets"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      "INSERT OR REPLACE INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
+    ).bind(x.id,x.audience,x.widget_type,x.title,x.enabled,x.sort_order,x.config_json||"{}"));
+  } else if(section==="systemSettings"){
+    for(const x of rows) stmts.push(env.DB.prepare(
+      `INSERT INTO system_settings(setting_key,value_json,updated_at) VALUES(?,?,?)
+       ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
+    ).bind(x.setting_key,x.value_json,x.updated_at||t));
+  } else {
+    return fail("未知的备份数据部分");
+  }
+
+  if(stmts.length) await env.DB.batch(stmts);
+  return responseJson({ok:true,section,processed:rows.length});
+}
+
+async function finishImport(env,user){
+  await recalcAllProgress(env);
+  await bumpVersion(env,"sidebar_version");
+  await audit(env,user,"import","business_data",null,{mode:"chunked"});
+  return responseJson({ok:true,message:"数据恢复完成"});
+}
+
 async function softDeleteCustomer(env,user,id){
   const row=await env.DB.prepare("SELECT id FROM customers WHERE id=? AND deleted_at IS NULL").bind(id).first();
   if(!row)return fail("客户不存在",404);
@@ -928,6 +1041,8 @@ async function api(request, env) {
 
   if (path === "/api/admin/users" && method === "GET") return usersList(env);
   if (path === "/api/admin/users" && method === "POST") return createUser(request,env,user);
+  m=path.match(/^\/api\/admin\/users\/([^/]+)$/);
+  if(m && method==="PATCH") return updateUser(request,env,user,m[1]);
   if (path === "/api/admin/fields" && method === "POST") return createField(request,env,user);
   m=path.match(/^\/api\/admin\/fields\/([^/]+)$/);
   if(m && method==="PATCH") return updateField(request,env,user,m[1]);
@@ -964,6 +1079,8 @@ async function api(request, env) {
   if (path === "/api/admin/audit" && method === "GET") return auditList(request,env);
   if (path === "/api/admin/export" && method === "GET") return exportBusinessData(env,user);
   if (path === "/api/admin/import" && method === "POST") return importBusinessData(request,env,user);
+  if (path === "/api/admin/import-chunk" && method === "POST") return importChunk(request,env,user);
+  if (path === "/api/admin/import-finish" && method === "POST") return finishImport(env,user);
   if (path === "/api/admin/list-columns" && method === "GET") return adminListColumns(request,env);
   if (path === "/api/admin/list-columns" && method === "PUT") return saveListColumns(request,env,user);
   if (path === "/api/admin/dashboard-widgets" && method === "GET") return adminDashboardWidgets(request,env);
