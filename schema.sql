@@ -1,3 +1,13 @@
+-- MS007 FRESH-DATABASE BOOTSTRAP ONLY.
+-- This file creates a brand-new database and its initial defaults.
+-- It must NEVER be re-applied to an existing production database.
+-- All changes to an existing database belong in versioned files under migrations/.
+--
+-- Keeping the initial defaults here is intentional: a brand-new disaster-recovery
+-- installation gets a usable starting system, while later deployments cannot
+-- recreate fields, progress items, sidebar items, or other settings that an
+-- administrator has deleted or changed.
+
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS users (
