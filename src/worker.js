@@ -289,8 +289,12 @@ async function listCustomers(request, env, user) {
   const page = rows.slice(0, limit);
 
   const visible = await env.DB.prepare(
-    "SELECT id,field_key,label FROM field_definitions WHERE enabled=1 AND list_visible=1 ORDER BY list_sort_order,sort_order"
-  ).all();
+    `SELECT fd.id,fd.field_key,lc.label
+     FROM list_columns lc
+     JOIN field_definitions fd ON fd.id=lc.field_id
+     WHERE lc.audience=? AND lc.enabled=1 AND lc.column_key='dynamic' AND fd.enabled=1
+     ORDER BY lc.sort_order,fd.sort_order`
+  ).bind(user.role).all();
   const visibleFields = visible.results || [];
   const ids = page.map(x => x.id);
   const valuesByCustomer = {};
