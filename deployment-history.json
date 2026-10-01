@@ -1,0 +1,38 @@
+{
+  "project": "MS007",
+  "authoritative_history": "GitHub Actions runs for Deploy MS007 to Cloudflare",
+  "records": [
+    {
+      "batch": "4",
+      "commit": "4050a9fcb2f906ef6e212e8b821f63f993a73b01",
+      "deploy_run": 36924446377,
+      "result": "success"
+    },
+    {
+      "batch": "5",
+      "commit": "9eedab35ab2363dc640f4c70260590c5bb98a15d",
+      "deploy_run": 36928037427,
+      "result": "success"
+    },
+    {
+      "batch": "7.2-worker",
+      "commit": "6530f36fca26a30e5c41cc7be6b42db7664fcb6c",
+      "deploy_run": 36934462608,
+      "result": "success"
+    },
+    {
+      "batch": "7.2-schema",
+      "commit": "467ae895f595da1e8525669b01a4a12059394c69",
+      "deploy_run": 36934471830,
+      "result": "success"
+    },
+    {
+      "batch": "7.5-final",
+      "commit": "f656fa7a20021c66929b9904bab2fc8e569bb8f3",
+      "quality_run": 36934819082,
+      "quality_result": "success",
+      "deploy_run": 36934819121,
+      "deploy_result": "pending_at_manifest_creation"
+    }
+  ]
+}
