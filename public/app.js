@@ -410,7 +410,7 @@ async function renderDashboard(view,period=null,cache=null){
       html+=`<div class="card" style="margin-top:18px">
         <div class="dashboard-card-head"><h3>${esc(w.title)}</h3><span>${esc(periodName)}</span></div>
         <div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead><tbody>
-        ${(data.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">当前时间范围内没有数据</td></tr>`}
+        ${(data.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}${x.active===false?"（已停用）":""}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">当前时间范围内没有数据</td></tr>`}
         </tbody></table></div>
       </div>`;
     }
