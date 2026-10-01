@@ -431,6 +431,7 @@ function renderCustomerRows(host,items,hasMore){
       </div>
       <div class="customer-actions">
         <button class="icon-action" title="预览" data-preview="${esc(c.id)}">👁 <span>预览</span></button>
+        <button class="icon-action" title="客户进度" data-progress-only="${esc(c.id)}">☑ <span>进度</span></button>
         <button class="icon-action" title="编辑" data-edit="${esc(c.id)}">✏ <span>编辑</span></button>
         <button class="icon-action" title="复制全部信息" data-copy="${esc(c.id)}">📋 <span>复制</span></button>
         <button class="icon-action" title="${archiveLabel}" data-archive="${esc(c.id)}">📦 <span>${archiveLabel}</span></button>
@@ -441,6 +442,7 @@ function renderCustomerRows(host,items,hasMore){
   ${hasMore?`<div style="text-align:center;margin:18px"><button class="btn secondary" id="loadMore">加载更多</button></div>`:""}`;
 
   host.querySelectorAll("[data-preview]").forEach(b=>b.onclick=()=>openCustomerPreview(b.dataset.preview));
+  host.querySelectorAll("[data-progress-only]").forEach(b=>b.onclick=()=>openCustomerProgressPanel(b.dataset.progressOnly));
   host.querySelectorAll("[data-edit]").forEach(b=>b.onclick=()=>openCustomerEditor(b.dataset.edit));
   host.querySelectorAll("[data-copy]").forEach(b=>b.onclick=()=>copyCustomerAll(b.dataset.copy));
   host.querySelectorAll("[data-archive]").forEach(b=>b.onclick=()=>setCustomerArchived(b.dataset.archive,!customerPageState.viewArchived));
@@ -583,6 +585,84 @@ async function openCustomerEditor(id=null){
   }catch(err){toast(err.message)}
 }
 
+async function openCustomerProgressPanel(id){
+  try{
+    const r=await api("/api/customers/"+encodeURIComponent(id));
+    const customer=r.customer;
+
+    openDrawer("客户进度 · "+customer.name,`
+      <section class="form-section customer-progress-editor progress-only-panel">
+        <div class="form-section-head progress-editor-head">
+          <div>
+            <h3>客户进度</h3>
+            <p>这里只修改客户进度，不显示或修改其他客户资料。只有点击“保存进度”后才会真正生效。</p>
+          </div>
+          <div class="progress-editor-summary">
+            <strong id="quickProgressPercent">${Number(customer.progressPercent||0)}%</strong>
+            <span id="quickProgressFraction">${Number(customer.progressDone||0)}/${Number(customer.progressTotal||0)}</span>
+          </div>
+        </div>
+        <div class="progress-check-grid">
+          ${(customer.progress||[]).map(p=>`
+            <label class="progress-check-item">
+              <input type="checkbox"
+                class="quick-progress-check"
+                data-progress-id="${esc(p.id)}"
+                data-original="${p.completed?"1":"0"}"
+                ${p.completed?"checked":""}>
+              <span class="progress-check-mark"></span>
+              <span class="progress-check-content">
+                <strong><i style="background:${esc(p.color||"#94a3b8")}"></i>${esc(p.label)}</strong>
+                ${p.description?`<small>${esc(p.description)}</small>`:""}
+              </span>
+            </label>`).join("")||'<div class="muted">管理员还没有设置客户进度。</div>'}
+        </div>
+      </section>
+      <div class="drawer-actions">
+        <button class="btn" id="quickProgressSave">保存进度</button>
+        <button class="btn ghost" id="quickProgressCancel">取消</button>
+      </div>
+    `,()=>{
+      const checks=[...document.querySelectorAll(".quick-progress-check")];
+      const updateSummary=()=>{
+        const done=checks.filter(x=>x.checked).length;
+        const total=checks.length;
+        const percent=total?Math.round(done*100/total):0;
+        const pct=document.querySelector("#quickProgressPercent");
+        const fraction=document.querySelector("#quickProgressFraction");
+        if(pct)pct.textContent=percent+"%";
+        if(fraction)fraction.textContent=done+"/"+total;
+      };
+      checks.forEach(x=>x.addEventListener("change",updateSummary));
+      updateSummary();
+
+      document.querySelector("#quickProgressCancel").onclick=requestCloseDrawer;
+      document.querySelector("#quickProgressSave").onclick=async()=>{
+        const changed=checks
+          .filter(x=>(x.dataset.original==="1")!==x.checked)
+          .map(x=>({id:x.dataset.progressId,completed:x.checked}));
+
+        const btn=document.querySelector("#quickProgressSave");
+        btn.disabled=true;btn.textContent="正在保存...";
+        try{
+          for(const p of changed){
+            await api("/api/customers/"+encodeURIComponent(id)+"/progress/"+encodeURIComponent(p.id),{
+              method:"PUT",
+              body:{completed:p.completed}
+            });
+          }
+          closeDrawer();
+          toast(changed.length?"客户进度已保存":"客户进度没有变化");
+          if(document.querySelector("#customerResults"))await loadCustomerPage(true);
+        }catch(err){
+          toast(err.message);
+          btn.disabled=false;btn.textContent="保存进度";
+        }
+      };
+    },{draftKey:`customer-progress:${id}:${state.user.id}`});
+  }catch(err){toast(err.message)}
+}
+
 async function openCustomerPreview(id){
   try{
     const [r,layout]=await Promise.all([
@@ -720,11 +800,32 @@ async function renderFields(view){
   const r=await api("/api/fields");const items=r.items||[];
   view.innerHTML=pageHead("登记字段管理","添加、编辑、排序并决定哪些字段显示在客户列表",`<button class="btn" id="addField">＋ 添加字段</button>`)+
     `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>名称</th><th>类型</th><th>必填</th><th>列表显示</th><th>可搜索</th><th>状态</th><th>操作</th></tr></thead><tbody>
-    ${items.map(f=>`<tr data-field-row="${esc(f.id)}"><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(fieldTypeName[f.field_type]||f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button> <button class="btn danger small" data-del-field="${esc(f.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
+    ${items.map(f=>`<tr data-field-row="${esc(f.id)}"><td>${f.sort_order}</td><td><strong>${esc(f.label)}</strong></td><td>${esc(fieldTypeName[f.field_type]||f.field_type)}</td><td>${f.required?"是":"否"}</td><td>${f.list_visible?"显示":"不显示"}</td><td>${f.searchable?"是":"否"}</td><td>${f.enabled?"启用":"停用"}</td><td>
+      <button class="btn ghost small" data-edit-field="${esc(f.id)}">编辑</button>
+      <button class="btn ghost small" data-toggle-field="${esc(f.id)}" data-enable-field="${f.enabled?"0":"1"}">${f.enabled?"停用":"启用"}</button>
+      <button class="btn danger small" data-hard-del-field="${esc(f.id)}">删除</button>
+    </td></tr>`).join("")}</tbody></table></div>`;
   const nextFieldSort=(items.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0))+1;
   document.querySelector("#addField").onclick=()=>fieldModal(view,null,nextFieldSort);
   document.querySelectorAll("[data-edit-field]").forEach(b=>b.onclick=()=>fieldModal(view,items.find(x=>x.id===b.dataset.editField)));
-  document.querySelectorAll("[data-del-field]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/fields/"+b.dataset.delField,{method:"DELETE"});toast("字段已停用");renderFields(view)}catch(e){toast(e.message)}});
+  document.querySelectorAll("[data-toggle-field]").forEach(b=>b.onclick=async()=>{
+    const enabled=b.dataset.enableField==="1";
+    try{
+      await api("/api/admin/fields/"+b.dataset.toggleField,{method:"PATCH",body:{enabled}});
+      toast(enabled?"字段已启用":"字段已停用");
+      renderFields(view);
+    }catch(e){toast(e.message)}
+  });
+  document.querySelectorAll("[data-hard-del-field]").forEach(b=>b.onclick=async()=>{
+    const item=items.find(x=>x.id===b.dataset.hardDelField);if(!item)return;
+    if(!confirm("永久删除登记条目「"+item.label+"」？\n\n这会同时删除所有客户在这个条目下已经填写的数据，并且无法恢复。"))return;
+    if(!confirm("请再次确认：真的要永久删除「"+item.label+"」吗？"))return;
+    try{
+      const r=await api("/api/admin/fields/"+encodeURIComponent(item.id)+"/hard-delete",{method:"DELETE"});
+      toast("登记条目已永久删除"+(r.deletedCustomerValues?("，同时删除 "+r.deletedCustomerValues+" 条客户字段数据"):""));
+      renderFields(view);
+    }catch(e){toast(e.message)}
+  });
   document.querySelectorAll("[data-field-row]").forEach(row=>row.addEventListener("contextmenu",e=>{
     e.preventDefault();
     const anchor=items.find(x=>x.id===row.dataset.fieldRow);if(!anchor)return;
@@ -880,11 +981,32 @@ async function renderProgressAdmin(view){
   const r=await api("/api/progress-defs");const items=r.items||[];
   view.innerHTML=pageHead("客户进度管理","业务员勾选完成后，客户卡片百分比立即更新",`<button class="btn" id="addProgress">＋ 添加进度</button>`)+
     `<div class="table-wrap"><table><thead><tr><th>顺序</th><th>进度名称</th><th>说明</th><th>颜色</th><th>状态</th><th>操作</th></tr></thead><tbody>
-    ${items.map(p=>`<tr data-progress-row="${esc(p.id)}"><td>${p.sort_order}</td><td><strong>${esc(p.label)}</strong></td><td>${esc(p.description||"")}</td><td><span class="tag" style="border-left:5px solid ${esc(p.color)}">${esc(p.color)}</span></td><td>${p.enabled?"启用":"停用"}</td><td><button class="btn ghost small" data-edit-prog="${esc(p.id)}">编辑</button> <button class="btn danger small" data-del-prog="${esc(p.id)}">停用</button></td></tr>`).join("")}</tbody></table></div>`;
+    ${items.map(p=>`<tr data-progress-row="${esc(p.id)}"><td>${p.sort_order}</td><td><strong>${esc(p.label)}</strong></td><td>${esc(p.description||"")}</td><td><span class="tag" style="border-left:5px solid ${esc(p.color)}">${esc(p.color)}</span></td><td>${p.enabled?"启用":"停用"}</td><td>
+      <button class="btn ghost small" data-edit-prog="${esc(p.id)}">编辑</button>
+      <button class="btn ghost small" data-toggle-prog="${esc(p.id)}" data-enable-prog="${p.enabled?"0":"1"}">${p.enabled?"停用":"启用"}</button>
+      <button class="btn danger small" data-hard-del-prog="${esc(p.id)}">删除</button>
+    </td></tr>`).join("")}</tbody></table></div>`;
   const nextProgressSort=(items.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0))+1;
   document.querySelector("#addProgress").onclick=()=>progressModal(view,null,nextProgressSort);
   document.querySelectorAll("[data-edit-prog]").forEach(b=>b.onclick=()=>progressModal(view,items.find(x=>x.id===b.dataset.editProg)));
-  document.querySelectorAll("[data-del-prog]").forEach(b=>b.onclick=async()=>{try{await api("/api/admin/progress/"+b.dataset.delProg,{method:"DELETE"});toast("进度已停用");renderProgressAdmin(view)}catch(e){toast(e.message)}});
+  document.querySelectorAll("[data-toggle-prog]").forEach(b=>b.onclick=async()=>{
+    const enabled=b.dataset.enableProg==="1";
+    try{
+      await api("/api/admin/progress/"+b.dataset.toggleProg,{method:"PATCH",body:{enabled}});
+      toast(enabled?"客户进度已启用":"客户进度已停用");
+      renderProgressAdmin(view);
+    }catch(e){toast(e.message)}
+  });
+  document.querySelectorAll("[data-hard-del-prog]").forEach(b=>b.onclick=async()=>{
+    const item=items.find(x=>x.id===b.dataset.hardDelProg);if(!item)return;
+    if(!confirm("永久删除客户进度「"+item.label+"」？\n\n这会同时删除所有客户在这个进度上的完成记录，并重新计算所有客户的完成百分比。此操作无法恢复。"))return;
+    if(!confirm("请再次确认：真的要永久删除「"+item.label+"」吗？"))return;
+    try{
+      const r=await api("/api/admin/progress/"+encodeURIComponent(item.id)+"/hard-delete",{method:"DELETE"});
+      toast("客户进度已永久删除"+(r.deletedCustomerProgress?("，同时删除 "+r.deletedCustomerProgress+" 条完成记录"):""));
+      renderProgressAdmin(view);
+    }catch(e){toast(e.message)}
+  });
   document.querySelectorAll("[data-progress-row]").forEach(row=>row.addEventListener("contextmenu",e=>{
     e.preventDefault();
     const anchor=items.find(x=>x.id===row.dataset.progressRow);if(!anchor)return;
