@@ -531,14 +531,20 @@ async function createField(request, env, user) {
   const key = String(b.fieldKey || ("field_" + Date.now())).trim().replace(/[^a-zA-Z0-9_]/g, "_");
   const id = uid("f_");
   const t = now();
+
+  const maxRow = await env.DB.prepare("SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM field_definitions WHERE enabled=1").first();
+  const nextSort = Number(maxRow?.max_sort || 0) + 1;
+  const sortOrder = b.sortOrder!==undefined ? safeInt(b.sortOrder,nextSort,0,100000) : nextSort;
+  const listSortOrder = b.listSortOrder!==undefined ? safeInt(b.listSortOrder,sortOrder,0,100000) : sortOrder;
+
   await env.DB.prepare(
     `INSERT INTO field_definitions(id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,sort_order,options_json,searchable,created_at,updated_at)
      VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
   ).bind(id,key,label,String(b.fieldType||"text"),b.required?1:0,b.enabled===false?0:1,b.listVisible?1:0,
-    safeInt(b.listSortOrder,100,0,100000),safeInt(b.sortOrder,100,0,100000),JSON.stringify(b.options||[]),
+    listSortOrder,sortOrder,JSON.stringify(b.options||[]),
     b.searchable===false?0:1,t,t).run();
-  await audit(env,user,"create","field",id,{label});
-  return responseJson({ok:true,id},201);
+  await audit(env,user,"create","field",id,{label,sortOrder});
+  return responseJson({ok:true,id,sortOrder},201);
 }
 
 async function updateField(request, env, user, id) {
