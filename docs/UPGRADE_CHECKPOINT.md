@@ -224,7 +224,7 @@ Implemented:
 
 Verification:
 - Final Batch 7 quality run 36934819082: success.
-- Final deployment run 36934819121 is the deployment record for commit f656fa7a20021c66929b9904bab2fc8e569bb8f3; consult deployment-history.json / GitHub Actions for its final conclusion.
+- Final deployment run 36934819121 for commit f656fa7a20021c66929b9904bab2fc8e569bb8f3: success.
 - Earlier Batch 7.2 cache Worker deployment 36934462608: success.
 - Earlier Batch 7.2 schema deployment 36934471830: success.
 
@@ -238,4 +238,4 @@ Final recovery package:
 - tests/batch7_scale.py
 
 Resume instruction for any later chat:
-"Read docs/UPGRADE_CHECKPOINT.md first. MS007 Batch 0-7 hardening is complete unless the final deploy record says otherwise. Preserve production D1/customer data and continue only from the first failed verification step."
+"Read docs/UPGRADE_CHECKPOINT.md first. MS007 Batch 0-7 hardening is complete and the final quality/deploy verification succeeded. Preserve production D1/customer data; only start new work after checking the current main commit and workflow status."
