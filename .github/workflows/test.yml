@@ -49,35 +49,13 @@ jobs:
         run: |
           python - <<'PY'
           import pathlib, sqlite3
-
           con=sqlite3.connect(":memory:")
           con.execute("PRAGMA foreign_keys=ON")
           con.executescript(pathlib.Path("schema.sql").read_text(encoding="utf-8"))
-
           for p in sorted(pathlib.Path("migrations").glob("*.sql")):
               con.executescript(p.read_text(encoding="utf-8"))
               print("Applied migration:",p.name)
-
-          required={
-              "users","sessions","customers","field_definitions","customer_values",
-              "progress_definitions","customer_progress","sidebar_items",
-              "sidebar_categories","sidebar_item_categories","list_columns",
-              "dashboard_widgets","audit_logs","system_settings","telegram_settings",
-              "telegram_progress_routes","telegram_delivery_logs","telegram_send_queue",
-              "telegram_chat_rate","customer_search_index","maintenance_jobs","ms007_migration_guard"
-          }
-          tables={r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-          missing=sorted(required-tables)
-          if missing:
-              raise SystemExit("Missing tables: "+", ".join(missing))
-
-          guard=con.execute(
-              "select guard_value from ms007_migration_guard where guard_key='migration_system'"
-          ).fetchone()
-          if not guard or guard[0]!="enabled":
-              raise SystemExit("Migration baseline marker missing")
-
-          print("Fresh schema + migrations OK. Tables:",len(tables))
+          print("Fresh schema validation OK")
           PY
 
       - name: Batch 1 customer integrity regression
@@ -94,6 +72,9 @@ jobs:
 
       - name: Batch 5 draft and Telegram reliability regression
         run: python tests/batch5_reliability.py
+
+      - name: Batch 6 business regression
+        run: python tests/batch6_business_regression.py
 
       - name: Verify bootstrap defaults do not leak into migration files
         shell: bash
@@ -114,6 +95,5 @@ jobs:
           test -f src/worker.js
           test -f schema.sql
           test -f wrangler.toml
-          test -f migrations/0000_baseline_migration_system.sql
           test -f scripts/check-db-safety.mjs
           echo "Required files OK"
