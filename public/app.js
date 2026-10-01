@@ -487,17 +487,61 @@ async function openCustomerEditor(id=null){
     const fields=layout.fields||[];
     const fieldMap=new Map(fields.map(x=>[x.id,x]));
     const sections=(layout.sections||[]).map(s=>registrationSectionHtml(s,fieldMap,customer)).join("");
+    const progressSection=id&&customer?`
+      <section class="form-section customer-progress-editor">
+        <div class="form-section-head progress-editor-head">
+          <div>
+            <h3>客户进度</h3>
+            <p>勾选表示已完成；取消勾选表示改回未完成。只有点击“保存修改”后才会真正生效。</p>
+          </div>
+          <div class="progress-editor-summary">
+            <strong id="editProgressPercent">${Number(customer.progressPercent||0)}%</strong>
+            <span id="editProgressFraction">${Number(customer.progressDone||0)}/${Number(customer.progressTotal||0)}</span>
+          </div>
+        </div>
+        <div class="progress-check-grid">
+          ${(customer.progress||[]).map(p=>`
+            <label class="progress-check-item">
+              <input type="checkbox"
+                class="customer-progress-check"
+                data-progress-id="${esc(p.id)}"
+                data-original="${p.completed?"1":"0"}"
+                ${p.completed?"checked":""}>
+              <span class="progress-check-mark"></span>
+              <span class="progress-check-content">
+                <strong><i style="background:${esc(p.color||"#94a3b8")}"></i>${esc(p.label)}</strong>
+                ${p.description?`<small>${esc(p.description)}</small>`:""}
+              </span>
+            </label>`).join("")||'<div class="muted">管理员还没有设置客户进度。</div>'}
+        </div>
+      </section>`:"";
 
     openDrawer(id?"编辑客户":"登记客户",`
       <form id="customerDrawerForm">
         ${state.user.role==="admin"?`<section class="form-section"><div class="form-section-head"><h3>负责人</h3></div><div class="form-grid"><div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${sales.map(x=>`<option value="${esc(x.id)}" ${customer?.ownerId===x.id?"selected":""}>${esc(x.display_name)}</option>`).join("")}</select></div></div></section>`:""}
         ${sections}
+        ${progressSection}
         <div class="drawer-actions">
           <button class="btn" type="submit">${id?"保存修改":"保存客户"}</button>
           <button class="btn ghost" type="button" id="drawerCancel">取消</button>
         </div>
       </form>`,()=>{
         document.querySelector("#drawerCancel").onclick=requestCloseDrawer;
+
+        const progressChecks=[...document.querySelectorAll(".customer-progress-check")];
+        const updateProgressSummary=()=>{
+          if(!progressChecks.length)return;
+          const done=progressChecks.filter(x=>x.checked).length;
+          const total=progressChecks.length;
+          const percent=total?Math.round(done*100/total):0;
+          const pct=document.querySelector("#editProgressPercent");
+          const fraction=document.querySelector("#editProgressFraction");
+          if(pct)pct.textContent=percent+"%";
+          if(fraction)fraction.textContent=done+"/"+total;
+        };
+        progressChecks.forEach(x=>x.addEventListener("change",updateProgressSummary));
+        updateProgressSummary();
+
         document.querySelector("#customerDrawerForm").onsubmit=async e=>{
           e.preventDefault();
           const form=e.currentTarget;
@@ -507,13 +551,33 @@ async function openCustomerEditor(id=null){
           if(!name){toast("请输入客户姓名");return}
           const body={name,values};
           if(state.user.role==="admin") body.assignedUserId=form.querySelector('[name="owner"]')?.value||null;
+
+          const changedProgress=progressChecks
+            .filter(x=>(x.dataset.original==="1")!==x.checked)
+            .map(x=>({id:x.dataset.progressId,completed:x.checked}));
+
+          const saveBtn=form.querySelector('button[type="submit"]');
+          if(saveBtn){saveBtn.disabled=true;saveBtn.textContent=id?"正在保存...":"正在登记..."}
+
           try{
-            if(id) await api("/api/customers/"+encodeURIComponent(id),{method:"PATCH",body});
-            else await api("/api/customers",{method:"POST",body});
+            if(id){
+              await api("/api/customers/"+encodeURIComponent(id),{method:"PATCH",body});
+              for(const p of changedProgress){
+                await api("/api/customers/"+encodeURIComponent(id)+"/progress/"+encodeURIComponent(p.id),{
+                  method:"PUT",
+                  body:{completed:p.completed}
+                });
+              }
+            }else{
+              await api("/api/customers",{method:"POST",body});
+            }
             closeDrawer();
-            toast(id?"客户资料已保存":"客户已登记");
+            toast(id?(changedProgress.length?"客户资料和进度已保存":"客户资料已保存"):"客户已登记");
             if(document.querySelector("#customerResults")) await loadCustomerPage(true);
-          }catch(err){toast(err.message)}
+          }catch(err){
+            toast(err.message);
+            if(saveBtn){saveBtn.disabled=false;saveBtn.textContent=id?"保存修改":"保存客户"}
+          }
         };
       },{draftKey:`customer:${id||"new"}:${state.user.id}`});
   }catch(err){toast(err.message)}
