@@ -1182,71 +1182,199 @@ function progressModal(view,p,nextSort=1,insert=null){
 
 async function renderSidebarAdmin(view){
   const r=await api("/api/admin/sidebar");
-  const items=r.items||[];
+  const data={
+    items:r.items||[],
+    categories:r.categories||[],
+    mappings:r.mappings||[]
+  };
 
-  const sectionItems=(audience)=>items
+  const categoriesFor=(audience)=>data.categories
+    .filter(x=>x.audience===audience)
+    .slice()
+    .sort((a,b)=>(Number(a.sort_order)||0)-(Number(b.sort_order)||0)||String(a.label||"").localeCompare(String(b.label||"")));
+
+  const categoryIdFor=(itemId,audience)=>{
+    return data.mappings.find(x=>x.item_id===itemId&&x.audience===audience)?.category_id||"";
+  };
+
+  const sectionItems=(audience)=>data.items
     .filter(x=>x.audience===audience || x.audience==="all")
     .slice()
     .sort((a,b)=>(Number(a.sort_order)||0)-(Number(b.sort_order)||0)||String(a.label||"").localeCompare(String(b.label||"")));
 
+  const renderRows=(rows,audience,categoryId="")=>rows.length?rows.map(x=>`
+    <div class="setting-row" draggable="true"
+      data-side-id="${esc(x.id)}"
+      data-audience="${esc(x.audience)}"
+      data-side-section="${audience}"
+      data-side-category="${esc(categoryId)}">
+      <div class="drag">⋮⋮</div>
+      <div>
+        <strong>${esc(x.label)}</strong>
+        <div class="muted" style="font-size:12px">${esc(x.url)}</div>
+      </div>
+      <div><span class="tag">排序：${Number(x.sort_order)||0}</span></div>
+      <div><span class="tag">${x.audience==="all"?"管理员和业务员":x.audience==="admin"?"管理员":"业务员"}</span></div>
+      <div>${x.enabled?"启用":"停用"}</div>
+      <div>
+        <button class="btn ghost small" data-side-edit="${esc(x.id)}">编辑</button>
+        <button class="btn danger small" data-side-del="${esc(x.id)}">删除</button>
+      </div>
+    </div>`).join(""):'<div class="muted" style="padding:12px 4px">这个分类目前没有按钮。</div>';
+
+  const renderCategoryCard=(category,audience)=>{
+    const rows=sectionItems(audience).filter(x=>categoryIdFor(x.id,audience)===category.id);
+    return `
+      <div class="sidebar-category-card" data-sidebar-category-card="${esc(category.id)}">
+        <div class="sidebar-category-head">
+          <div>
+            <div class="sidebar-category-title">${esc(category.label)}</div>
+            <div class="muted" style="font-size:12px">分类排序：${Number(category.sort_order)||0} · ${rows.length} 个按钮</div>
+          </div>
+          <div class="row wrap">
+            <button class="btn secondary small" data-add-side-in-category="${esc(category.id)}" data-category-audience="${audience}">＋ 添加按钮</button>
+            <button class="btn ghost small" data-edit-side-category="${esc(category.id)}">编辑分类</button>
+            <button class="btn danger small" data-delete-side-category="${esc(category.id)}">删除分类</button>
+          </div>
+        </div>
+        <div class="settings-list">
+          ${renderRows(rows,audience,category.id)}
+        </div>
+      </div>`;
+  };
+
   const renderSection=(audience,title,description)=>{
-    const rows=sectionItems(audience);
+    const cats=categoriesFor(audience);
+    const uncategorized=sectionItems(audience).filter(x=>!categoryIdFor(x.id,audience));
     return `
       <section class="card sidebar-admin-section" style="margin-bottom:18px">
-        <div class="row wrap" style="justify-content:space-between;align-items:center;margin-bottom:12px">
+        <div class="row wrap sidebar-area-head">
           <div>
             <h3 style="margin:0 0 4px">${esc(title)}</h3>
             <div class="muted" style="font-size:12px">${esc(description)}</div>
           </div>
-          <button class="btn" data-add-side="${audience}">＋ 添加按钮</button>
+          <div class="row wrap">
+            <button class="btn secondary" data-add-side-category="${audience}">＋ 新建分类</button>
+            <button class="btn" data-add-side="${audience}">＋ 添加按钮</button>
+          </div>
         </div>
-        <div class="settings-list">
-          ${rows.length?rows.map(x=>`
-            <div class="setting-row" draggable="true" data-side-id="${esc(x.id)}" data-audience="${esc(x.audience)}" data-side-section="${audience}">
-              <div class="drag">⋮⋮</div>
+
+        ${uncategorized.length?`
+          <div class="sidebar-category-card uncategorized">
+            <div class="sidebar-category-head">
               <div>
-                <strong>${esc(x.label)}</strong>
-                <div class="muted" style="font-size:12px">${esc(x.url)}</div>
+                <div class="sidebar-category-title">未分类</div>
+                <div class="muted" style="font-size:12px">没有放入分类的按钮会显示在这里。</div>
               </div>
-              <div><span class="tag">排序：${Number(x.sort_order)||0}</span></div>
-              <div><span class="tag">${x.audience==="all"?"管理员和业务员":x.audience==="admin"?"管理员":"业务员"}</span></div>
-              <div>${x.enabled?"启用":"停用"}</div>
-              <div>
-                <button class="btn ghost small" data-side-edit="${esc(x.id)}">编辑</button>
-                <button class="btn danger small" data-side-del="${esc(x.id)}">删除</button>
-              </div>
-            </div>`).join(""):'<div class="muted" style="padding:14px 4px">这个区域目前没有左侧栏按钮。</div>'}
+              <button class="btn secondary small" data-add-side="${audience}">＋ 添加按钮</button>
+            </div>
+            <div class="settings-list">${renderRows(uncategorized,audience,"")}</div>
+          </div>`:""}
+
+        <div class="sidebar-category-list">
+          ${cats.map(cat=>renderCategoryCard(cat,audience)).join("")}
         </div>
+        ${!cats.length&&!uncategorized.length?'<div class="muted" style="padding:12px 2px">这个区域目前没有分类和按钮。</div>':""}
       </section>`;
   };
 
   view.innerHTML=pageHead(
     "左侧栏管理",
-    "管理员左侧栏和业务员左侧栏分开管理；保存后在线用户会自动同步。"
+    "管理员和业务员分开管理；每个区域都可以新建分类，再把按钮放进对应分类。"
   )+
-    `<div class="notice" style="margin-bottom:14px">当前侧栏配置版本：<strong>${r.version}</strong>。每一项现在都会显示实际排序数字；新增按钮默认使用当前区域最大排序数字 +1。</div>
-    ${renderSection("admin","管理员左侧栏","这里只管理管理员登录后看到的左侧栏。")}
-    ${renderSection("sales","业务员左侧栏","这里只管理业务员登录后看到的左侧栏。")}`;
+    `<div class="notice" style="margin-bottom:14px">当前侧栏配置版本：<strong>${r.version}</strong>。分类和按钮都会显示实际排序数字；新建时默认使用当前区域最大排序数字 +1。</div>
+    ${renderSection("admin","管理员左侧栏","管理员登录后看到的分类和按钮。")}
+    ${renderSection("sales","业务员左侧栏","业务员登录后看到的分类和按钮。")}`;
+
+  document.querySelectorAll("[data-add-side-category]").forEach(b=>{
+    b.onclick=()=>sidebarCategoryModal(view,null,data,b.dataset.addSideCategory);
+  });
+
+  document.querySelectorAll("[data-edit-side-category]").forEach(b=>{
+    const cat=data.categories.find(x=>x.id===b.dataset.editSideCategory);
+    if(cat)b.onclick=()=>sidebarCategoryModal(view,cat,data,cat.audience);
+  });
+
+  document.querySelectorAll("[data-delete-side-category]").forEach(b=>b.onclick=async()=>{
+    const cat=data.categories.find(x=>x.id===b.dataset.deleteSideCategory);
+    if(!cat)return;
+    if(!await uiConfirm(
+      `确认删除分类「${cat.label}」？\n\n只有分类里没有按钮时才能删除。`,
+      {title:"删除左侧栏分类",confirmText:"删除分类",danger:true}
+    ))return;
+    try{
+      await api("/api/admin/sidebar-categories/"+encodeURIComponent(cat.id),{method:"DELETE"});
+      toast("分类已删除");
+      await refreshSidebar(true);
+      renderSidebarAdmin(view);
+    }catch(e){toast(e.message)}
+  });
 
   document.querySelectorAll("[data-add-side]").forEach(b=>{
-    b.onclick=()=>sidebarModal(view,null,items,b.dataset.addSide);
+    b.onclick=()=>sidebarModal(view,null,data,b.dataset.addSide,"");
+  });
+
+  document.querySelectorAll("[data-add-side-in-category]").forEach(b=>{
+    b.onclick=()=>sidebarModal(view,null,data,b.dataset.categoryAudience,b.dataset.addSideInCategory);
   });
 
   document.querySelectorAll("[data-side-edit]").forEach(b=>b.onclick=()=>{
-    sidebarModal(view,items.find(x=>x.id===b.dataset.sideEdit),items);
+    sidebarModal(view,data.items.find(x=>x.id===b.dataset.sideEdit),data);
   });
 
   document.querySelectorAll("[data-side-del]").forEach(b=>b.onclick=async()=>{
     if(!await uiConfirm("确认删除这个侧栏按钮？",{title:"删除侧栏按钮",confirmText:"删除",danger:true}))return;
     try{
       await api("/api/admin/sidebar/"+b.dataset.sideDel,{method:"DELETE"});
-      toast("侧栏按钮已删除并同步");
+      toast("左侧栏按钮已删除并同步");
       await refreshSidebar(true);
       renderSidebarAdmin(view);
     }catch(e){toast(e.message)}
   });
 
-  enableSidebarDrag(view,items);
+  enableSidebarDrag(view,data);
+}
+
+function sidebarCategoryNextSort(categories,audience){
+  return categories
+    .filter(x=>x.audience===audience)
+    .reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0)+1;
+}
+
+function sidebarCategoryModal(view,category,data,audience){
+  const nextSort=category?.sort_order??sidebarCategoryNextSort(data.categories,audience);
+  openModal(category?"编辑分类":"新建分类",`
+    <div class="field">
+      <label>所属区域</label>
+      <input class="input" value="${audience==="admin"?"管理员左侧栏":"业务员左侧栏"}" disabled>
+    </div>
+    <div class="field">
+      <label>分类名称</label>
+      <input class="input" id="scLabel" value="${esc(category?.label||"")}" placeholder="例如：管理、系统、通知">
+    </div>
+    <div class="field">
+      <label>分类排序数字</label>
+      <input class="input" type="number" id="scSort" value="${nextSort}">
+      <div class="muted" style="font-size:12px;margin-top:5px">${category?"当前分类的排序数字。":"已自动取这个区域当前最大分类排序数字 +1。"}</div>
+    </div>
+    <button class="btn full" id="scSave">保存分类</button>
+  `,()=>{
+    document.querySelector("#scSave").onclick=async()=>{
+      const body={
+        audience,
+        label:val("scLabel"),
+        sortOrder:Number(val("scSort")||sidebarCategoryNextSort(data.categories,audience))
+      };
+      try{
+        if(category)await api("/api/admin/sidebar-categories/"+encodeURIComponent(category.id),{method:"PATCH",body});
+        else await api("/api/admin/sidebar-categories",{method:"POST",body});
+        closeModal();
+        toast(category?"分类设置已保存":"分类已创建");
+        await refreshSidebar(true);
+        renderSidebarAdmin(view);
+      }catch(e){toast(e.message)}
+    };
+  },{draftKey:`sidebar-category:${category?.id||("new:"+audience)}`});
 }
 
 function sidebarNextSort(items,audience){
@@ -1256,9 +1384,25 @@ function sidebarNextSort(items,audience){
   return relevant.reduce((m,x)=>Math.max(m,Number(x.sort_order)||0),0)+1;
 }
 
-function sidebarModal(view,x,items=[],defaultAudience="sales"){
+function sidebarModal(view,x,data={items:[],categories:[],mappings:[]},defaultAudience="sales",defaultCategoryId=""){
+  const items=data.items||[];
+  const categories=data.categories||[];
+  const mappings=data.mappings||[];
   const initialAudience=x?.audience||defaultAudience;
   const initialSort=x?.sort_order??sidebarNextSort(items,initialAudience);
+
+  const mappedCategory=(audience)=>{
+    if(!x)return defaultAudience===audience?defaultCategoryId:"";
+    return mappings.find(m=>m.item_id===x.id&&m.audience===audience)?.category_id||"";
+  };
+
+  const categoryOptions=(audience,selected)=>{
+    const cats=categories
+      .filter(c=>c.audience===audience)
+      .slice()
+      .sort((a,b)=>(Number(a.sort_order)||0)-(Number(b.sort_order)||0)||String(a.label||"").localeCompare(String(b.label||"")));
+    return '<option value="">未分类</option>'+cats.map(c=>`<option value="${esc(c.id)}" ${c.id===selected?"selected":""}>${esc(c.label)}（排序 ${Number(c.sort_order)||0}）</option>`).join("");
+  };
 
   openModal(x?"编辑左侧栏按钮":"添加左侧栏按钮",`
     <div class="field"><label>按钮名称</label><input class="input" id="sLabel" value="${esc(x?.label||"")}"></div>
@@ -1267,30 +1411,63 @@ function sidebarModal(view,x,items=[],defaultAudience="sales"){
       <option value="sales" ${initialAudience==="sales"?"selected":""}>业务员</option>
       <option value="all" ${initialAudience==="all"?"selected":""}>管理员和业务员</option>
     </select></div>
+    <div id="sCategoryFields"></div>
     <div class="field"><label>跳转链接</label><input class="input" id="sUrl" value="${esc(x?.url||"https://")}"></div>
     <div class="field"><label>图标文字/图标代号</label><input class="input" id="sIcon" value="${esc(x?.icon||"link")}"></div>
-    <div class="field"><label>分组标题</label><input class="input" id="sGroup" value="${esc(x?.group_label||"")}"></div>
     <div class="field"><label>打开方式</label><select class="input" id="sTarget"><option value="same" ${x?.target!=="new"?"selected":""}>当前页面</option><option value="new" ${x?.target==="new"?"selected":""}>新窗口</option></select></div>
-    <div class="field"><label>排序数字</label><input class="input" type="number" id="sSort" value="${initialSort}"><div class="muted" style="font-size:12px;margin-top:5px">${x?"当前保存的排序数字。":"已自动取当前区域最大排序数字 +1，你也可以手动修改。"}</div></div>
+    <div class="field"><label>按钮排序数字</label><input class="input" type="number" id="sSort" value="${initialSort}"><div class="muted" style="font-size:12px;margin-top:5px">${x?"当前保存的按钮排序数字。":"已自动取当前区域最大按钮排序数字 +1。"}</div></div>
     <label><input type="checkbox" id="sEnabled" ${x?.enabled!==0?"checked":""}> 启用</label>
     <button class="btn full" id="sSave" style="margin-top:16px">保存并同步</button>`,()=>{
-      if(!x){
-        document.querySelector("#sAudience").onchange=()=>{
-          document.querySelector("#sSort").value=sidebarNextSort(items,val("sAudience"));
-        };
-      }
+
+      const renderCategoryFields=(audience,reset=false)=>{
+        const box=document.querySelector("#sCategoryFields");
+        if(audience==="all"){
+          const adminSelected=reset?"":mappedCategory("admin");
+          const salesSelected=reset?"":mappedCategory("sales");
+          box.innerHTML=`
+            <div class="field"><label>管理员分类</label><select class="input" id="sAdminCategory">${categoryOptions("admin",adminSelected)}</select></div>
+            <div class="field"><label>业务员分类</label><select class="input" id="sSalesCategory">${categoryOptions("sales",salesSelected)}</select></div>
+            <div class="muted" style="font-size:12px;margin:-4px 0 12px">共用按钮可以分别放进管理员和业务员不同的分类。</div>
+          `;
+        }else{
+          const selected=reset?"":mappedCategory(audience);
+          box.innerHTML=`
+            <div class="field"><label>所属分类</label><select class="input" id="sSingleCategory">${categoryOptions(audience,selected)}</select></div>
+          `;
+        }
+      };
+
+      renderCategoryFields(initialAudience,false);
+
+      document.querySelector("#sAudience").onchange=()=>{
+        const audience=val("sAudience");
+        renderCategoryFields(audience,true);
+        if(!x)document.querySelector("#sSort").value=sidebarNextSort(items,audience);
+      };
 
       document.querySelector("#sSave").onclick=async()=>{
+        const audience=val("sAudience");
         const body={
           label:val("sLabel"),
-          audience:val("sAudience"),
+          audience,
           url:val("sUrl"),
           icon:val("sIcon"),
-          groupLabel:val("sGroup"),
           target:val("sTarget"),
-          sortOrder:Number(val("sSort")||sidebarNextSort(items,val("sAudience"))),
+          sortOrder:Number(val("sSort")||sidebarNextSort(items,audience)),
           enabled:checked("sEnabled")
         };
+
+        if(audience==="all"){
+          body.adminCategoryId=val("sAdminCategory");
+          body.salesCategoryId=val("sSalesCategory");
+        }else if(audience==="admin"){
+          body.adminCategoryId=val("sSingleCategory");
+          body.salesCategoryId="";
+        }else{
+          body.salesCategoryId=val("sSingleCategory");
+          body.adminCategoryId="";
+        }
+
         try{
           if(x)await api("/api/admin/sidebar/"+x.id,{method:"PATCH",body});
           else await api("/api/admin/sidebar",{method:"POST",body});
@@ -1300,35 +1477,47 @@ function sidebarModal(view,x,items=[],defaultAudience="sales"){
           renderSidebarAdmin(view);
         }catch(e){toast(e.message)}
       };
-    },{draftKey:`sidebar:${x?.id||("new:"+initialAudience)}`});
+    },{draftKey:`sidebar:${x?.id||("new:"+initialAudience+":"+defaultCategoryId)}`});
 }
 
-function enableSidebarDrag(view,items){
+function enableSidebarDrag(view,data){
+  const items=data.items||[];
+  const mappings=data.mappings||[];
+  const categoryIdFor=(itemId,audience)=>mappings.find(x=>x.item_id===itemId&&x.audience===audience)?.category_id||"";
   let dragId=null;
   let dragSection=null;
+  let dragCategory="";
 
   document.querySelectorAll("[data-side-id]").forEach(row=>{
     row.addEventListener("dragstart",()=>{
       dragId=row.dataset.sideId;
       dragSection=row.dataset.sideSection||row.dataset.audience;
+      dragCategory=row.dataset.sideCategory||"";
     });
     row.addEventListener("dragover",e=>e.preventDefault());
     row.addEventListener("drop",async e=>{
       e.preventDefault();
       const targetId=row.dataset.sideId;
       const targetSection=row.dataset.sideSection||row.dataset.audience;
+      const targetCategory=row.dataset.sideCategory||"";
       if(!dragId||dragId===targetId)return;
-      if(dragSection!==targetSection){toast("请在同一个区域内排序");return;}
-
-      const a=items.find(x=>x.id===dragId);
-      const b=items.find(x=>x.id===targetId);
-      if(!a||!b){return;}
-      if(a.audience!==b.audience){
-        toast("“管理员和业务员”共用按钮不能和单独按钮直接拖动混排，请编辑排序数字调整。");
+      if(dragSection!==targetSection||dragCategory!==targetCategory){
+        toast("拖动只能调整同一分类内的按钮顺序；移动分类请点“编辑”。");
         return;
       }
 
-      const subset=items.filter(x=>x.audience===a.audience).sort((x,y)=>x.sort_order-y.sort_order);
+      const a=items.find(x=>x.id===dragId);
+      const b=items.find(x=>x.id===targetId);
+      if(!a||!b)return;
+      if(a.audience!==b.audience){
+        toast("共用按钮和单独按钮请通过排序数字调整。");
+        return;
+      }
+
+      const subset=items
+        .filter(x=>x.audience===a.audience)
+        .filter(x=>categoryIdFor(x.id,targetSection)===targetCategory)
+        .sort((x,y)=>(Number(x.sort_order)||0)-(Number(y.sort_order)||0));
       const from=subset.findIndex(x=>x.id===dragId);
       const to=subset.findIndex(x=>x.id===targetId);
       if(from<0||to<0)return;
@@ -1340,7 +1529,7 @@ function enableSidebarDrag(view,items){
         for(let i=0;i<subset.length;i++){
           await api("/api/admin/sidebar/"+subset[i].id,{method:"PATCH",body:{sortOrder:(i+1)*10}});
         }
-        toast("排序已同步");
+        toast("按钮排序已同步");
         await refreshSidebar(true);
         renderSidebarAdmin(view);
       }catch(err){toast(err.message)}
@@ -2147,7 +2336,7 @@ async function renderBackup(view){
     if(backup?.format!=="MS007-BUSINESS-BACKUP"||!backup?.data){toast("这不是 MS007 业务备份文件");return}
     if(!await uiConfirm("确认开始恢复这份备份？\n\n同 ID 数据会按备份内容覆盖。",{title:"恢复业务数据",confirmText:"开始恢复",danger:true}))return;
 
-    const order=["users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress","sidebarItems","listColumns","dashboardWidgets","systemSettings"];
+    const order=["users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress","sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets","systemSettings"];
     const total=order.reduce((n,k)=>n+(Array.isArray(backup.data[k])?backup.data[k].length:0),0);
     let done=0;const progress=document.querySelector("#restoreProgress");
     try{
