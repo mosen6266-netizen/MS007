@@ -1,22 +1,32 @@
 {
   "batch": "Batch 7",
-  "step": "2",
-  "title": "Statistics cache design",
-  "purpose": "Reduce full table scans for customer and salesperson statistics.",
+  "step": "7.2",
+  "title": "Dashboard statistics cache",
+  "status": "implemented",
+  "purpose": "Reduce repeated full-table aggregate scans when administrators or salespeople reopen the dashboard.",
+  "implementation": {
+    "table": "dashboard_statistics_cache",
+    "migration": "migrations/0005_batch7_statistics_cache.sql",
+    "baseline_schema": true,
+    "cache_targets": [
+      "/api/stats-bundle",
+      "/api/stats"
+    ],
+    "invalidation": [
+      "customer create/update/atomic save",
+      "progress toggle",
+      "customer soft delete/restore",
+      "sales account create/update",
+      "progress definition create/update/disable/permanent delete",
+      "backup import chunks/finalization",
+      "background progress recalculation batches"
+    ],
+    "fallback": "If the cache table is unavailable or a cache read fails, authoritative statistics queries still run."
+  },
   "protection": {
     "customer_data_modified": false,
-    "schema_migration_required": false,
-    "production_records_touched": false
-  },
-  "planned_changes": [
-    "incremental customer counters",
-    "salesperson statistics cache",
-    "archive status counters",
-    "safe invalidation on customer changes"
-  ],
-  "validation": [
-    "customer records remain unchanged",
-    "existing configuration remains unchanged",
-    "statistics can be rebuilt if cache is lost"
-  ]
+    "customer_progress_source_of_truth_modified": false,
+    "existing_settings_modified": false,
+    "derived_cache_rebuildable": true
+  }
 }
