@@ -209,6 +209,10 @@ function telegramBuiltInTemplateVariables(){
   ];
 }
 
+function telegramStableFieldToken(fieldId){
+  return "{{字段:"+String(fieldId||"")+"}}";
+}
+
 async function telegramTemplateVariables(env){
   const fields=await env.DB.prepare(
     "SELECT id,label FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
@@ -216,12 +220,35 @@ async function telegramTemplateVariables(env){
   return [
     ...telegramBuiltInTemplateVariables(),
     ...(fields.results||[]).map(x=>({
-      token:"{{"+String(x.label||"登记字段")+"}}",
+      token:telegramStableFieldToken(x.id),
+      legacyToken:"{{"+String(x.label||"登记字段")+"}}",
       key:"field:"+x.id,
       fieldId:x.id,
       label:String(x.label||"登记字段")
     }))
   ];
+}
+
+async function normalizeTelegramTemplateTokens(env,template=null){
+  const current=template===null
+    ?await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate())
+    :String(template||defaultTelegramTemplate());
+  const fields=await env.DB.prepare(
+    "SELECT id,label FROM field_definitions ORDER BY sort_order,label"
+  ).all();
+  let normalized=String(current||defaultTelegramTemplate());
+  for(const field of fields.results||[]){
+    const legacy="{{"+String(field.label||"登记字段")+"}}";
+    normalized=replaceAllLiteral(normalized,legacy,telegramStableFieldToken(field.id));
+  }
+  if(template===null && normalized!==current){
+    await env.DB.prepare(
+      `INSERT INTO system_settings(setting_key,value_json,updated_at)
+       VALUES('telegram_message_template',?,?)
+       ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
+    ).bind(JSON.stringify(normalized),now()).run();
+  }
+  return normalized;
 }
 
 function replaceAllLiteral(source,needle,replacement){
@@ -232,7 +259,9 @@ function renderTelegramTemplate(template,variables,detailUrl,linkLabel){
   let out=telegramHtmlEscape(String(template||defaultTelegramTemplate()));
   for(const item of variables||[]){
     if(!item?.token||item.key==="detail_link")continue;
-    out=replaceAllLiteral(out,item.token,telegramHtmlEscape(String(item.value??"")));
+    const replacement=telegramHtmlEscape(String(item.value??""));
+    out=replaceAllLiteral(out,item.token,replacement);
+    if(item.legacyToken)out=replaceAllLiteral(out,item.legacyToken,replacement);
   }
   const link='<a href="'+telegramHtmlEscape(detailUrl)+'">'+telegramHtmlEscape(linkLabel||"查看客户详情")+"</a>";
   out=replaceAllLiteral(out,"{{查看客户详情}}",link);
@@ -551,6 +580,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
 
 async function telegramAdminGet(env){
   const row=await telegramSettingsRow(env);
+  const normalizedTemplate=await normalizeTelegramTemplateTokens(env);
   let fields=defaultTelegramFields();
   try{
     const parsed=JSON.parse(row.fields_json||"[]");
@@ -567,7 +597,7 @@ async function telegramAdminGet(env){
     ).all(),
     telegramTemplateVariables(env)
   ]);
-  const messageTemplate=await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
+  const messageTemplate=normalizedTemplate;
   return responseJson({
     ok:true,
     settings:{
@@ -1712,6 +1742,18 @@ async function hardDeleteField(env,user,id){
   await env.DB.prepare("DELETE FROM field_definitions WHERE id=?").bind(id).run();
   await audit(env,user,"delete_permanent","field",id,{label:field.label,deletedCustomerValues:valueCount});
   return responseJson({ok:true,deletedCustomerValues:valueCount,label:field.label});
+}
+
+async function dashboardWidgetsForProgress(env,progressId){
+  const r=await env.DB.prepare(
+    "SELECT id,audience,title,enabled,config_json FROM dashboard_widgets WHERE widget_type='metric_progress'"
+  ).all();
+  const matches=[];
+  for(const row of r.results||[]){
+    let cfg={};try{cfg=JSON.parse(row.config_json||"{}")}catch{}
+    if(String(cfg?.progressId||"")===String(progressId))matches.push(row);
+  }
+  return matches;
 }
 
 async function hardDeleteProgressDef(env,user,id){
