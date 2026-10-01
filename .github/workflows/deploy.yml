@@ -43,6 +43,9 @@ jobs:
       - name: Database safety gate
         run: node scripts/check-db-safety.mjs
 
+      - name: Check duplicate function declarations
+        run: node scripts/check-duplicate-functions.mjs
+
       - name: Validate fresh database and migrations
         shell: bash
         run: |
