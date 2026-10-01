@@ -1492,7 +1492,7 @@ async function saveCustomerAtomic(request,env,user,id,ctx){
   for(const [pid,completed] of uniqueProgress.entries()){
     statements.push(env.DB.prepare(
       `INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
-       SELECT ?,?,?,?,?,?
+       SELECT ?,?,?,?,?
        WHERE EXISTS(SELECT 1 FROM customers WHERE id=? AND edit_version=?)
        ON CONFLICT(customer_id,progress_id) DO UPDATE SET
          completed=excluded.completed,
