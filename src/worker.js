@@ -751,6 +751,17 @@ async function telegramRetryableFailureItems(env,limit=500){
   return r.results||[];
 }
 
+async function telegramUnresolvedAdminGet(env){
+  const [unresolved,retryableProbe]=await Promise.all([
+    telegramUnresolvedItems(env,200),
+    telegramRetryableFailureItems(env,1)
+  ]);
+  return {
+    ...unresolved,
+    hasRetryableFailures:retryableProbe.length>0
+  };
+}
+
 async function telegramQueueMonitor(env){
   const cutoff=new Date(Date.now()-24*60*60*1000).toISOString();
   const [queue,delivery]=await Promise.all([
@@ -1008,7 +1019,7 @@ async function telegramAdminGet(env){
     const parsed=JSON.parse(row.fields_json||"[]");
     if(Array.isArray(parsed))fields=parsed;
   }catch{}
-  const [availableFields,logs,progressDefs,routes,templateVariables,queueMonitor,unresolved]=await Promise.all([
+  const [availableFields,logs,progressDefs,routes,templateVariables,queueMonitor,unresolved,retryableProbe]=await Promise.all([
     telegramAvailableFields(env),
     telegramRecentActivity(env,20).then(results=>({results})),
     env.DB.prepare(
@@ -1019,7 +1030,8 @@ async function telegramAdminGet(env){
     ).all(),
     telegramTemplateVariables(env),
     telegramQueueMonitor(env),
-    telegramUnresolvedItems(env,200)
+    telegramUnresolvedItems(env,200),
+    telegramRetryableFailureItems(env,1)
   ]);
   const messageTemplate=normalizedTemplate;
   return responseJson({
@@ -1039,7 +1051,7 @@ async function telegramAdminGet(env){
     progressDefs:progressDefs.results||[],
     routes:routes.results||[],
     queueMonitor,
-    unresolved,
+    unresolved:{...unresolved,hasRetryableFailures:retryableProbe.length>0},
     logs:logs.results||[]
   });
 }
@@ -4563,7 +4575,7 @@ async function api(request, env, ctx) {
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
   if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
-  if (path === "/api/admin/telegram/unresolved" && method === "GET") return responseJson({ok:true,...await telegramUnresolvedItems(env,200)});
+  if (path === "/api/admin/telegram/unresolved" && method === "GET") return responseJson({ok:true,...await telegramUnresolvedAdminGet(env)});
   if (path === "/api/admin/telegram/retry-failed-batch" && method === "POST") return retryFailedTelegramBatch(request,env,user,ctx);
   if (path === "/api/admin/telegram/logs" && method === "GET") return telegramLogs(request,env);
   m=path.match(/^\/api\/admin\/telegram\/queue\/([^/]+)\/retry$/);
