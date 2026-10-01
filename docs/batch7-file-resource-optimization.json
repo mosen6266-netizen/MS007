@@ -1,0 +1,21 @@
+{
+  "batch": "Batch 7",
+  "step": "Step 3",
+  "name": "File Resource Optimization",
+  "data_protection": {
+    "customer_data_modified": false,
+    "schema_migration_required": false,
+    "production_records_touched": false
+  },
+  "targets": [
+    "Move large workflow images away from embedded base64 bundles",
+    "Keep attachments referenced by resource URLs",
+    "Reduce initial loading payload",
+    "Prepare scalable asset management"
+  ],
+  "scope": [
+    "workflow images",
+    "attachments",
+    "static resources"
+  ]
+}
