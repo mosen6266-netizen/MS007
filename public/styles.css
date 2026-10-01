@@ -86,3 +86,15 @@ textarea.input{min-height:100px;resize:vertical}.row{display:flex;gap:10px;align
   .drawer-panel{width:100vw}.preview-summary{grid-template-columns:1fr 1fr}.preview-grid{grid-template-columns:1fr}
   .layout-section-toolbar{flex-direction:column}.layout-section-fields{grid-template-columns:1fr;width:100%}.layout-item{flex-wrap:wrap}
 }
+
+/* Select field option editor */
+.field-options-box{border:1px solid #dbe4f0;background:#f8fafc;border-radius:12px;padding:13px;margin:12px 0 14px}
+.field-options-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.field-options-list{display:grid;gap:8px}
+.field-option-row{display:grid;grid-template-columns:28px minmax(0,1fr) 42px 42px 58px;gap:7px;align-items:center}
+.empty-options{border:1px dashed #cbd5e1;border-radius:9px;padding:16px;text-align:center;color:var(--muted);font-size:13px}
+@media(max-width:620px){
+  .field-option-row{grid-template-columns:24px minmax(0,1fr) 38px 38px}
+  .field-option-row .danger{grid-column:2/-1}
+  .field-options-head{align-items:flex-start;flex-direction:column}
+}
