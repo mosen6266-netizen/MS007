@@ -841,31 +841,87 @@ async function renderCustomerDetail(view,id){
 }
 
 async function renderSales(view){
-  const r=await api("/api/admin/users");const items=r.items||[];
-  view.innerHTML=pageHead("业务员管理","业务员只能看到分配给自己的客户",`<button class="btn" id="addSales">＋ 添加业务员</button>`)+
+  const r=await api("/api/admin/users");
+  const items=r.items||[];
+
+  view.innerHTML=pageHead(
+    "业务员管理",
+    "业务员只能看到分配给自己的客户；管理员账号拥有管理员后台权限。",
+    `<div class="row wrap">
+      <button class="btn secondary" id="addAdmin">＋ 添加管理员</button>
+      <button class="btn" id="addSales">＋ 添加业务员</button>
+    </div>`
+  )+
     `<div class="table-wrap"><table><thead><tr><th>姓名</th><th>账号</th><th>角色</th><th>状态</th><th>创建时间</th><th>操作</th></tr></thead><tbody>
-    ${items.map(x=>`<tr><td>${esc(x.display_name)}</td><td>${esc(x.username)}</td><td>${x.role==="admin"?"管理员":"业务员"}</td><td><span class="tag">${x.active?"启用":"停用"}</span></td><td>${esc((x.created_at||"").slice(0,10))}</td><td>${x.role==="sales"?`<button class="btn ghost small" data-edit-user="${esc(x.id)}">设置</button>`:""}</td></tr>`).join("")}</tbody></table></div>`;
-  document.querySelector("#addSales").onclick=()=>openModal("添加业务员",`
-    <div class="field"><label>业务员姓名</label><input class="input" id="mName"></div>
-    <div class="field"><label>登录账号</label><input class="input" id="mUser"></div>
-    <div class="field"><label>初始密码（至少8位）</label><input class="input" type="password" id="mPass"></div>
-    <button class="btn full" id="mSave">创建业务员</button>`,()=>{
-      document.querySelector("#mSave").onclick=async()=>{try{await api("/api/admin/users",{method:"POST",body:{displayName:val("mName"),username:val("mUser"),password:val("mPass")}});closeModal();toast("业务员已创建");renderSales(view);}catch(e){toast(e.message)}};
-    },{draftKey:"sales-user:new"});
+    ${items.map(x=>`<tr>
+      <td>${esc(x.display_name)}</td>
+      <td>${esc(x.username)}</td>
+      <td>${x.role==="admin"?"管理员":"业务员"}</td>
+      <td><span class="tag">${x.active?"启用":"停用"}</span></td>
+      <td>${esc((x.created_at||"").slice(0,10))}</td>
+      <td><button class="btn ghost small" data-edit-user="${esc(x.id)}">设置</button></td>
+    </tr>`).join("")}</tbody></table></div>`;
+
+  const openCreateUser=(role)=>{
+    const isAdmin=role==="admin";
+    openModal(isAdmin?"添加管理员":"添加业务员",`
+      <div class="field"><label>${isAdmin?"管理员名称":"业务员姓名"}</label><input class="input" id="mName"></div>
+      <div class="field"><label>登录账号</label><input class="input" id="mUser"></div>
+      <div class="field"><label>初始密码（至少8位）</label><input class="input" type="password" id="mPass"></div>
+      ${isAdmin?'<div class="notice warning" style="margin:14px 0">管理员账号可以进入管理员后台并使用管理员功能，请只创建给需要管理员权限的人。</div>':""}
+      <button class="btn full" id="mSave">${isAdmin?"创建管理员":"创建业务员"}</button>
+    `,()=>{
+      document.querySelector("#mSave").onclick=async()=>{
+        try{
+          await api("/api/admin/users",{
+            method:"POST",
+            body:{
+              displayName:val("mName"),
+              username:val("mUser"),
+              password:val("mPass"),
+              role
+            }
+          });
+          closeModal();
+          toast(isAdmin?"管理员账号已创建":"业务员已创建");
+          renderSales(view);
+        }catch(e){toast(e.message)}
+      };
+    },{draftKey:`${role}-user:new`});
+  };
+
+  document.querySelector("#addAdmin").onclick=()=>openCreateUser("admin");
+  document.querySelector("#addSales").onclick=()=>openCreateUser("sales");
+
   document.querySelectorAll("[data-edit-user]").forEach(b=>b.onclick=()=>{
-    const u=items.find(x=>x.id===b.dataset.editUser); if(!u)return;
-    openModal("业务员账号设置",`
-      <div class="field"><label>业务员姓名</label><input class="input" id="euName" value="${esc(u.display_name)}"></div>
+    const u=items.find(x=>x.id===b.dataset.editUser);
+    if(!u)return;
+
+    const isAdmin=u.role==="admin";
+    const isSelf=u.id===state.user.id;
+    openModal(isAdmin?"管理员账号设置":"业务员账号设置",`
+      <div class="field"><label>${isAdmin?"管理员名称":"业务员姓名"}</label><input class="input" id="euName" value="${esc(u.display_name)}"></div>
       <div class="field"><label>登录账号</label><input class="input" value="${esc(u.username)}" disabled></div>
       <div class="field"><label>重新设置密码</label><input class="input" type="password" id="euPass" placeholder="不修改密码请留空"></div>
-      <label><input type="checkbox" id="euActive" ${u.active?"checked":""}> 启用这个业务员账号</label>
-      <div class="notice warning" style="margin:14px 0">修改密码后，这个业务员当前已经登录的会话会被退出，需要使用新密码重新登录。</div>
-      <button class="btn full" id="euSave">保存设置</button>`,()=>{
-        document.querySelector("#euSave").onclick=async()=>{try{
-          const body={displayName:val("euName"),active:checked("euActive")};if(val("euPass"))body.password=val("euPass");
-          await api("/api/admin/users/"+u.id,{method:"PATCH",body});closeModal();toast("业务员账号设置已保存");renderSales(view);
-        }catch(e){toast(e.message)}};
-      },{draftKey:`sales-user:${u.id}`});
+      <label><input type="checkbox" id="euActive" ${u.active?"checked":""} ${isSelf?"disabled":""}> 启用这个${isAdmin?"管理员":"业务员"}账号</label>
+      ${isSelf?'<div class="muted" style="font-size:12px;margin-top:6px">当前正在登录的管理员账号不能在这里停用。</div>':""}
+      <div class="notice warning" style="margin:14px 0">修改密码后，这个账号当前已经登录的会话会被退出，需要使用新密码重新登录。</div>
+      <button class="btn full" id="euSave">保存设置</button>
+    `,()=>{
+      document.querySelector("#euSave").onclick=async()=>{
+        try{
+          const body={
+            displayName:val("euName"),
+            active:isSelf?true:checked("euActive")
+          };
+          if(val("euPass"))body.password=val("euPass");
+          await api("/api/admin/users/"+u.id,{method:"PATCH",body});
+          closeModal();
+          toast(isAdmin?"管理员账号设置已保存":"业务员账号设置已保存");
+          renderSales(view);
+        }catch(e){toast(e.message)}
+      };
+    },{draftKey:`${u.role}-user:${u.id}`});
   });
 }
 
