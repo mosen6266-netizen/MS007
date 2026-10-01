@@ -272,7 +272,7 @@ async function telegramApiCall(token,method,payload){
   token=String(token||"").trim();
   if(!/^[0-9]+:[A-Za-z0-9_-]+$/.test(token)) throw new Error("Bot Token 格式不正确");
   const ctl=new AbortController();
-  const timer=setTimeout(()=>ctl.abort(),8000);
+  const timer=setTimeout(()=>ctl.abort(),15000);
   try{
     const res=await fetch("https://api.telegram.org/bot"+token+"/"+method,{
       method:"POST",
@@ -281,16 +281,243 @@ async function telegramApiCall(token,method,payload){
       signal:ctl.signal
     });
     const data=await res.json().catch(()=>({ok:false,description:"Telegram 返回了无法识别的内容"}));
-    if(!res.ok||!data.ok) throw new Error(data.description||("Telegram HTTP "+res.status));
+    if(!res.ok||!data.ok){
+      const err=new Error(data.description||("Telegram HTTP "+res.status));
+      err.httpStatus=Number(res.status||0);
+      err.telegramErrorCode=Number(data?.error_code||0);
+      err.retryAfter=Math.max(0,Number(data?.parameters?.retry_after||0));
+      throw err;
+    }
     return data;
   } finally {
     clearTimeout(timer);
   }
 }
-
 async function telegramValidateToken(token){
   const data=await telegramApiCall(token,"getMe",{});
   return data.result||{};
+}
+
+function telegramAfterSeconds(seconds){
+  return new Date(Date.now()+Math.max(0,Number(seconds)||0)*1000).toISOString();
+}
+
+function telegramRetryableError(error){
+  const status=Number(error?.httpStatus||0);
+  return Number(error?.retryAfter||0)>0 ||
+    status===429 ||
+    status>=500 ||
+    error?.name==="AbortError" ||
+    status===0;
+}
+
+function telegramRetryDelaySeconds(error,attempts){
+  const retryAfter=Math.max(0,Number(error?.retryAfter||0));
+  if(retryAfter>0)return Math.max(5,retryAfter+1);
+  const steps=[10,20,40,60,120,300,600,900];
+  return steps[Math.min(Math.max(0,Number(attempts)||0),steps.length-1)];
+}
+
+async function enqueueTelegramMessage(env,{
+  dedupeKey,customerId=null,actorUserId=null,progressId=null,chatId,messageText
+}){
+  const t=now();
+  const id=uid("tgq_");
+  const result=await env.DB.prepare(
+    `INSERT OR IGNORE INTO telegram_send_queue(
+      id,dedupe_key,customer_id,actor_user_id,progress_id,chat_id,message_text,
+      status,attempts,next_attempt_at,locked_until,last_error,created_at,updated_at
+     ) VALUES(?,?,?,?,?,?,?,'pending',0,?,NULL,'',?,?)`
+  ).bind(
+    id,String(dedupeKey),customerId,actorUserId,progressId,String(chatId),String(messageText),
+    t,t,t
+  ).run();
+  return {id,inserted:Number(result?.meta?.changes||0)>0};
+}
+
+async function acquireTelegramChatLease(env,chatId,seconds=4){
+  const current=now();
+  const nextAllowed=telegramAfterSeconds(seconds);
+  const result=await env.DB.prepare(
+    `INSERT INTO telegram_chat_rate(chat_id,next_allowed_at,updated_at)
+     VALUES(?,?,?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       next_allowed_at=excluded.next_allowed_at,
+       updated_at=excluded.updated_at
+     WHERE telegram_chat_rate.next_allowed_at<=?`
+  ).bind(String(chatId),nextAllowed,current,current).run();
+  return {acquired:Number(result?.meta?.changes||0)>0,nextAllowed};
+}
+
+async function extendTelegramChatLease(env,chatId,nextAllowedAt){
+  const t=now();
+  await env.DB.prepare(
+    `INSERT INTO telegram_chat_rate(chat_id,next_allowed_at,updated_at)
+     VALUES(?,?,?)
+     ON CONFLICT(chat_id) DO UPDATE SET
+       next_allowed_at=CASE
+         WHEN telegram_chat_rate.next_allowed_at<excluded.next_allowed_at THEN excluded.next_allowed_at
+         ELSE telegram_chat_rate.next_allowed_at
+       END,
+       updated_at=excluded.updated_at`
+  ).bind(String(chatId),String(nextAllowedAt),t).run();
+}
+
+async function telegramRecentActivity(env,limit=20){
+  const r=await env.DB.prepare(
+    `SELECT * FROM (
+       SELECT
+         l.id,l.status,l.error_text,l.created_at,
+         NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,
+         c.name customer_name,u.display_name actor_name,p.label progress_name
+       FROM telegram_delivery_logs l
+       LEFT JOIN customers c ON c.id=l.customer_id
+       LEFT JOIN users u ON u.id=l.actor_user_id
+       LEFT JOIN progress_definitions p ON p.id=l.progress_id
+
+       UNION ALL
+
+       SELECT
+         q.id,
+         CASE WHEN q.status='retry' THEN 'retry' ELSE 'pending' END AS status,
+         q.last_error AS error_text,
+         q.created_at,
+         q.chat_id,
+         q.next_attempt_at,
+         q.attempts,
+         c.name customer_name,u.display_name actor_name,p.label progress_name
+       FROM telegram_send_queue q
+       LEFT JOIN customers c ON c.id=q.customer_id
+       LEFT JOIN users u ON u.id=q.actor_user_id
+       LEFT JOIN progress_definitions p ON p.id=q.progress_id
+     ) activity
+     ORDER BY activity.created_at DESC,activity.id DESC
+     LIMIT ?`
+  ).bind(Math.max(1,Math.min(100,Number(limit)||20))).all();
+  return r.results||[];
+}
+
+async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWait=false}={}){
+  const started=Date.now();
+  let processed=0;
+
+  const settings=await telegramSettingsRow(env);
+  if(!settings?.enabled || !settings?.bot_token_enc)return {processed,reason:"disabled"};
+
+  let token="";
+  try{
+    token=await telegramDecryptSecret(env,settings.bot_token_enc);
+  }catch(e){
+    const retryAt=telegramAfterSeconds(300);
+    await env.DB.prepare(
+      `UPDATE telegram_send_queue
+       SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
+       WHERE status IN ('pending','retry','sending')`
+    ).bind(retryAt,"Token 无法解密，等待管理员重新保存 Token",now()).run();
+    return {processed,reason:"token"};
+  }
+
+  while(processed<maxItems && Date.now()-started<maxRunMs){
+    const current=now();
+    const task=await env.DB.prepare(
+      `SELECT * FROM telegram_send_queue
+       WHERE (
+         (status IN ('pending','retry') AND next_attempt_at<=?)
+         OR
+         (status='sending' AND locked_until IS NOT NULL AND locked_until<=?)
+       )
+       ORDER BY next_attempt_at,created_at,id
+       LIMIT 1`
+    ).bind(current,current).first();
+
+    if(!task){
+      if(allowShortWait){
+        const nextRow=await env.DB.prepare(
+          `SELECT MIN(next_attempt_at) next_at
+           FROM telegram_send_queue
+           WHERE status IN ('pending','retry')`
+        ).first();
+        const nextMs=Date.parse(String(nextRow?.next_at||""));
+        const waitMs=Number.isFinite(nextMs)?nextMs-Date.now():0;
+        if(waitMs>0 && waitMs<=4500 && Date.now()-started+waitMs+250<maxRunMs){
+          await new Promise(resolve=>setTimeout(resolve,waitMs+150));
+          continue;
+        }
+      }
+      break;
+    }
+
+    const lockUntil=telegramAfterSeconds(75);
+    const claim=await env.DB.prepare(
+      `UPDATE telegram_send_queue
+       SET status='sending',locked_until=?,updated_at=?
+       WHERE id=? AND (
+         (status IN ('pending','retry') AND next_attempt_at<=?)
+         OR
+         (status='sending' AND locked_until IS NOT NULL AND locked_until<=?)
+       )`
+    ).bind(lockUntil,current,task.id,current,current).run();
+    if(Number(claim?.meta?.changes||0)!==1)continue;
+
+    const lease=await acquireTelegramChatLease(env,task.chat_id,4);
+    if(!lease.acquired){
+      const rate=await env.DB.prepare(
+        "SELECT next_allowed_at FROM telegram_chat_rate WHERE chat_id=?"
+      ).bind(task.chat_id).first();
+      const retryAt=String(rate?.next_allowed_at||telegramAfterSeconds(4));
+      await env.DB.prepare(
+        `UPDATE telegram_send_queue
+         SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
+         WHERE id=?`
+      ).bind(retryAt,"同一群组正在限速排队，系统会自动发送",now(),task.id).run();
+      continue;
+    }
+
+    try{
+      await telegramApiCall(token,"sendMessage",{
+        chat_id:task.chat_id,
+        text:task.message_text,
+        parse_mode:"HTML",
+        disable_web_page_preview:true
+      });
+      await logTelegramDelivery(env,{
+        customerId:task.customer_id,
+        actorUserId:task.actor_user_id,
+        progressId:task.progress_id,
+        status:"success",
+        error:"群 "+task.chat_id
+      });
+      await env.DB.prepare("DELETE FROM telegram_send_queue WHERE id=?").bind(task.id).run();
+      processed++;
+    }catch(e){
+      const attempts=Number(task.attempts||0)+1;
+      if(telegramRetryableError(e)){
+        const delaySeconds=telegramRetryDelaySeconds(e,attempts-1);
+        const retryAt=telegramAfterSeconds(delaySeconds);
+        const reason=Number(e?.retryAfter||0)>0
+          ?("Telegram 限流，已自动等待 "+delaySeconds+" 秒后重试")
+          :("发送暂时失败，系统将在 "+delaySeconds+" 秒后自动重试："+String(e?.message||e));
+        await extendTelegramChatLease(env,task.chat_id,retryAt);
+        await env.DB.prepare(
+          `UPDATE telegram_send_queue
+           SET status='retry',attempts=?,next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
+           WHERE id=?`
+        ).bind(attempts,retryAt,String(reason).slice(0,1000),now(),task.id).run();
+      }else{
+        await logTelegramDelivery(env,{
+          customerId:task.customer_id,
+          actorUserId:task.actor_user_id,
+          progressId:task.progress_id,
+          status:"failed",
+          error:"群 "+task.chat_id+"："+String(e?.message||e)
+        });
+        await env.DB.prepare("DELETE FROM telegram_send_queue WHERE id=?").bind(task.id).run();
+      }
+      processed++;
+    }
+  }
+
+  return {processed};
 }
 
 async function telegramAdminGet(env){
@@ -302,14 +529,7 @@ async function telegramAdminGet(env){
   }catch{}
   const [availableFields,logs,progressDefs,routes,templateVariables]=await Promise.all([
     telegramAvailableFields(env),
-    env.DB.prepare(
-      `SELECT l.id,l.status,l.error_text,l.created_at,c.name customer_name,u.display_name actor_name,p.label progress_name
-       FROM telegram_delivery_logs l
-       LEFT JOIN customers c ON c.id=l.customer_id
-       LEFT JOIN users u ON u.id=l.actor_user_id
-       LEFT JOIN progress_definitions p ON p.id=l.progress_id
-       ORDER BY l.created_at DESC LIMIT 20`
-    ).all(),
+    telegramRecentActivity(env,20).then(results=>({results})),
     env.DB.prepare(
       "SELECT id,label,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
     ).all(),
@@ -344,36 +564,54 @@ async function telegramLogs(request,env){
   const page=safeInt(url.searchParams.get("page"),1,1,1000000);
   const limit=safeInt(url.searchParams.get("limit"),50,1,100);
   const status=String(url.searchParams.get("status")||"").trim();
-  const where=[];
-  const binds=[];
+  const allowedStatus=new Set(["pending","retry","success","failed","skipped"]);
+  const statusFilter=allowedStatus.has(status)?status:"";
 
-  if(["success","failed","skipped"].includes(status)){
-    where.push("l.status=?");
-    binds.push(status);
-  }
+  const baseSql=`
+    SELECT
+      l.id,l.status,l.error_text,l.created_at,
+      NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,
+      c.name customer_name,u.display_name actor_name,p.label progress_name
+    FROM telegram_delivery_logs l
+    LEFT JOIN customers c ON c.id=l.customer_id
+    LEFT JOIN users u ON u.id=l.actor_user_id
+    LEFT JOIN progress_definitions p ON p.id=l.progress_id
 
-  const whereSql=where.length?("WHERE "+where.join(" AND ")):"";
+    UNION ALL
+
+    SELECT
+      q.id,
+      CASE WHEN q.status='retry' THEN 'retry' ELSE 'pending' END AS status,
+      q.last_error AS error_text,
+      q.created_at,
+      q.chat_id,
+      q.next_attempt_at,
+      q.attempts,
+      c.name customer_name,u.display_name actor_name,p.label progress_name
+    FROM telegram_send_queue q
+    LEFT JOIN customers c ON c.id=q.customer_id
+    LEFT JOIN users u ON u.id=q.actor_user_id
+    LEFT JOIN progress_definitions p ON p.id=q.progress_id
+  `;
+  const whereSql=statusFilter?"WHERE activity.status=?":"";
+  const binds=statusFilter?[statusFilter]:[];
+
   const totalRow=await env.DB.prepare(
-    `SELECT COUNT(*) n FROM telegram_delivery_logs l ${whereSql}`
+    `SELECT COUNT(*) n FROM (${baseSql}) activity ${whereSql}`
   ).bind(...binds).first();
   const total=Number(totalRow?.n||0);
   const pages=Math.max(1,Math.ceil(total/limit));
   const offset=(page-1)*limit;
 
   const r=await env.DB.prepare(
-    `SELECT l.id,l.status,l.error_text,l.created_at,c.name customer_name,u.display_name actor_name,p.label progress_name
-     FROM telegram_delivery_logs l
-     LEFT JOIN customers c ON c.id=l.customer_id
-     LEFT JOIN users u ON u.id=l.actor_user_id
-     LEFT JOIN progress_definitions p ON p.id=l.progress_id
+    `SELECT * FROM (${baseSql}) activity
      ${whereSql}
-     ORDER BY l.created_at DESC,l.id DESC
+     ORDER BY activity.created_at DESC,activity.id DESC
      LIMIT ? OFFSET ?`
   ).bind(...binds,limit,offset).all();
 
-  return responseJson({ok:true,items:r.results||[],page,limit,total,pages,status});
+  return responseJson({ok:true,items:r.results||[],page,limit,total,pages,status:statusFilter});
 }
-
 async function telegramAdminSave(request,env,user){
   const b=await readBody(request);
   const old=await telegramSettingsRow(env);
@@ -459,8 +697,6 @@ async function telegramAdminTest(request,env,user){
   const row=await telegramSettingsRow(env);
   if(!row.bot_token_enc)return fail("请先保存 Telegram Bot Token");
   if(!row.chat_id)return fail("请先填写 Telegram 群 ID");
-  let token="";
-  try{token=await telegramDecryptSecret(env,row.bot_token_enc)}catch(e){return fail("Telegram Token 无法解密，请重新填写 Token")}
 
   const origin=new URL(request.url).origin;
   const template=await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
@@ -486,20 +722,16 @@ async function telegramAdminTest(request,env,user){
     row.link_label||"查看客户详情"
   );
 
-  try{
-    await telegramApiCall(token,"sendMessage",{
-      chat_id:row.chat_id,
-      text,
-      parse_mode:"HTML",
-      disable_web_page_preview:true
-    });
-    await audit(env,user,"test","telegram_settings","1",{chatId:row.chat_id,template:true});
-    return responseJson({ok:true,message:"模板测试消息已发送"});
-  }catch(e){
-    return fail("发送失败："+String(e?.message||e));
-  }
+  await enqueueTelegramMessage(env,{
+    dedupeKey:"test:"+uid("evt_"),
+    actorUserId:user.id,
+    chatId:row.chat_id,
+    messageText:text
+  });
+  await audit(env,user,"test","telegram_settings","1",{chatId:row.chat_id,template:true,queued:true});
+  await processTelegramQueue(env,{maxItems:2,maxRunMs:2500,allowShortWait:false}).catch(()=>{});
+  return responseJson({ok:true,message:"模板测试消息已加入可靠发送队列"});
 }
-
 async function telegramProgressStatus(env,customerId){
   const defsResult=await env.DB.prepare(
     "SELECT id,label,color,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
@@ -524,7 +756,7 @@ async function logTelegramDelivery(env,{customerId,actorUserId,progressId,status
   }catch{}
 }
 
-async function sendTelegramProgressNotification(request,env,user,customerId,progressDef,summary){
+async function sendTelegramProgressNotification(request,env,user,customerId,progressDef,summary,eventId=""){
   const row=await telegramSettingsRow(env);
   if(!row.enabled)return;
   if(normalizedRole(user.role)==="admin"&&!row.notify_admin)return;
@@ -550,13 +782,6 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
 
   if(!targetChatIds.length){
     await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"这个进度没有可用的通知群"});
-    return;
-  }
-
-  let token="";
-  try{token=await telegramDecryptSecret(env,row.bot_token_enc)}
-  catch(e){
-    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"failed",error:"Token 无法解密"});
     return;
   }
 
@@ -608,21 +833,22 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
     row.link_label||"查看客户详情"
   );
 
+  const eventKey=String(eventId||now());
   for(const targetChatId of targetChatIds){
-    try{
-      await telegramApiCall(token,"sendMessage",{
-        chat_id:targetChatId,
-        text:messageText,
-        parse_mode:"HTML",
-        disable_web_page_preview:true
-      });
-      await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"success",error:"群 "+targetChatId});
-    }catch(e){
-      await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"failed",error:"群 "+targetChatId+"："+String(e?.message||e)});
-    }
+    await enqueueTelegramMessage(env,{
+      dedupeKey:[customerId,progressDef.id,eventKey,targetChatId].join(":"),
+      customerId,
+      actorUserId:user.id,
+      progressId:progressDef.id,
+      chatId:targetChatId,
+      messageText
+    });
   }
-}
 
+  // Try to deliver immediately. Per-chat leases prevent concurrent Worker
+  // requests from exceeding the safe pace; cron continues anything left queued.
+  await processTelegramQueue(env,{maxItems:4,maxRunMs:2500,allowShortWait:false});
+}
 async function bumpVersion(env, key) {
   const t = now();
   await env.DB.prepare(
@@ -1046,7 +1272,7 @@ async function toggleProgress(request, env, user, customerId, progressId, ctx) {
 
   const transitionedToComplete=completed===1 && Number(previous?.completed||0)!==1;
   if(transitionedToComplete){
-    const job=sendTelegramProgressNotification(request,env,user,customerId,pd,summary).catch(()=>{});
+    const job=sendTelegramProgressNotification(request,env,user,customerId,pd,summary,t).catch(()=>{});
     if(ctx?.waitUntil)ctx.waitUntil(job);
     else await job;
   }
@@ -2528,5 +2754,15 @@ export default {
     } catch (e) {
       return withSecurityHeaders(responseJson({ok:false,code:"SERVER_ERROR",message:"系统暂时无法处理请求",detail:String(e?.message||e)},500));
     }
+  },
+
+  async scheduled(controller,env,ctx){
+    const job=processTelegramQueue(env,{
+      maxItems:12,
+      maxRunMs:48000,
+      allowShortWait:true
+    }).catch(()=>{});
+    if(ctx?.waitUntil)ctx.waitUntil(job);
+    else await job;
   }
 };
