@@ -25,7 +25,9 @@ function toast(msg){
   clearTimeout(toastEl._t); toastEl._t=setTimeout(()=>toastEl.classList.remove("show"),2200);
 }
 async function api(path, options={}){
+  const role=state.user?.role||sessionStorage.getItem("ms007Role")||"";
   const opts={credentials:"same-origin",...options};
+  if(role)opts.headers={...(opts.headers||{}),"x-ms007-role":role};
   if(opts.body && typeof opts.body!=="string"){
     opts.headers={...(opts.headers||{}),"content-type":"application/json"};
     opts.body=JSON.stringify(opts.body);
@@ -56,6 +58,7 @@ async function bootstrap(){
   try{
     const me=await api("/api/me");
     state.user=me.user;
+    sessionStorage.setItem("ms007Role",me.user.role);
     await enterApp();
   }catch(e){
     renderHome();
@@ -90,6 +93,7 @@ function renderHome(){
   app.querySelectorAll("[data-login]").forEach(b=>b.onclick=()=>renderLogin(b.dataset.login));
 }
 async function renderLogin(role){
+  sessionStorage.setItem("ms007Role",role);
   let needsBootstrap=false;
   try{ needsBootstrap=(await api("/api/bootstrap-status")).needsBootstrap; }catch{}
   const roleName=role==="admin"?"管理员":"业务员";
@@ -145,6 +149,7 @@ async function renderLogin(role){
     try{
       const r=await api("/api/login",{method:"POST",body:{username:fd.get("username"),password:fd.get("password"),role}});
       state.user=r.user;
+      sessionStorage.setItem("ms007Role",r.user.role);
       const pendingCustomerId=state.pendingCustomerId;
       state.pendingCustomerId=null;
       location.hash=pendingCustomerId?`#/${role}/customer/${encodeURIComponent(pendingCustomerId)}`:`#/${role}/dashboard`;
@@ -237,7 +242,10 @@ async function refreshMiniStatus(){
 }
 async function logout(){
   try{await api("/api/logout",{method:"POST"});}catch{}
-  location.hash=""; renderHome();
+  sessionStorage.removeItem("ms007Role");
+  state.user=null;
+  location.hash="";
+  renderHome();
 }
 window.addEventListener("hashchange",()=>{ if(state.user){renderSidebarOnly();renderRoute();} });
 
