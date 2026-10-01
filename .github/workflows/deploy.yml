@@ -8,15 +8,176 @@ on:
       - "public/**"
       - "src/**"
       - "schema.sql"
+      - "migrations/**"
+      - "scripts/**"
       - "wrangler.toml"
       - ".github/workflows/deploy.yml"
+      - ".github/workflows/test.yml"
 
 concurrency:
   group: ms007-cloudflare-deploy
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Frontend syntax
+        run: node --check public/app.js
+
+      - name: Worker syntax
+        shell: bash
+        run: |
+          cp src/worker.js /tmp/worker.mjs
+          node --check /tmp/worker.mjs
+
+      - name: Database safety gate
+        run: node scripts/check-db-safety.mjs
+
+      - name: Validate fresh database and migrations
+        shell: bash
+        run: |
+          python - <<'PY'
+          import pathlib, sqlite3
+          con=sqlite3.connect(":memory:")
+          con.execute("PRAGMA foreign_keys=ON")
+          con.executescript(pathlib.Path("schema.sql").read_text(encoding="utf-8"))
+          for p in sorted(pathlib.Path("migrations").glob("*.sql")):
+              con.executescript(p.read_text(encoding="utf-8"))
+              print("Applied",p.name)
+          required={
+              "users","customers","field_definitions","customer_values",
+              "progress_definitions","customer_progress","sidebar_items",
+              "sidebar_categories","sidebar_item_categories","list_columns",
+              "dashboard_widgets","audit_logs","system_settings","telegram_settings",
+              "telegram_delivery_logs","telegram_send_queue","telegram_chat_rate",
+              "ms007_migration_guard"
+          }
+          tables={r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+          missing=sorted(required-tables)
+          if missing:
+              raise SystemExit("Missing tables: "+", ".join(missing))
+          print("Database validation OK")
+          PY
+
+  staging:
+    needs: validate
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      subdomain: ${{ steps.subdomain.outputs.subdomain }}
+
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Require Cloudflare authorization
+        shell: bash
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Resolve staging D1 database
+        id: d1
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/resolve-d1.mjs ms007-crm-staging > /tmp/d1.json
+          cat /tmp/d1.json
+          echo "database_id=$(node -e "const x=require('/tmp/d1.json');process.stdout.write(x.id)")" >> "$GITHUB_OUTPUT"
+          echo "created=$(node -e "const x=require('/tmp/d1.json');process.stdout.write(String(x.created))")" >> "$GITHUB_OUTPUT"
+
+      - name: Build staging config
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          node scripts/build-deploy-config.mjs             output=wrangler.staging.toml             worker=ms007-crm-staging             db=ms007-crm-staging             id="${{ steps.d1.outputs.database_id }}"             version="$SHORT_SHA"             channel=staging             disable-cron=true
+
+      - name: Bootstrap staging database once
+        if: ${{ steps.d1.outputs.created == 'true' }}
+        run: npx --yes wrangler@latest d1 execute DB --remote --file=schema.sql --config wrangler.staging.toml
+
+      - name: Apply staging migrations
+        run: npx --yes wrangler@latest d1 migrations apply DB --remote --config wrangler.staging.toml
+
+      - name: Resolve workers.dev subdomain
+        id: subdomain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             -H "Content-Type: application/json"             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"             > /tmp/workers-subdomain.json
+
+          CURRENT=$(node - <<'NODE'
+          const fs=require("fs");
+          const x=JSON.parse(fs.readFileSync("/tmp/workers-subdomain.json","utf8"));
+          if(x.success&&x.result?.subdomain)process.stdout.write(x.result.subdomain);
+          NODE
+          )
+
+          if [ -z "$CURRENT" ]; then
+            DESIRED="mosen6266-ms007"
+            curl -fsS               -X PUT               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               -H "Content-Type: application/json"               --data "{\"subdomain\":\"$DESIRED\"}"               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"               > /tmp/workers-subdomain-create.json
+
+            CURRENT=$(node - <<'NODE'
+          const fs=require("fs");
+          const x=JSON.parse(fs.readFileSync("/tmp/workers-subdomain-create.json","utf8"));
+          if(!x.success)throw new Error(JSON.stringify(x.errors||x));
+          if(x.result?.subdomain)process.stdout.write(x.result.subdomain);
+          NODE
+            )
+          fi
+
+          test -n "$CURRENT"
+          echo "subdomain=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy staging application
+        run: npx --yes wrangler@latest deploy --config wrangler.staging.toml
+
+      - name: Staging smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://ms007-crm-staging.${{ steps.subdomain.outputs.subdomain }}.workers.dev"
+          for i in 1 2 3 4 5 6; do
+            if curl -fsS "$URL/api/health" > /tmp/staging-health.json; then
+              break
+            fi
+            sleep 3
+          done
+          cat /tmp/staging-health.json
+          node - <<'NODE'
+          const fs=require("fs");
+          const x=JSON.parse(fs.readFileSync("/tmp/staging-health.json","utf8"));
+          const expected=process.env.GITHUB_SHA.slice(0,12);
+          if(!x.ok||x.channel!=="staging"||x.version!==expected){
+            console.error("Staging version check failed",x,expected);
+            process.exit(1);
+          }
+          NODE
+          curl -fsS "$URL/api/bootstrap-status"
+          echo
+
+  production:
+    needs: staging
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -27,170 +188,78 @@ jobs:
       BOOTSTRAP_TOKEN: ${{ secrets.BOOTSTRAP_TOKEN }}
 
     steps:
-      - name: Cloudflare authorization status
-        if: ${{ env.CLOUDFLARE_API_TOKEN == '' || env.CLOUDFLARE_ACCOUNT_ID == '' }}
-        run: |
-          echo "Cloudflare authorization has not been configured yet."
-          echo "Add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID repository secrets to enable deployment."
-
       - name: Checkout
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
         uses: actions/checkout@v4
 
       - name: Setup Node
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
         uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Database destructive-change safety gate
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          node - <<'NODE'
-          const fs = require('fs');
+      - name: Database safety gate
+        run: node scripts/check-db-safety.mjs
 
-          const raw = fs.readFileSync('schema.sql', 'utf8');
-          // Remove SQL comments before checking so comments/examples do not cause false alarms.
-          const sql = raw
-            .replace(/\/\*[\s\S]*?\*\//g, ' ')
-            .replace(/--.*$/gm, ' ')
-            .replace(/\s+/g, ' ')
-            .trim();
-
-          const blocked = [
-            { name: 'DROP TABLE', re: /\bDROP\s+TABLE\b/i },
-            { name: 'DROP VIEW', re: /\bDROP\s+VIEW\b/i },
-            { name: 'DROP COLUMN', re: /\bALTER\s+TABLE\b[\s\S]*?\bDROP\s+(?:COLUMN\s+)?\b/i },
-            { name: 'TRUNCATE', re: /\bTRUNCATE\b/i },
-            { name: 'DELETE FROM', re: /\bDELETE\s+FROM\b/i },
-            { name: 'UPDATE existing data', re: /\bUPDATE\s+[A-Za-z_][A-Za-z0-9_]*\s+SET\b/i },
-            { name: 'INSERT OR REPLACE', re: /\bINSERT\s+OR\s+REPLACE\b/i },
-            { name: 'REPLACE INTO', re: /\bREPLACE\s+INTO\b/i },
-            { name: 'ALTER TABLE RENAME', re: /\bALTER\s+TABLE\b[\s\S]*?\bRENAME\b/i },
-            { name: 'Disable foreign keys', re: /\bPRAGMA\s+foreign_keys\s*=\s*(?:OFF|0)\b/i }
-          ];
-
-          const hits = blocked.filter(x => x.re.test(sql)).map(x => x.name);
-          if (hits.length) {
-            console.error('');
-            console.error('BLOCKED: schema.sql contains deployment-time database operations that may change or destroy existing customer data:');
-            for (const hit of hits) console.error(' - ' + hit);
-            console.error('');
-            console.error('Deployment stopped BEFORE the remote D1 database was touched.');
-            console.error('Review the migration explicitly before changing this safety gate.');
-            process.exit(1);
-          }
-
-          console.log('Database safety gate passed.');
-          console.log('No destructive or bulk-overwrite SQL was found in schema.sql.');
-          NODE
-
-      - name: Resolve or create D1 database
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
+      - name: Resolve production D1 database
         id: d1
         shell: bash
         run: |
           set -euo pipefail
+          node scripts/resolve-d1.mjs ms007-crm > /tmp/d1.json
+          cat /tmp/d1.json
+          echo "database_id=$(node -e "const x=require('/tmp/d1.json');process.stdout.write(x.id)")" >> "$GITHUB_OUTPUT"
+          echo "created=$(node -e "const x=require('/tmp/d1.json');process.stdout.write(String(x.created))")" >> "$GITHUB_OUTPUT"
 
-          curl -fsS             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             -H "Content-Type: application/json"             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"             > /tmp/d1-list.json
-
-          DB_ID=$(node - <<'NODE'
-          const fs=require('fs');
-          const x=JSON.parse(fs.readFileSync('/tmp/d1-list.json','utf8'));
-          if(!x.success) {
-            console.error(JSON.stringify(x.errors||x));
-            process.exit(2);
-          }
-          const d=(x.result||[]).find(v=>v.name==='ms007-crm');
-          if(d) process.stdout.write(d.uuid||'');
-          NODE
-          )
-
-          if [ -z "$DB_ID" ]; then
-            curl -fsS               -X POST               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               -H "Content-Type: application/json"               --data '{"name":"ms007-crm"}'               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"               > /tmp/d1-create.json
-
-            DB_ID=$(node - <<'NODE'
-          const fs=require('fs');
-          const x=JSON.parse(fs.readFileSync('/tmp/d1-create.json','utf8'));
-          if(!x.success) {
-            console.error(JSON.stringify(x.errors||x));
-            process.exit(2);
-          }
-          const d=x.result||{};
-          process.stdout.write(d.uuid||'');
-          NODE
-            )
-          fi
-
-          if [ -z "$DB_ID" ]; then
-            echo "Could not resolve D1 database ID" >&2
-            exit 1
-          fi
-
-          echo "database_id=$DB_ID" >> "$GITHUB_OUTPUT"
-
-      - name: Build deploy config
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
-        shell: bash
-        run: |
-          cp wrangler.toml wrangler.deploy.toml
-          sed -i "s/REPLACE_WITH_D1_DATABASE_ID/${{ steps.d1.outputs.database_id }}/g" wrangler.deploy.toml
-
-      - name: Apply database schema
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
-        run: npx --yes wrangler@latest d1 execute ms007-crm --remote --file=schema.sql --config wrangler.deploy.toml
-
-      - name: Ensure workers.dev subdomain
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
+      - name: Build production config
         shell: bash
         run: |
           set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          node scripts/build-deploy-config.mjs             output=wrangler.production.toml             worker=ms007-crm             db=ms007-crm             id="${{ steps.d1.outputs.database_id }}"             version="$SHORT_SHA"             channel=production
 
-          curl -sS             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             -H "Content-Type: application/json"             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"             > /tmp/workers-subdomain.json
+      - name: Bootstrap production database once
+        if: ${{ steps.d1.outputs.created == 'true' }}
+        run: npx --yes wrangler@latest d1 execute DB --remote --file=schema.sql --config wrangler.production.toml
 
-          CURRENT=$(node - <<'NODE'
-          const fs=require('fs');
-          const x=JSON.parse(fs.readFileSync('/tmp/workers-subdomain.json','utf8'));
-          if(x.success && x.result && x.result.subdomain) process.stdout.write(x.result.subdomain);
-          NODE
-          )
+      - name: Record production recovery point
+        if: ${{ steps.d1.outputs.created != 'true' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npx --yes wrangler@latest d1 time-travel info ms007-crm --json --config wrangler.production.toml | tee /tmp/ms007-recovery-point.json
+          {
+            echo "## MS007 production recovery point"
+            echo
+            echo "Recorded before migrations for commit \`$GITHUB_SHA\`."
+            echo
+            echo '~~~json'
+            cat /tmp/ms007-recovery-point.json
+            echo '~~~'
+          } >> "$GITHUB_STEP_SUMMARY"
 
-          if [ -z "$CURRENT" ]; then
-            DESIRED="mosen6266-ms007"
-            curl -fsS               -X PUT               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               -H "Content-Type: application/json"               --data "{\"subdomain\":\"$DESIRED\"}"               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"               > /tmp/workers-subdomain-create.json
+      - name: Upload production recovery point
+        if: ${{ steps.d1.outputs.created != 'true' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ms007-production-recovery-point-${{ github.run_id }}
+          path: /tmp/ms007-recovery-point.json
+          retention-days: 30
 
-            CURRENT=$(node - <<'NODE'
-          const fs=require('fs');
-          const x=JSON.parse(fs.readFileSync('/tmp/workers-subdomain-create.json','utf8'));
-          if(!x.success) {
-            console.error(JSON.stringify(x.errors||x));
-            process.exit(2);
-          }
-          if(x.result && x.result.subdomain) process.stdout.write(x.result.subdomain);
-          NODE
-            )
-          fi
+      - name: Apply production migrations
+        run: npx --yes wrangler@latest d1 migrations apply DB --remote --config wrangler.production.toml
 
-          if [ -z "$CURRENT" ]; then
-            echo "Could not resolve workers.dev subdomain" >&2
-            exit 1
-          fi
+      - name: Verify no unapplied production migrations
+        run: npx --yes wrangler@latest d1 migrations list DB --remote --config wrangler.production.toml
 
-          echo "workers.dev subdomain is ready."
-
-      - name: Deploy application
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
-        run: npx --yes wrangler@latest deploy --config wrangler.deploy.toml
+      - name: Deploy production application
+        run: npx --yes wrangler@latest deploy --config wrangler.production.toml
 
       - name: Set bootstrap secret
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' && env.BOOTSTRAP_TOKEN != '' }}
+        if: ${{ env.BOOTSTRAP_TOKEN != '' }}
         shell: bash
         run: |
           set -euo pipefail
           for attempt in 1 2 3; do
-            if printf '%s' "$BOOTSTRAP_TOKEN" | npx --yes wrangler@latest secret put BOOTSTRAP_TOKEN --config wrangler.deploy.toml; then
+            if printf '%s' "$BOOTSTRAP_TOKEN" | npx --yes wrangler@latest secret put BOOTSTRAP_TOKEN --config wrangler.production.toml; then
               exit 0
             fi
             if [ "$attempt" -lt 3 ]; then
@@ -201,26 +270,37 @@ jobs:
           exit 1
 
       - name: Production smoke test
-        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
         shell: bash
         run: |
           set -euo pipefail
-          URL="https://ms007-crm.mosen6266-ms007.workers.dev"
-          for i in 1 2 3 4 5; do
+          URL="https://ms007-crm.${{ needs.staging.outputs.subdomain }}.workers.dev"
+          for i in 1 2 3 4 5 6; do
             if curl -fsS "$URL/api/health" > /tmp/health.json; then
               break
             fi
             sleep 3
           done
           cat /tmp/health.json
+
+          node - <<'NODE'
+          const fs=require("fs");
+          const x=JSON.parse(fs.readFileSync("/tmp/health.json","utf8"));
+          const expected=process.env.GITHUB_SHA.slice(0,12);
+          if(!x.ok||x.channel!=="production"||x.version!==expected){
+            console.error("Production version check failed",x,expected);
+            process.exit(1);
+          }
+          NODE
+
           curl -fsS "$URL/api/bootstrap-status"
           echo
+
           curl -fsS -H "x-bootstrap-token: $BOOTSTRAP_TOKEN" "$URL/api/bootstrap-token-check" > /tmp/bootstrap-token-check.json
           cat /tmp/bootstrap-token-check.json
           node - <<'NODE'
-          const fs=require('fs');
-          const x=JSON.parse(fs.readFileSync('/tmp/bootstrap-token-check.json','utf8'));
-          if(!x.configured || !x.valid){
+          const fs=require("fs");
+          const x=JSON.parse(fs.readFileSync("/tmp/bootstrap-token-check.json","utf8"));
+          if(!x.configured||!x.valid){
             console.error("BOOTSTRAP_TOKEN is not configured or does not match the GitHub secret.");
             process.exit(1);
           }
@@ -229,10 +309,10 @@ jobs:
           curl -sS -X POST -H "x-bootstrap-token: $BOOTSTRAP_TOKEN" "$URL/api/bootstrap-diagnostic" > /tmp/bootstrap-diagnostic.json
           cat /tmp/bootstrap-diagnostic.json
           node - <<'NODE'
-          const fs=require('fs');
-          const x=JSON.parse(fs.readFileSync('/tmp/bootstrap-diagnostic.json','utf8'));
+          const fs=require("fs");
+          const x=JSON.parse(fs.readFileSync("/tmp/bootstrap-diagnostic.json","utf8"));
           if(!x.ok){
-            console.error("Bootstrap diagnostic failed at step:", x.step, x.errorName, x.errorMessage);
+            console.error("Bootstrap diagnostic failed at step:",x.step,x.errorName,x.errorMessage);
             process.exit(1);
           }
           NODE
