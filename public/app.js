@@ -416,12 +416,12 @@ function renderCustomerRows(host,items,hasMore){
       <div class="customer-fields customer-fields-configurable">${details.join("")||'<div class="muted">未设置客户资料显示项</div>'}</div>
       <div class="customer-step-status">
         <div class="step-status current-step">
-          <span>当前进度</span>
-          <strong><i style="background:${esc(c.currentProgress?.color||"#94a3b8")}"></i>${esc(c.currentProgress?.label||"未开始")}</strong>
+          <span>当前</span>
+          <strong><i></i>${esc(c.currentProgress?.label||"未开始")}</strong>
         </div>
         <div class="step-status next-step">
-          <span>下一步进度</span>
-          <strong><i style="background:${esc(c.nextProgress?.color||"#22c55e")}"></i>${esc(c.nextProgress?.label||"暂无进度")}</strong>
+          <span>下一步</span>
+          <strong><i></i>${esc(c.nextProgress?.label||"暂无进度")}</strong>
         </div>
       </div>
       <div class="customer-row-progress">
@@ -510,7 +510,7 @@ async function openCustomerEditor(id=null){
                 ${p.completed?"checked":""}>
               <span class="progress-check-mark"></span>
               <span class="progress-check-content">
-                <strong><i style="background:${esc(p.color||"#94a3b8")}"></i>${esc(p.label)}</strong>
+                <strong><i class="progress-status-dot"></i>${esc(p.label)}</strong>
                 ${p.description?`<small>${esc(p.description)}</small>`:""}
               </span>
             </label>`).join("")||'<div class="muted">管理员还没有设置客户进度。</div>'}
@@ -611,7 +611,7 @@ async function openCustomerProgressPanel(id){
                 ${p.completed?"checked":""}>
               <span class="progress-check-mark"></span>
               <span class="progress-check-content">
-                <strong><i style="background:${esc(p.color||"#94a3b8")}"></i>${esc(p.label)}</strong>
+                <strong><i class="progress-status-dot"></i>${esc(p.label)}</strong>
                 ${p.description?`<small>${esc(p.description)}</small>`:""}
               </span>
             </label>`).join("")||'<div class="muted">管理员还没有设置客户进度。</div>'}
