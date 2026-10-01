@@ -867,7 +867,7 @@ async function telegramAdminGet(env){
     const parsed=JSON.parse(row.fields_json||"[]");
     if(Array.isArray(parsed))fields=parsed;
   }catch{}
-  const [availableFields,logs,progressDefs,routes,templateVariables]=await Promise.all([
+  const [availableFields,logs,progressDefs,routes,templateVariables,queueMonitor]=await Promise.all([
     telegramAvailableFields(env),
     telegramRecentActivity(env,20).then(results=>({results})),
     env.DB.prepare(
@@ -876,7 +876,8 @@ async function telegramAdminGet(env){
     env.DB.prepare(
       "SELECT progress_id,route_mode,chat_id FROM telegram_progress_routes"
     ).all(),
-    telegramTemplateVariables(env)
+    telegramTemplateVariables(env),
+    telegramQueueMonitor(env)
   ]);
   const messageTemplate=normalizedTemplate;
   return responseJson({
@@ -895,6 +896,7 @@ async function telegramAdminGet(env){
     templateVariables,
     progressDefs:progressDefs.results||[],
     routes:routes.results||[],
+    queueMonitor,
     logs:logs.results||[]
   });
 }
@@ -904,13 +906,13 @@ async function telegramLogs(request,env){
   const limit=safeInt(url.searchParams.get("limit"),50,1,100);
   const status=String(url.searchParams.get("status")||"").trim();
   const cursor=decodeCursor(url.searchParams.get("cursor"));
-  const allowedStatus=new Set(["pending","retry","success","failed","skipped"]);
+  const allowedStatus=new Set(["pending","retry","needs_admin","success","failed","skipped"]);
   const statusFilter=allowedStatus.has(status)?status:"";
 
   const baseSql=`
     SELECT
       l.id,l.status,l.error_text,l.created_at,
-      NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,
+      NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,NULL AS requires_admin,
       c.name customer_name,u.display_name actor_name,p.label progress_name
     FROM telegram_delivery_logs l
     LEFT JOIN customers c ON c.id=l.customer_id
@@ -921,12 +923,17 @@ async function telegramLogs(request,env){
 
     SELECT
       q.id,
-      CASE WHEN q.status='retry' THEN 'retry' ELSE 'pending' END AS status,
+      CASE
+        WHEN COALESCE(q.requires_admin,0)=1 THEN 'needs_admin'
+        WHEN q.status='retry' THEN 'retry'
+        ELSE 'pending'
+      END AS status,
       q.last_error AS error_text,
       q.created_at,
       q.chat_id,
       q.next_attempt_at,
       q.attempts,
+      q.requires_admin,
       c.name customer_name,u.display_name actor_name,p.label progress_name
     FROM telegram_send_queue q
     LEFT JOIN customers c ON c.id=q.customer_id
@@ -4089,6 +4096,8 @@ async function api(request, env, ctx) {
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
   if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
   if (path === "/api/admin/telegram/logs" && method === "GET") return telegramLogs(request,env);
+  m=path.match(/^\/api\/admin\/telegram\/queue\/([^/]+)\/retry$/);
+  if(m && method==="POST") return retryTelegramQueueItem(env,user,m[1],ctx);
   if (path === "/api/admin/telegram" && method === "PUT") return telegramAdminSave(request,env,user);
   if (path === "/api/admin/telegram/test" && method === "POST") return telegramAdminTest(request,env,user);
   if (path === "/api/admin/registration-layout" && method === "GET") return adminRegistrationLayout(env);
