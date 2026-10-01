@@ -10,6 +10,8 @@ const state = {
   sales: [],
   sidebarTimer: null,
   pendingCustomerId: null,
+  appVersion: "",
+  deployChannel: "",
 };
 
 const iconMap = {
@@ -171,6 +173,14 @@ async function renderLogin(role){
 }
 
 async function enterApp(){
+  try{
+    const health=await api("/api/health");
+    state.appVersion=String(health.version||"");
+    state.deployChannel=String(health.channel||"");
+  }catch{
+    state.appVersion="";
+    state.deployChannel="";
+  }
   await refreshSidebar(true);
   startSidebarSync();
   const direct=location.hash.match(/^#\/customer\/([^/]+)$/);
@@ -227,7 +237,10 @@ async function renderShell(){
       <aside class="sidebar">
         <div class="logo"><strong>MS007</strong><small>${roleLabel}系统</small></div>
         <nav id="sideNav">${sideHtml()}</nav>
-        <div class="side-footer"><button class="btn ghost small full" id="logoutBtn">退出登录</button></div>
+        <div class="side-footer">
+          ${state.appVersion?`<div class="system-version">版本 ${esc(state.appVersion)}${state.deployChannel&&state.deployChannel!=="production"?` · ${esc(state.deployChannel)}`:""}</div>`:""}
+          <button class="btn ghost small full" id="logoutBtn">退出登录</button>
+        </div>
       </aside>
       <section class="main">
         <header class="topbar">
