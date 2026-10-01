@@ -94,6 +94,44 @@ jobs:
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
         run: npx --yes wrangler@latest d1 execute ms007-crm --remote --file=schema.sql --config wrangler.deploy.toml
 
+      - name: Ensure workers.dev subdomain
+        if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          curl -sS             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             -H "Content-Type: application/json"             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"             > /tmp/workers-subdomain.json
+
+          CURRENT=$(node - <<'NODE'
+          const fs=require('fs');
+          const x=JSON.parse(fs.readFileSync('/tmp/workers-subdomain.json','utf8'));
+          if(x.success && x.result && x.result.subdomain) process.stdout.write(x.result.subdomain);
+          NODE
+          )
+
+          if [ -z "$CURRENT" ]; then
+            DESIRED="mosen6266-ms007"
+            curl -fsS               -X PUT               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               -H "Content-Type: application/json"               --data "{\"subdomain\":\"$DESIRED\"}"               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"               > /tmp/workers-subdomain-create.json
+
+            CURRENT=$(node - <<'NODE'
+          const fs=require('fs');
+          const x=JSON.parse(fs.readFileSync('/tmp/workers-subdomain-create.json','utf8'));
+          if(!x.success) {
+            console.error(JSON.stringify(x.errors||x));
+            process.exit(2);
+          }
+          if(x.result && x.result.subdomain) process.stdout.write(x.result.subdomain);
+          NODE
+            )
+          fi
+
+          if [ -z "$CURRENT" ]; then
+            echo "Could not resolve workers.dev subdomain" >&2
+            exit 1
+          fi
+
+          echo "workers.dev subdomain is ready."
+
       - name: Deploy application
         if: ${{ env.CLOUDFLARE_API_TOKEN != '' && env.CLOUDFLARE_ACCOUNT_ID != '' }}
         run: npx --yes wrangler@latest deploy --config wrangler.deploy.toml
