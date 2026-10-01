@@ -1,0 +1,16 @@
+{
+  "project": "MS007",
+  "upgrade_phase": "Batch 6",
+  "purpose": "Release governance and recovery tracking",
+  "data_policy": {
+    "customer_data_modified": false,
+    "schema_data_migration": false,
+    "production_records_touched": false
+  },
+  "tracking": {
+    "version_source": "git commit SHA",
+    "deployment_history": "enabled by workflow records",
+    "rollback_checkpoint": "record before production migration/deploy"
+  },
+  "created_for": "Batch 6 Step 2 version governance"
+}
