@@ -819,3 +819,29 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
   color:var(--muted);
   word-break:break-all;
 }
+
+
+/* Operation record detail */
+.audit-detail-meta{
+  display:grid;
+  grid-template-columns:repeat(2,minmax(0,1fr));
+  gap:10px;
+}
+.audit-detail-meta>div{
+  border:1px solid var(--line);
+  border-radius:10px;
+  padding:10px 12px;
+}
+.audit-detail-meta span{
+  display:block;
+  color:var(--muted);
+  font-size:12px;
+  margin-bottom:4px;
+}
+.audit-detail-meta strong{
+  display:block;
+  word-break:break-word;
+}
+@media(max-width:620px){
+  .audit-detail-meta{grid-template-columns:1fr}
+}
