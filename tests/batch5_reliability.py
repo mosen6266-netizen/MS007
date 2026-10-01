@@ -20,8 +20,11 @@ assert "localStorage.removeItem(storageKey)" in draft_block
 for token in [
     "async function telegramQueueMonitor",
     "async function telegramUnresolvedItems",
+    "async function telegramRetryableFailureItems",
+    "async function telegramUnresolvedAdminGet",
     "async function retryTelegramQueueItem",
     "async function retryTelegramDeliveryLog",
+    "async function retryFailedTelegramBatch",
     "MAX_AUTO_ATTEMPTS=8",
     "requires_admin",
     "dead_lettered_at",
@@ -29,6 +32,7 @@ for token in [
     "retryTelegramQueueItem(env,user,m[1],ctx)",
     "retryTelegramDeliveryLog(request,env,user,m[1],ctx)",
     "/api/admin/telegram/unresolved",
+    "/api/admin/telegram/retry-failed-batch",
 ]:
     assert token in worker,token
 
@@ -49,6 +53,9 @@ for token in [
     "未发送成功",
     "tgUnresolvedBody",
     "tgUnresolvedRefresh",
+    "tgRetryAllFailed",
+    "一键重新发送全部失败",
+    "/api/admin/telegram/retry-failed-batch",
     "data-tg-unresolved-retry",
     "/api/admin/telegram/unresolved",
     "每 5 秒自动检查一次",
@@ -85,6 +92,34 @@ for token in [
     "这个进度没有可用的通知群",
 ]:
     assert token in retry_log,token
+
+# One-click resend-all must stage work in small batches and leave actual
+# Telegram delivery to the existing rate-limited reliable queue.
+bulk=worker[worker.index("async function retryFailedTelegramBatch"):worker.index("async function bumpVersion")]
+for token in [
+    "const BATCH_SIZE=10",
+    "telegramRetryableFailureItems(env,500)",
+    "requires_admin=0",
+    "{manual:true,processImmediately:false}",
+    "maxItems:2",
+    "hasMoreActionable",
+]:
+    assert token in bulk,token
+assert "status===\"pending\"" not in bulk
+assert "status===\"retry\"" not in bulk
+
+failure_query=worker[worker.index("async function telegramRetryableFailureItems"):worker.index("async function telegramUnresolvedAdminGet")]
+assert "COALESCE(q.requires_admin,0)=1" in failure_query
+assert "l.status IN ('failed','skipped')" in failure_query
+assert "telegram_send_queue q2" in failure_query
+assert "s.status='success'" in failure_query
+
+sender=worker[worker.index("async function sendTelegramProgressNotification"):worker.index("async function retryTelegramDeliveryLog")]
+assert "options?.processImmediately!==false" in sender
+
+assert "每批最多 10 条" in telegram_ui
+assert "setTimeout(resolve,900)" in telegram_ui
+assert "telegramHasRetryableFailures" in telegram_ui
 
 con=sqlite3.connect(":memory:")
 con.execute("PRAGMA foreign_keys=ON")
