@@ -897,18 +897,42 @@ async function createField(request, env, user) {
   const id = uid("f_");
   const t = now();
 
-  const maxRow = await env.DB.prepare("SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM field_definitions WHERE enabled=1").first();
-  const nextSort = Number(maxRow?.max_sort || 0) + 1;
-  const sortOrder = b.sortOrder!==undefined ? safeInt(b.sortOrder,nextSort,0,100000) : nextSort;
-  const listSortOrder = b.listSortOrder!==undefined ? safeInt(b.listSortOrder,sortOrder,0,100000) : sortOrder;
+  let sortOrder;
+  const insertAnchorId=String(b.insertAnchorId||"").trim();
+  const insertPosition=b.insertPosition==="before"?"before":b.insertPosition==="after"?"after":"";
 
-  await env.DB.prepare(
-    `INSERT INTO field_definitions(id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,sort_order,options_json,searchable,created_at,updated_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
-  ).bind(id,key,label,String(b.fieldType||"text"),b.required?1:0,b.enabled===false?0:1,b.listVisible?1:0,
-    listSortOrder,sortOrder,JSON.stringify(b.options||[]),
-    b.searchable===false?0:1,t,t).run();
-  await audit(env,user,"create","field",id,{label,sortOrder});
+  if(insertAnchorId && insertPosition){
+    const anchor=await env.DB.prepare("SELECT id,sort_order FROM field_definitions WHERE id=?").bind(insertAnchorId).first();
+    if(!anchor)return fail("插入位置已经不存在，请刷新后重试",409,"INSERT_ANCHOR_MISSING");
+    const anchorSort=Number(anchor.sort_order||0);
+    sortOrder=Math.max(0,anchorSort+(insertPosition==="after"?1:0));
+
+    const listSortOrder=sortOrder;
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE field_definitions SET sort_order=sort_order+1,updated_at=? WHERE sort_order>=?"
+      ).bind(t,sortOrder),
+      env.DB.prepare(
+        `INSERT INTO field_definitions(id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,sort_order,options_json,searchable,created_at,updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
+      ).bind(id,key,label,String(b.fieldType||"text"),b.required?1:0,b.enabled===false?0:1,b.listVisible?1:0,
+        listSortOrder,sortOrder,JSON.stringify(b.options||[]),b.searchable===false?0:1,t,t)
+    ]);
+  }else{
+    const maxRow = await env.DB.prepare("SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM field_definitions").first();
+    const nextSort = Number(maxRow?.max_sort || 0) + 1;
+    sortOrder = b.sortOrder!==undefined ? safeInt(b.sortOrder,nextSort,0,100000) : nextSort;
+    const listSortOrder = b.listSortOrder!==undefined ? safeInt(b.listSortOrder,sortOrder,0,100000) : sortOrder;
+
+    await env.DB.prepare(
+      `INSERT INTO field_definitions(id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,sort_order,options_json,searchable,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).bind(id,key,label,String(b.fieldType||"text"),b.required?1:0,b.enabled===false?0:1,b.listVisible?1:0,
+      listSortOrder,sortOrder,JSON.stringify(b.options||[]),
+      b.searchable===false?0:1,t,t).run();
+  }
+
+  await audit(env,user,"create","field",id,{label,sortOrder,insertAnchorId:insertAnchorId||null,insertPosition:insertPosition||null});
   return responseJson({ok:true,id,sortOrder},201);
 }
 
@@ -945,14 +969,36 @@ async function createProgressDef(request, env, user) {
   const b=await readBody(request), label=String(b.label||"").trim();
   if(!label) return fail("请输入进度名称");
   const id=uid("p_"),t=now();
-  const maxRow=await env.DB.prepare("SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM progress_definitions WHERE enabled=1").first();
-  const nextSort=Number(maxRow?.max_sort||0)+1;
-  const sortOrder=b.sortOrder!==undefined?safeInt(b.sortOrder,nextSort,0,100000):nextSort;
-  await env.DB.prepare(
-    "INSERT INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)"
-  ).bind(id,label,String(b.description||""),b.enabled===false?0:1,sortOrder,String(b.color||"#2563eb"),t,t).run();
+
+  let sortOrder;
+  const insertAnchorId=String(b.insertAnchorId||"").trim();
+  const insertPosition=b.insertPosition==="before"?"before":b.insertPosition==="after"?"after":"";
+
+  if(insertAnchorId && insertPosition){
+    const anchor=await env.DB.prepare("SELECT id,sort_order FROM progress_definitions WHERE id=?").bind(insertAnchorId).first();
+    if(!anchor)return fail("插入位置已经不存在，请刷新后重试",409,"INSERT_ANCHOR_MISSING");
+    const anchorSort=Number(anchor.sort_order||0);
+    sortOrder=Math.max(0,anchorSort+(insertPosition==="after"?1:0));
+
+    await env.DB.batch([
+      env.DB.prepare(
+        "UPDATE progress_definitions SET sort_order=sort_order+1,updated_at=? WHERE sort_order>=?"
+      ).bind(t,sortOrder),
+      env.DB.prepare(
+        "INSERT INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)"
+      ).bind(id,label,String(b.description||""),b.enabled===false?0:1,sortOrder,String(b.color||"#2563eb"),t,t)
+    ]);
+  }else{
+    const maxRow=await env.DB.prepare("SELECT COALESCE(MAX(sort_order),0) AS max_sort FROM progress_definitions").first();
+    const nextSort=Number(maxRow?.max_sort||0)+1;
+    sortOrder=b.sortOrder!==undefined?safeInt(b.sortOrder,nextSort,0,100000):nextSort;
+    await env.DB.prepare(
+      "INSERT INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)"
+    ).bind(id,label,String(b.description||""),b.enabled===false?0:1,sortOrder,String(b.color||"#2563eb"),t,t).run();
+  }
+
   await recalcAllProgress(env);
-  await audit(env,user,"create","progress_definition",id,{label,sortOrder});
+  await audit(env,user,"create","progress_definition",id,{label,sortOrder,insertAnchorId:insertAnchorId||null,insertPosition:insertPosition||null});
   return responseJson({ok:true,id,sortOrder},201);
 }
 
