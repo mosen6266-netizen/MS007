@@ -426,8 +426,8 @@ async function renderDashboard(view,period=null,cache=null){
 
 async function getSales(){
   if(state.user.role!=="admin")return[];
-  const r=await api("/api/admin/users");
-  state.sales=(r.items||[]).filter(x=>x.role==="sales"&&x.active);
+  const r=await api("/api/admin/sales-options");
+  state.sales=r.items||[];
   return state.sales;
 }
 let currentListColumns=[];
@@ -446,7 +446,7 @@ async function renderCustomers(view){
       `<button class="btn" id="newCustomer">＋ 登记客户</button>`)+
     `<div class="toolbar">
       <input class="input" id="searchCustomer" placeholder="搜索姓名、案件编号或其他可搜索字段">
-      ${state.user.role==="admin"?`<select class="input" id="ownerFilter"><option value="">全部业务员</option>${sales.map(x=>`<option value="${esc(x.id)}">${esc(x.display_name)}</option>`).join("")}</select>`:""}
+      ${state.user.role==="admin"?`<select class="input" id="ownerFilter"><option value="">全部业务员</option>${sales.map(x=>`<option value="${esc(x.id)}">${esc(x.display_name)}${x.active?"":"（已停用）"}</option>`).join("")}</select>`:""}
       <button class="btn secondary" id="searchBtn">搜索</button>
       <span class="grow"></span>
       <button class="btn small" id="activeCustomersBtn">当前客户</button>
@@ -589,6 +589,19 @@ function registrationSectionHtml(section,fieldMap,customer){
   </section>`;
 }
 
+async function handleCustomerEditConflict(err,id,reopen){
+  if(err?.code!=="EDIT_CONFLICT")return false;
+  const reload=await uiConfirm(
+    "这名客户刚刚被其他人修改。为了避免覆盖对方的最新内容，系统已经阻止了本次保存。\n\n重新载入最新资料会丢弃当前这份未保存草稿；如果你还要查看当前填写内容，请先取消。",
+    {title:"检测到多人编辑冲突",confirmText:"重新载入最新资料",cancelText:"保留当前内容"}
+  );
+  if(reload){
+    removeDrawer({clearDraft:true});
+    await reopen(id);
+  }
+  return true;
+}
+
 async function openCustomerEditor(id=null){
   try{
     const [layout,sales,detail]=await Promise.all([
@@ -597,6 +610,7 @@ async function openCustomerEditor(id=null){
       id?api("/api/customers/"+encodeURIComponent(id)):Promise.resolve(null)
     ]);
     const customer=detail?.customer||null;
+    const assignableSales=state.user.role==="admin"?sales.filter(x=>x.active||customer?.ownerId===x.id):[];
     const fields=layout.fields||[];
     const fieldMap=new Map(fields.map(x=>[x.id,x]));
     const sections=(layout.sections||[]).map(s=>registrationSectionHtml(s,fieldMap,customer)).join("");
@@ -631,7 +645,7 @@ async function openCustomerEditor(id=null){
 
     openDrawer(id?"编辑客户":"登记客户",`
       <form id="customerDrawerForm">
-        ${state.user.role==="admin"?`<section class="form-section"><div class="form-section-head"><h3>负责人</h3></div><div class="form-grid"><div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${sales.map(x=>`<option value="${esc(x.id)}" ${customer?.ownerId===x.id?"selected":""}>${esc(x.display_name)}</option>`).join("")}</select></div></div></section>`:""}
+        ${state.user.role==="admin"?`<section class="form-section"><div class="form-section-head"><h3>负责人</h3></div><div class="form-grid"><div class="field"><label>业务员</label><select class="input" name="owner"><option value="">暂不分配</option>${assignableSales.map(x=>`<option value="${esc(x.id)}" ${customer?.ownerId===x.id?"selected":""}>${esc(x.display_name)}${x.active?"":"（已停用，保留现负责人）"}</option>`).join("")}</select></div></div></section>`:""}
         ${sections}
         ${progressSection}
         <div class="drawer-actions">
@@ -674,20 +688,17 @@ async function openCustomerEditor(id=null){
 
           try{
             if(id){
-              await api("/api/customers/"+encodeURIComponent(id),{method:"PATCH",body});
-              for(const p of changedProgress){
-                await api("/api/customers/"+encodeURIComponent(id)+"/progress/"+encodeURIComponent(p.id),{
-                  method:"PUT",
-                  body:{completed:p.completed}
-                });
-              }
+              body.expectedVersion=customer.editVersion;
+              body.progressChanges=changedProgress;
+              await api("/api/customers/"+encodeURIComponent(id),{method:"PUT",body});
             }else{
               await api("/api/customers",{method:"POST",body});
             }
             closeDrawer();
-            toast(id?(changedProgress.length?"客户资料和进度已保存":"客户资料已保存"):"客户已登记");
+            toast(id?(changedProgress.length?"客户资料和进度已一次性保存":"客户资料已保存"):"客户已登记");
             if(document.querySelector("#customerResults")) await loadCustomerPage(true);
           }catch(err){
+            if(id && await handleCustomerEditConflict(err,id,openCustomerEditor))return;
             toast(err.message);
             if(saveBtn){saveBtn.disabled=false;saveBtn.textContent=id?"保存修改":"保存客户"}
           }
@@ -756,16 +767,17 @@ async function openCustomerProgressPanel(id){
         const btn=document.querySelector("#quickProgressSave");
         btn.disabled=true;btn.textContent="正在保存...";
         try{
-          for(const p of changed){
-            await api("/api/customers/"+encodeURIComponent(id)+"/progress/"+encodeURIComponent(p.id),{
+          if(changed.length){
+            await api("/api/customers/"+encodeURIComponent(id),{
               method:"PUT",
-              body:{completed:p.completed}
+              body:{expectedVersion:customer.editVersion,progressChanges:changed}
             });
           }
           closeDrawer();
-          toast(changed.length?"客户进度已保存":"客户进度没有变化");
+          toast(changed.length?"客户进度已一次性保存":"客户进度没有变化");
           if(document.querySelector("#customerResults"))await loadCustomerPage(true);
         }catch(err){
+          if(await handleCustomerEditConflict(err,id,openCustomerProgressPanel))return;
           toast(err.message);
           btn.disabled=false;btn.textContent="保存进度";
         }
