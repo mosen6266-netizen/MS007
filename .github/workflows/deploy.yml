@@ -45,16 +45,42 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          npx --yes wrangler@latest d1 list --json > /tmp/d1-list.json
-          DB_ID=$(node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('/tmp/d1-list.json','utf8'));const a=Array.isArray(x)?x:(x.result||[]);const d=a.find(v=>v.name==='ms007-crm');if(d)process.stdout.write(d.uuid||d.id||'')")
+
+          curl -fsS             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             -H "Content-Type: application/json"             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"             > /tmp/d1-list.json
+
+          DB_ID=$(node - <<'NODE'
+          const fs=require('fs');
+          const x=JSON.parse(fs.readFileSync('/tmp/d1-list.json','utf8'));
+          if(!x.success) {
+            console.error(JSON.stringify(x.errors||x));
+            process.exit(2);
+          }
+          const d=(x.result||[]).find(v=>v.name==='ms007-crm');
+          if(d) process.stdout.write(d.uuid||'');
+          NODE
+          )
+
           if [ -z "$DB_ID" ]; then
-            npx --yes wrangler@latest d1 create ms007-crm --json > /tmp/d1-create.json
-            DB_ID=$(node -e "const fs=require('fs');const x=JSON.parse(fs.readFileSync('/tmp/d1-create.json','utf8'));const d=x.result||x;process.stdout.write(d.uuid||d.id||d.database_id||'')")
+            curl -fsS               -X POST               -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"               -H "Content-Type: application/json"               --data '{"name":"ms007-crm"}'               "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/d1/database"               > /tmp/d1-create.json
+
+            DB_ID=$(node - <<'NODE'
+          const fs=require('fs');
+          const x=JSON.parse(fs.readFileSync('/tmp/d1-create.json','utf8'));
+          if(!x.success) {
+            console.error(JSON.stringify(x.errors||x));
+            process.exit(2);
+          }
+          const d=x.result||{};
+          process.stdout.write(d.uuid||'');
+          NODE
+            )
           fi
+
           if [ -z "$DB_ID" ]; then
             echo "Could not resolve D1 database ID" >&2
             exit 1
           fi
+
           echo "database_id=$DB_ID" >> "$GITHUB_OUTPUT"
 
       - name: Build deploy config
