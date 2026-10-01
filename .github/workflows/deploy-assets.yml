@@ -1,0 +1,102 @@
+name: Deploy MS007 assets only
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/deploy-assets.yml"
+
+concurrency:
+  group: ms007-assets-production
+  cancel-in-progress: true
+
+jobs:
+  deploy-assets:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Frontend and Worker syntax
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check public/app.js
+          node --check src/worker.js
+
+      - name: Require Cloudflare authorization
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$CLOUDFLARE_API_TOKEN"
+          test -n "$CLOUDFLARE_ACCOUNT_ID"
+
+      - name: Resolve production D1 binding
+        id: d1
+        shell: bash
+        run: |
+          set -euo pipefail
+          node scripts/resolve-d1.mjs ms007-crm > /tmp/d1.json
+          echo "database_id=$(node -e "const x=require('/tmp/d1.json');process.stdout.write(x.id)")" >> "$GITHUB_OUTPUT"
+
+      - name: Build production config without touching D1 data
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHORT_SHA="${GITHUB_SHA:0:12}"
+          node scripts/build-deploy-config.mjs             output=wrangler.production.toml             worker=ms007-crm             db=ms007-crm             id="${{ steps.d1.outputs.database_id }}"             version="$SHORT_SHA"             channel=production
+
+      - name: Resolve workers.dev subdomain
+        id: subdomain
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsS             -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"             -H "Content-Type: application/json"             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/subdomain"             > /tmp/workers-subdomain.json
+          CURRENT=$(node - <<'NODE'
+          const fs=require("fs");
+          const x=JSON.parse(fs.readFileSync("/tmp/workers-subdomain.json","utf8"));
+          if(!x.success)throw new Error(JSON.stringify(x.errors||x));
+          if(x.result?.subdomain)process.stdout.write(x.result.subdomain);
+          NODE
+          )
+          test -n "$CURRENT"
+          echo "subdomain=$CURRENT" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy production Worker and static assets only
+        run: npx --yes wrangler@latest deploy --config wrangler.production.toml
+
+      - name: Asset-only production smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="https://ms007-crm.${{ steps.subdomain.outputs.subdomain }}.workers.dev"
+          EXPECTED="${GITHUB_SHA:0:12}"
+          export EXPECTED
+
+          for i in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS "$URL/api/health" > /tmp/health.json; then
+              if node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync("/tmp/health.json","utf8"));process.exit(x.ok&&x.channel==="production"&&x.version===process.env.EXPECTED?0:1)'; then
+                break
+              fi
+            fi
+            sleep 3
+          done
+          cat /tmp/health.json
+          node -e 'const fs=require("fs");const x=JSON.parse(fs.readFileSync("/tmp/health.json","utf8"));if(!(x.ok&&x.channel==="production"&&x.version===process.env.EXPECTED))process.exit(1)'
+
+          curl -fsS "$URL/branding/ms007-icon.svg" | grep -q "<svg"
+          curl -fsS "$URL/branding/ms007-logo.svg" | grep -q "<svg"
+          curl -fsS "$URL/manifest.webmanifest" | grep -q "MS007"
+          echo "MS007 brand assets are live."
