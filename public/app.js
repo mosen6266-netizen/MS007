@@ -42,6 +42,18 @@ async function api(path, options={}){
 function pageHead(title, sub="", right=""){
   return `<div class="page-head"><div><h1>${esc(title)}</h1>${sub?`<p>${esc(sub)}</p>`:""}</div><div>${right}</div></div>`;
 }
+function listPagerHtml(prefix,page,pages,total){
+  page=Math.max(1,Number(page)||1);
+  pages=Math.max(1,Number(pages)||1);
+  total=Math.max(0,Number(total)||0);
+  return `<div class="list-pager">
+    <div class="muted">共 ${total} 条 · 第 ${page} / ${pages} 页 · 每页 50 条</div>
+    <div class="row">
+      <button class="btn ghost small" id="${prefix}Prev" ${page<=1?"disabled":""}>上一页</button>
+      <button class="btn ghost small" id="${prefix}Next" ${page>=pages?"disabled":""}>下一页</button>
+    </div>
+  </div>`;
+}
 function progressTone(p){
   if(p>=100)return "#dcfce7";
   if(p>=80)return "#ede9fe";
@@ -840,9 +852,11 @@ async function renderCustomerDetail(view,id){
   await openCustomerPreview(id);
 }
 
-async function renderSales(view){
-  const r=await api("/api/admin/users");
+async function renderSales(view,page=1){
+  const r=await api("/api/admin/users?page="+encodeURIComponent(page)+"&limit=50");
   const items=r.items||[];
+  const currentPage=Number(r.page||page||1);
+  const pages=Number(r.pages||1);
 
   view.innerHTML=pageHead(
     "业务员管理",
@@ -860,7 +874,8 @@ async function renderSales(view){
       <td><span class="tag">${x.active?"启用":"停用"}</span></td>
       <td>${esc((x.created_at||"").slice(0,10))}</td>
       <td><button class="btn ghost small" data-edit-user="${esc(x.id)}">设置</button></td>
-    </tr>`).join("")}</tbody></table></div>`;
+    </tr>`).join("")||'<tr><td colspan="6" class="muted">还没有账号</td></tr>'}</tbody></table></div>
+    ${listPagerHtml("usersPage",currentPage,pages,r.total||0)}`;
 
   const openCreateUser=(role)=>{
     const isAdmin=role==="admin";
@@ -884,7 +899,7 @@ async function renderSales(view){
           });
           closeModal();
           toast(isAdmin?"管理员账号已创建":"业务员已创建");
-          renderSales(view);
+          renderSales(view,currentPage);
         }catch(e){toast(e.message)}
       };
     },{draftKey:`${role}-user:new`});
@@ -918,11 +933,14 @@ async function renderSales(view){
           await api("/api/admin/users/"+u.id,{method:"PATCH",body});
           closeModal();
           toast(isAdmin?"管理员账号设置已保存":"业务员账号设置已保存");
-          renderSales(view);
+          renderSales(view,currentPage);
         }catch(e){toast(e.message)}
       };
     },{draftKey:`${u.role}-user:${u.id}`});
   });
+
+  document.querySelector("#usersPagePrev").onclick=()=>renderSales(view,currentPage-1);
+  document.querySelector("#usersPageNext").onclick=()=>renderSales(view,currentPage+1);
 }
 
 const fieldTypeName={
@@ -2278,23 +2296,121 @@ const entityName={
   business_data:"业务数据",session:"登录会话"
 };
 
-async function renderAudit(view){
-  const r=await api("/api/admin/audit?limit=200");
+async function renderAudit(view,opts={}){
+  const stateOpts={
+    page:Number(opts.page||1),
+    actor:String(opts.actor||""),
+    action:String(opts.action||""),
+    from:String(opts.from||""),
+    to:String(opts.to||"")
+  };
+  const qs=new URLSearchParams({page:String(stateOpts.page),limit:"50"});
+  if(stateOpts.actor)qs.set("actor",stateOpts.actor);
+  if(stateOpts.action)qs.set("action",stateOpts.action);
+  if(stateOpts.from)qs.set("from",stateOpts.from+"T00:00:00.000Z");
+  if(stateOpts.to){
+    const d=new Date(stateOpts.to+"T00:00:00");
+    d.setDate(d.getDate()+1);
+    qs.set("to",d.toISOString());
+  }
+
+  const r=await api("/api/admin/audit?"+qs.toString());
   const items=r.items||[];
+  const currentPage=Number(r.page||stateOpts.page||1);
+  const pages=Number(r.pages||1);
+
   view.innerHTML=pageHead("操作记录","查看谁在什么时候对系统做了什么操作")+
-    `<div class="table-wrap"><table><thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>对象ID</th></tr></thead><tbody>
-    ${items.map(x=>`<tr><td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td><td>${esc(x.actor_name||"系统")}</td><td>${esc(actionName[x.action]||x.action)}</td><td>${esc(entityName[x.entity_type]||x.entity_type)}</td><td><span class="muted">${esc(x.entity_id||"")}</span></td></tr>`).join("")||`<tr><td colspan="5" class="muted">还没有操作记录</td></tr>`}</tbody></table></div>`;
+    `<div class="card list-filter-card">
+      <div class="list-filter-grid audit-filter-grid">
+        <div class="field"><label>操作人</label><select class="input" id="auditActor">
+          <option value="">全部操作人</option>
+          <option value="__system__" ${stateOpts.actor==="__system__"?"selected":""}>系统</option>
+          ${(r.actors||[]).map(x=>`<option value="${esc(x.id)}" ${stateOpts.actor===x.id?"selected":""}>${esc(x.display_name)}（${x.role==="admin"?"管理员":"业务员"}）</option>`).join("")}
+        </select></div>
+        <div class="field"><label>操作类型</label><select class="input" id="auditAction">
+          <option value="">全部操作</option>
+          ${(r.actions||[]).map(x=>`<option value="${esc(x)}" ${stateOpts.action===x?"selected":""}>${esc(actionName[x]||x)}</option>`).join("")}
+        </select></div>
+        <div class="field"><label>开始日期</label><input class="input" type="date" id="auditFrom" value="${esc(stateOpts.from)}"></div>
+        <div class="field"><label>结束日期</label><input class="input" type="date" id="auditTo" value="${esc(stateOpts.to)}"></div>
+      </div>
+      <div class="row wrap">
+        <button class="btn" id="auditApply">筛选</button>
+        <button class="btn ghost" id="auditReset">清除筛选</button>
+      </div>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>对象ID</th></tr></thead><tbody>
+      ${items.map(x=>`<tr><td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td><td>${esc(x.actor_name||"系统")}</td><td>${esc(actionName[x.action]||x.action)}</td><td>${esc(entityName[x.entity_type]||x.entity_type)}</td><td><span class="muted">${esc(x.entity_id||"")}</span></td></tr>`).join("")||`<tr><td colspan="5" class="muted">没有符合条件的操作记录</td></tr>`}
+    </tbody></table></div>
+    ${listPagerHtml("auditPage",currentPage,pages,r.total||0)}`;
+
+  const readFilters=()=>({
+    page:1,
+    actor:val("auditActor"),
+    action:val("auditAction"),
+    from:val("auditFrom"),
+    to:val("auditTo")
+  });
+  document.querySelector("#auditApply").onclick=()=>renderAudit(view,readFilters());
+  document.querySelector("#auditReset").onclick=()=>renderAudit(view,{page:1});
+  document.querySelector("#auditPagePrev").onclick=()=>renderAudit(view,{...stateOpts,page:currentPage-1});
+  document.querySelector("#auditPageNext").onclick=()=>renderAudit(view,{...stateOpts,page:currentPage+1});
 }
 
-async function renderRecycle(view){
-  const r=await api("/api/admin/recycle");
+async function renderRecycle(view,opts={}){
+  const stateOpts={
+    page:Number(opts.page||1),
+    q:String(opts.q||""),
+    owner:String(opts.owner||"")
+  };
+  const qs=new URLSearchParams({page:String(stateOpts.page),limit:"50"});
+  if(stateOpts.q)qs.set("q",stateOpts.q);
+  if(stateOpts.owner)qs.set("owner",stateOpts.owner);
+  const r=await api("/api/admin/recycle?"+qs.toString());
   const items=r.items||[];
+  const currentPage=Number(r.page||stateOpts.page||1);
+  const pages=Number(r.pages||1);
+
   view.innerHTML=pageHead("回收站","删除客户不会立即永久消失，可以在这里恢复")+
-    `<div class="table-wrap"><table><thead><tr><th>客户姓名</th><th>业务员</th><th>删除时间</th><th>操作</th></tr></thead><tbody>
-    ${items.map(x=>`<tr><td><strong>${esc(x.name)}</strong></td><td>${esc(x.owner_name||"未分配")}</td><td>${esc((x.deleted_at||"").replace("T"," ").slice(0,19))}</td><td><button class="btn secondary small" data-restore="${esc(x.id)}">恢复客户</button></td></tr>`).join("")||`<tr><td colspan="4" class="muted">回收站为空</td></tr>`}</tbody></table></div>`;
-  document.querySelectorAll("[data-restore]").forEach(b=>b.onclick=async()=>{
-    try{await api("/api/admin/recycle/"+b.dataset.restore+"/restore",{method:"POST"});toast("客户已恢复");renderRecycle(view)}catch(e){toast(e.message)}
+    `<div class="card list-filter-card">
+      <div class="list-filter-grid recycle-filter-grid">
+        <div class="field"><label>搜索客户姓名</label><input class="input" id="recycleSearch" value="${esc(stateOpts.q)}" placeholder="输入客户姓名"></div>
+        <div class="field"><label>业务员</label><select class="input" id="recycleOwner">
+          <option value="">全部业务员</option>
+          <option value="__none__" ${stateOpts.owner==="__none__"?"selected":""}>未分配</option>
+          ${(r.owners||[]).map(x=>`<option value="${esc(x.id)}" ${stateOpts.owner===x.id?"selected":""}>${esc(x.display_name)}${x.active?"":"（已停用）"}</option>`).join("")}
+        </select></div>
+      </div>
+      <div class="row wrap">
+        <button class="btn" id="recycleApply">筛选</button>
+        <button class="btn ghost" id="recycleReset">清除筛选</button>
+      </div>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>客户姓名</th><th>业务员</th><th>删除时间</th><th>操作</th></tr></thead><tbody>
+      ${items.map(x=>`<tr><td><strong>${esc(x.name)}</strong></td><td>${esc(x.owner_name||"未分配")}</td><td>${esc((x.deleted_at||"").replace("T"," ").slice(0,19))}</td><td><button class="btn secondary small" data-restore="${esc(x.id)}">恢复客户</button></td></tr>`).join("")||`<tr><td colspan="4" class="muted">没有符合条件的回收站客户</td></tr>`}
+    </tbody></table></div>
+    ${listPagerHtml("recyclePage",currentPage,pages,r.total||0)}`;
+
+  const readFilters=()=>({
+    page:1,
+    q:val("recycleSearch").trim(),
+    owner:val("recycleOwner")
   });
+  document.querySelector("#recycleApply").onclick=()=>renderRecycle(view,readFilters());
+  document.querySelector("#recycleReset").onclick=()=>renderRecycle(view,{page:1});
+  document.querySelector("#recycleSearch").onkeydown=e=>{if(e.key==="Enter")renderRecycle(view,readFilters())};
+
+  document.querySelectorAll("[data-restore]").forEach(b=>b.onclick=async()=>{
+    try{
+      await api("/api/admin/recycle/"+b.dataset.restore+"/restore",{method:"POST"});
+      toast("客户已恢复");
+      const nextPage=items.length===1&&currentPage>1?currentPage-1:currentPage;
+      renderRecycle(view,{...stateOpts,page:nextPage});
+    }catch(e){toast(e.message)}
+  });
+
+  document.querySelector("#recyclePagePrev").onclick=()=>renderRecycle(view,{...stateOpts,page:currentPage-1});
+  document.querySelector("#recyclePageNext").onclick=()=>renderRecycle(view,{...stateOpts,page:currentPage+1});
 }
 
 async function renderBackup(view){
