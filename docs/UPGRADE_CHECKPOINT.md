@@ -12,6 +12,8 @@ Agreed seven-batch hardening plan is documented in docs/UPGRADE_PLAN.md.
 
 Batch 0 is COMPLETE.
 
+Batch 1 is COMPLETE.
+
 Changes already committed in Batch 0:
 - Added migrations/0000_baseline_migration_system.sql.
 - Configured Wrangler migrations directory.
@@ -40,3 +42,30 @@ Next work: Batch 1 - first-priority data correctness.
 ## Resume instruction for a new chat
 
 "Continue MS007 seven-batch upgrade plan from docs/UPGRADE_PLAN.md and docs/UPGRADE_CHECKPOINT.md. Verify the latest GitHub commit and workflow status first, then continue from the last completed checkpoint without repeating or resetting existing production data."
+
+
+## Batch 1 completed verification
+
+Final verified commit: 609bffb0180c674dfb649157f9d77303b8d79793
+
+Implemented:
+- Dedicated complete salesperson selector API; account-management pagination no longer truncates customer owner selectors.
+- Existing inactive owners remain visible and can be retained; new assignments to inactive accounts are blocked.
+- Atomic customer profile + progress save.
+- Optimistic edit-version conflict protection prevents stale editors from overwriting newer changes.
+- Server-side validation for required fields, supported data types, select options, field existence, and owner validity.
+- Dashboard ownership statistics retain inactive salespeople who still own customers.
+- One-time repair of derived customer progress totals/percentages without changing completion records or completion timestamps.
+- Regression tests for guarded field/progress updates and stale-version protection.
+
+Verification:
+- Quality Check run 36918622222: success.
+- Deploy run 36918622051: success.
+- Validation regression step: success.
+- Staging migrations/deploy/smoke: success.
+- Production recovery point: success.
+- Production migrations: success.
+- Production bootstrap schema: skipped because the existing production database was preserved.
+- Production deploy/smoke: success.
+
+Next work: Batch 2 - referential consistency and detailed auditing.
