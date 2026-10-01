@@ -584,7 +584,7 @@ async function telegramRecentActivity(env,limit=20){
     `SELECT * FROM (
        SELECT
          l.id,l.status,l.error_text,l.created_at,
-         NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,
+         NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,NULL AS requires_admin,
          c.name customer_name,u.display_name actor_name,p.label progress_name
        FROM telegram_delivery_logs l
        LEFT JOIN customers c ON c.id=l.customer_id
@@ -595,12 +595,17 @@ async function telegramRecentActivity(env,limit=20){
 
        SELECT
          q.id,
-         CASE WHEN q.status='retry' THEN 'retry' ELSE 'pending' END AS status,
+         CASE
+           WHEN COALESCE(q.requires_admin,0)=1 THEN 'needs_admin'
+           WHEN q.status='retry' THEN 'retry'
+           ELSE 'pending'
+         END AS status,
          q.last_error AS error_text,
          q.created_at,
          q.chat_id,
          q.next_attempt_at,
          q.attempts,
+         q.requires_admin,
          c.name customer_name,u.display_name actor_name,p.label progress_name
        FROM telegram_send_queue q
        LEFT JOIN customers c ON c.id=q.customer_id
@@ -613,9 +618,76 @@ async function telegramRecentActivity(env,limit=20){
   return r.results||[];
 }
 
+async function telegramQueueMonitor(env){
+  const cutoff=new Date(Date.now()-24*60*60*1000).toISOString();
+  const [queue,delivery]=await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        SUM(CASE WHEN COALESCE(requires_admin,0)=0 AND status='pending' THEN 1 ELSE 0 END) pending_count,
+        SUM(CASE WHEN COALESCE(requires_admin,0)=0 AND status='retry' THEN 1 ELSE 0 END) retry_count,
+        SUM(CASE WHEN COALESCE(requires_admin,0)=1 THEN 1 ELSE 0 END) needs_admin_count,
+        MIN(CASE WHEN COALESCE(requires_admin,0)=0 AND status IN ('pending','retry','sending') THEN created_at END) oldest_active_at
+       FROM telegram_send_queue`
+    ).first(),
+    env.DB.prepare(
+      `SELECT
+        SUM(CASE WHEN status='success' THEN 1 ELSE 0 END) success_count,
+        SUM(CASE WHEN status='failed' THEN 1 ELSE 0 END) failed_count
+       FROM telegram_delivery_logs
+       WHERE created_at>=? AND status IN ('success','failed')`
+    ).bind(cutoff).first()
+  ]);
+  const success=Number(delivery?.success_count||0);
+  const failed=Number(delivery?.failed_count||0);
+  const recentTotal=success+failed;
+  const oldest=String(queue?.oldest_active_at||"");
+  const oldestMs=Date.parse(oldest);
+  return {
+    pendingCount:Number(queue?.pending_count||0),
+    retryCount:Number(queue?.retry_count||0),
+    needsAdminCount:Number(queue?.needs_admin_count||0),
+    oldestActiveAt:oldest||null,
+    oldestWaitSeconds:Number.isFinite(oldestMs)?Math.max(0,Math.floor((Date.now()-oldestMs)/1000)):0,
+    recentWindowHours:24,
+    recentSuccessCount:success,
+    recentFailedCount:failed,
+    recentTotal,
+    recentSuccessRate:recentTotal?Number((success*100/recentTotal).toFixed(1)):null
+  };
+}
+
+async function retryTelegramQueueItem(env,user,id,ctx){
+  const row=await env.DB.prepare(
+    "SELECT id,status,requires_admin,last_error FROM telegram_send_queue WHERE id=?"
+  ).bind(id).first();
+  if(!row)return fail("这条 Telegram 消息已经不存在，可能已经发送成功",404);
+  if(!Number(row.requires_admin||0))return fail("这条消息当前不需要管理员手动重试",409);
+  const t=now();
+  const result=await env.DB.prepare(
+    `UPDATE telegram_send_queue
+     SET status='retry',attempts=0,next_attempt_at=?,locked_until=NULL,
+         requires_admin=0,dead_lettered_at=NULL,
+         last_error=?,updated_at=?
+     WHERE id=? AND requires_admin=1`
+  ).bind(
+    t,
+    ("管理员已手动重试；之前原因："+String(row.last_error||"")).slice(0,1000),
+    t,
+    id
+  ).run();
+  if(Number(result?.meta?.changes||0)!==1)return fail("这条消息状态刚刚发生变化，请刷新后重试",409);
+  await audit(env,user,"retry","telegram_queue",id,{
+    previousError:String(row.last_error||"").slice(0,500)
+  });
+  const job=processTelegramQueue(env,{maxItems:2,maxRunMs:8000,allowShortWait:false}).catch(()=>{});
+  if(ctx?.waitUntil)ctx.waitUntil(job);
+  return responseJson({ok:true,id,message:"已重新进入发送队列"});
+}
+
 async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWait=false}={}){
   const started=Date.now();
   let processed=0;
+  const MAX_AUTO_ATTEMPTS=8;
 
   const settings=await telegramSettingsRow(env);
   if(!settings?.bot_token_enc)return {processed,reason:"token_missing"};
@@ -625,12 +697,17 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
   try{
     token=await telegramDecryptSecret(env,settings.bot_token_enc);
   }catch(e){
-    const retryAt=telegramAfterSeconds(300);
+    const t=now();
     await env.DB.prepare(
       `UPDATE telegram_send_queue
-       SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
-       WHERE status IN ('pending','retry','sending')`
-    ).bind(retryAt,"Token 无法解密，等待管理员重新保存 Token",now()).run();
+       SET status='retry',requires_admin=1,dead_lettered_at=?,
+           locked_until=NULL,last_error=?,updated_at=?
+       WHERE COALESCE(requires_admin,0)=0 AND status IN ('pending','retry','sending')`
+    ).bind(
+      t,
+      "Token 无法解密，需要管理员重新保存 Telegram Bot Token 后手动重试",
+      t
+    ).run();
     return {processed,reason:"token"};
   }
 
@@ -638,7 +715,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
     const current=now();
     const task=await env.DB.prepare(
       `SELECT * FROM telegram_send_queue
-       WHERE (
+       WHERE COALESCE(requires_admin,0)=0 AND (
          (status IN ('pending','retry') AND next_attempt_at<=?)
          OR
          (status='sending' AND locked_until IS NOT NULL AND locked_until<=?)
@@ -652,7 +729,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
         const nextRow=await env.DB.prepare(
           `SELECT MIN(next_attempt_at) next_at
            FROM telegram_send_queue
-           WHERE status IN ('pending','retry')`
+           WHERE COALESCE(requires_admin,0)=0 AND status IN ('pending','retry')`
         ).first();
         const nextMs=Date.parse(String(nextRow?.next_at||""));
         const waitMs=Number.isFinite(nextMs)?nextMs-Date.now():0;
@@ -682,7 +759,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
     const claim=await env.DB.prepare(
       `UPDATE telegram_send_queue
        SET status='sending',locked_until=?,updated_at=?
-       WHERE id=? AND (
+       WHERE id=? AND COALESCE(requires_admin,0)=0 AND (
          (status IN ('pending','retry') AND next_attempt_at<=?)
          OR
          (status='sending' AND locked_until IS NOT NULL AND locked_until<=?)
@@ -736,7 +813,8 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
       processed++;
     }catch(e){
       const attempts=Number(task.attempts||0)+1;
-      if(telegramRetryableError(e)){
+      const retryable=telegramRetryableError(e);
+      if(retryable && attempts<MAX_AUTO_ATTEMPTS){
         const delaySeconds=telegramRetryDelaySeconds(e,attempts-1);
         const retryAt=telegramAfterSeconds(delaySeconds);
         const reason=Number(e?.retryAfter||0)>0
@@ -749,14 +827,30 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
            WHERE id=?`
         ).bind(attempts,retryAt,String(reason).slice(0,1000),now(),task.id).run();
       }else{
+        const t=now();
+        const reason=retryable
+          ?("自动重试 "+attempts+" 次仍未成功，需要管理员检查后手动重试："+String(e?.message||e))
+          :("Telegram 拒绝了这条消息，需要管理员检查群 ID、权限或模板后手动重试："+String(e?.message||e));
         await logTelegramDelivery(env,{
           customerId:task.customer_id,
           actorUserId:task.actor_user_id,
           progressId:task.progress_id,
           status:"failed",
-          error:"群 "+task.chat_id+"："+String(e?.message||e)
+          error:"群 "+task.chat_id+"："+String(reason).slice(0,900)
         });
-        await env.DB.prepare("DELETE FROM telegram_send_queue WHERE id=?").bind(task.id).run();
+        await env.DB.prepare(
+          `UPDATE telegram_send_queue
+           SET status='retry',attempts=?,next_attempt_at=?,locked_until=NULL,
+               requires_admin=1,dead_lettered_at=?,last_error=?,updated_at=?
+           WHERE id=?`
+        ).bind(
+          attempts,
+          t,
+          t,
+          String(reason).slice(0,1000),
+          t,
+          task.id
+        ).run();
       }
       processed++;
     }
@@ -773,7 +867,7 @@ async function telegramAdminGet(env){
     const parsed=JSON.parse(row.fields_json||"[]");
     if(Array.isArray(parsed))fields=parsed;
   }catch{}
-  const [availableFields,logs,progressDefs,routes,templateVariables]=await Promise.all([
+  const [availableFields,logs,progressDefs,routes,templateVariables,queueMonitor]=await Promise.all([
     telegramAvailableFields(env),
     telegramRecentActivity(env,20).then(results=>({results})),
     env.DB.prepare(
@@ -782,7 +876,8 @@ async function telegramAdminGet(env){
     env.DB.prepare(
       "SELECT progress_id,route_mode,chat_id FROM telegram_progress_routes"
     ).all(),
-    telegramTemplateVariables(env)
+    telegramTemplateVariables(env),
+    telegramQueueMonitor(env)
   ]);
   const messageTemplate=normalizedTemplate;
   return responseJson({
@@ -801,6 +896,7 @@ async function telegramAdminGet(env){
     templateVariables,
     progressDefs:progressDefs.results||[],
     routes:routes.results||[],
+    queueMonitor,
     logs:logs.results||[]
   });
 }
@@ -810,13 +906,13 @@ async function telegramLogs(request,env){
   const limit=safeInt(url.searchParams.get("limit"),50,1,100);
   const status=String(url.searchParams.get("status")||"").trim();
   const cursor=decodeCursor(url.searchParams.get("cursor"));
-  const allowedStatus=new Set(["pending","retry","success","failed","skipped"]);
+  const allowedStatus=new Set(["pending","retry","needs_admin","success","failed","skipped"]);
   const statusFilter=allowedStatus.has(status)?status:"";
 
   const baseSql=`
     SELECT
       l.id,l.status,l.error_text,l.created_at,
-      NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,
+      NULL AS chat_id,NULL AS next_attempt_at,NULL AS attempts,NULL AS requires_admin,
       c.name customer_name,u.display_name actor_name,p.label progress_name
     FROM telegram_delivery_logs l
     LEFT JOIN customers c ON c.id=l.customer_id
@@ -827,12 +923,17 @@ async function telegramLogs(request,env){
 
     SELECT
       q.id,
-      CASE WHEN q.status='retry' THEN 'retry' ELSE 'pending' END AS status,
+      CASE
+        WHEN COALESCE(q.requires_admin,0)=1 THEN 'needs_admin'
+        WHEN q.status='retry' THEN 'retry'
+        ELSE 'pending'
+      END AS status,
       q.last_error AS error_text,
       q.created_at,
       q.chat_id,
       q.next_attempt_at,
       q.attempts,
+      q.requires_admin,
       c.name customer_name,u.display_name actor_name,p.label progress_name
     FROM telegram_send_queue q
     LEFT JOIN customers c ON c.id=q.customer_id
@@ -3995,6 +4096,8 @@ async function api(request, env, ctx) {
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
   if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
   if (path === "/api/admin/telegram/logs" && method === "GET") return telegramLogs(request,env);
+  m=path.match(/^\/api\/admin\/telegram\/queue\/([^/]+)\/retry$/);
+  if(m && method==="POST") return retryTelegramQueueItem(env,user,m[1],ctx);
   if (path === "/api/admin/telegram" && method === "PUT") return telegramAdminSave(request,env,user);
   if (path === "/api/admin/telegram/test" && method === "POST") return telegramAdminTest(request,env,user);
   if (path === "/api/admin/registration-layout" && method === "GET") return adminRegistrationLayout(env);
