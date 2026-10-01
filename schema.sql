@@ -184,25 +184,11 @@ INSERT OR IGNORE INTO sidebar_items
 ('ss_customers','sales','我的客户','users','#/sales/customers','same',1,20,'',datetime('now'),datetime('now')),
 ('ss_new','sales','登记客户','user-plus','#/sales/new','same',1,30,'',datetime('now'),datetime('now'));
 
-INSERT OR IGNORE INTO list_columns
-(id,audience,column_key,field_id,label,enabled,sort_order) VALUES
-('lca_name','admin','name',NULL,'客户姓名',1,10),
-('lca_owner','admin','owner',NULL,'业务员',1,20),
-('lca_case','admin','dynamic','f_case_no','案件编号',1,30),
-('lca_country','admin','dynamic','f_country','国家/地区',1,40),
-('lcs_name','sales','name',NULL,'客户姓名',1,10),
-('lcs_case','sales','dynamic','f_case_no','案件编号',1,20),
-('lcs_country','sales','dynamic','f_country','国家/地区',1,30);
+-- Customer list columns are intentionally NOT seeded here.
+-- Administrators fully control which columns are shown. Re-running schema.sql must never recreate removed columns.
 
-INSERT OR IGNORE INTO dashboard_widgets
-(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES
-('dwa_total','admin','metric_total','客户总数',1,10,'{}'),
-('dwa_today','admin','metric_today','今日新增',1,20,'{}'),
-('dwa_complete','admin','metric_complete','已完成',1,30,'{}'),
-('dwa_sales','admin','sales_breakdown','业务员客户分布',1,40,'{}'),
-('dws_total','sales','metric_total','我的客户',1,10,'{}'),
-('dws_today','sales','metric_today','今日新增',1,20,'{}'),
-('dws_complete','sales','metric_complete','已完成',1,30,'{}');
+-- Dashboard widgets are intentionally NOT seeded here.
+-- Administrators fully control dashboard contents. Re-running schema.sql must never recreate removed widgets.
 
 INSERT OR IGNORE INTO system_settings(setting_key,value_json,updated_at) VALUES
 ('capacity_config','{"provider":"Cloudflare","database":"D1","free_single_db_mb":500,"free_account_gb":5,"free_rows_read_day":5000000,"free_rows_write_day":100000,"free_worker_requests_day":100000,"paid_base_usd_month":5,"warning_percent":70,"upgrade_percent":85,"urgent_percent":95,"upgrade_url":"https://dash.cloudflare.com/","pricing_checked":"2026-10-01"}',datetime('now'));
