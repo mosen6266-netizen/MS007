@@ -898,7 +898,7 @@ async function recalcProgress(env, customerId) {
   const done = Number(totals?.done || 0);
   const percent = total > 0 ? Math.round(done * 100 / total) : 0;
   await env.DB.prepare(
-    "UPDATE customers SET progress_done=?,progress_total=?,progress_percent=?,updated_at=? WHERE id=?"
+    "UPDATE customers SET progress_done=?,progress_total=?,progress_percent=?,updated_at=?,edit_version=edit_version+1 WHERE id=?"
   ).bind(done, total, percent, now(), customerId).run();
   return { done, total, percent };
 }
@@ -1172,9 +1172,106 @@ async function listCustomers(request, env, user) {
   });
 }
 
+function validateCustomerName(value){
+  const name=String(value??"").trim();
+  if(!name)return {ok:false,message:"请输入客户姓名"};
+  if(name.length>300)return {ok:false,message:"客户姓名不能超过 300 个字符"};
+  return {ok:true,value:name};
+}
+
+function validateFieldValue(field,raw){
+  const value=String(raw??"");
+  const trimmed=value.trim();
+  const type=String(field.field_type||"text");
+
+  if(field.required && !trimmed)return {ok:false,message:"「"+field.label+"」为必填项"};
+
+  const max=type==="textarea"?50000:10000;
+  if(value.length>max)return {ok:false,message:"「"+field.label+"」内容过长"};
+
+  if(trimmed){
+    if(type==="email" && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)){
+      return {ok:false,message:"「"+field.label+"」邮箱格式不正确"};
+    }
+    if(type==="number" && !Number.isFinite(Number(trimmed))){
+      return {ok:false,message:"「"+field.label+"」必须填写有效数字"};
+    }
+    if(type==="date" && !/^\d{4}-\d{2}-\d{2}$/.test(trimmed)){
+      return {ok:false,message:"「"+field.label+"」日期格式不正确"};
+    }
+    if(type==="time" && !/^(?:[01]\d|2[0-3]):[0-5]\d(?::[0-5]\d)?$/.test(trimmed)){
+      return {ok:false,message:"「"+field.label+"」时间格式不正确"};
+    }
+    if(type==="url"){
+      try{
+        const u=new URL(trimmed);
+        if(!["http:","https:"].includes(u.protocol))throw new Error("protocol");
+      }catch{
+        return {ok:false,message:"「"+field.label+"」网址格式不正确"};
+      }
+    }
+    if(type==="select"||type==="single"){
+      let options=[];
+      try{
+        const parsed=JSON.parse(field.options_json||"[]");
+        if(Array.isArray(parsed))options=parsed.map(x=>String(x));
+      }catch{}
+      if(!options.includes(value)){
+        return {ok:false,message:"「"+field.label+"」的选择值已经不在当前选项中，请重新选择"};
+      }
+    }
+  }
+
+  return {ok:true,value};
+}
+
+async function validateCustomerValues(env,values,{requireRequired=true}={}){
+  const input=values && typeof values==="object" && !Array.isArray(values)?values:{};
+  const defsResult=await env.DB.prepare(
+    "SELECT id,label,field_type,required,options_json FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  const defs=defsResult.results||[];
+  const byId=new Map(defs.map(x=>[x.id,x]));
+
+  for(const key of Object.keys(input)){
+    if(!byId.has(key))return {ok:false,message:"客户资料中包含已经停用或不存在的登记条目，请刷新页面后重试"};
+  }
+
+  const normalized={};
+  for(const field of defs){
+    const has=Object.prototype.hasOwnProperty.call(input,field.id);
+    if(!has){
+      if(requireRequired && field.required)return {ok:false,message:"「"+field.label+"」为必填项"};
+      continue;
+    }
+    const checked=validateFieldValue(field,input[field.id]);
+    if(!checked.ok)return checked;
+    normalized[field.id]=checked.value;
+  }
+  return {ok:true,values:normalized,fields:defs};
+}
+
+async function resolveCustomerOwner(env,user,current,requestedProvided,requestedValue){
+  if(normalizedRole(user.role)==="sales")return {ok:true,ownerId:user.id};
+
+  if(!requestedProvided)return {ok:true,ownerId:current?.assigned_user_id||null};
+  const ownerId=String(requestedValue||"").trim()||null;
+  if(!ownerId)return {ok:true,ownerId:null};
+
+  const owner=await env.DB.prepare(
+    "SELECT id,display_name,active FROM users WHERE id=? AND role='sales'"
+  ).bind(ownerId).first();
+  if(!owner)return {ok:false,message:"指定的业务员不存在"};
+
+  if(!owner.active && ownerId!==current?.assigned_user_id){
+    return {ok:false,message:"该业务员已经停用，不能再把新客户或其他客户分配给他"};
+  }
+  return {ok:true,ownerId,owner};
+}
+
 async function getCustomer(env, user, id) {
   const row = await env.DB.prepare(
-    `SELECT c.*,u.display_name owner_name FROM customers c
+    `SELECT c.*,u.display_name owner_name,u.active owner_active FROM customers c
      LEFT JOIN users u ON u.id=c.assigned_user_id
      WHERE c.id=? AND c.deleted_at IS NULL`
   ).bind(id).first();
@@ -1204,6 +1301,8 @@ async function getCustomer(env, user, id) {
       name: row.name,
       ownerId: row.assigned_user_id,
       ownerName: row.owner_name || "",
+      ownerActive: row.assigned_user_id ? !!row.owner_active : null,
+      editVersion: Number(row.edit_version || 1),
       progressDone: Number(row.progress_done || 0),
       progressTotal: Number(row.progress_total || 0),
       progressPercent: Number(row.progress_percent || 0),
@@ -1219,32 +1318,44 @@ async function getCustomer(env, user, id) {
 
 async function createCustomer(request, env, user) {
   const body = await readBody(request);
-  const name = String(body.name || "").trim();
-  if (!name) return fail("请输入客户姓名");
-  let assigned = normalizedRole(user.role) === "sales" ? user.id : String(body.assignedUserId || "").trim() || null;
-  if (assigned) {
-    const owner = await env.DB.prepare("SELECT id FROM users WHERE id=? AND role='sales' AND active=1").bind(assigned).first();
-    if (!owner) return fail("指定的业务员不存在");
-  }
+  const nameCheck=validateCustomerName(body.name);
+  if(!nameCheck.ok)return fail(nameCheck.message);
+
+  const ownerCheck=await resolveCustomerOwner(
+    env,user,null,
+    normalizedRole(user.role)==="admin",
+    body.assignedUserId
+  );
+  if(!ownerCheck.ok)return fail(ownerCheck.message);
+
+  const valuesCheck=await validateCustomerValues(env,body.values||{},{requireRequired:true});
+  if(!valuesCheck.ok)return fail(valuesCheck.message);
+
   const totalRow = await env.DB.prepare("SELECT COUNT(*) n FROM progress_definitions WHERE enabled=1").first();
   const total = Number(totalRow?.n || 0);
   const id = uid("c_");
   const t = now();
-  await env.DB.prepare(
-    `INSERT INTO customers(id,assigned_user_id,name,progress_done,progress_total,progress_percent,archived,created_by_id,created_at,updated_at)
-     VALUES(?,?,?,0,?,0,0,?,?,?)`
-  ).bind(id, assigned, name, total, user.id, t, t).run();
 
-  const values = body.values && typeof body.values === "object" ? body.values : {};
-  const stmts = [];
-  for (const [fieldId, value] of Object.entries(values)) {
-    stmts.push(env.DB.prepare(
-      "INSERT OR REPLACE INTO customer_values(customer_id,field_id,value,updated_at) VALUES(?,?,?,?)"
-    ).bind(id, fieldId, String(value ?? ""), t));
+  const statements=[
+    env.DB.prepare(
+      `INSERT INTO customers(
+        id,assigned_user_id,name,progress_done,progress_total,progress_percent,archived,
+        created_by_id,created_at,updated_at,edit_version
+       ) VALUES(?,?,?,0,?,0,0,?,?,?,1)`
+    ).bind(id,ownerCheck.ownerId,nameCheck.value,total,user.id,t,t)
+  ];
+
+  for(const [fieldId,value] of Object.entries(valuesCheck.values)){
+    statements.push(env.DB.prepare(
+      `INSERT INTO customer_values(customer_id,field_id,value,updated_at)
+       VALUES(?,?,?,?)
+       ON CONFLICT(customer_id,field_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`
+    ).bind(id,fieldId,value,t));
   }
-  if (stmts.length) await env.DB.batch(stmts);
-  await audit(env, user, "create", "customer", id, { name, assignedUserId: assigned });
-  return responseJson({ ok: true, id }, 201);
+
+  await env.DB.batch(statements);
+  await audit(env,user,"create","customer",id,{name:nameCheck.value,assignedUserId:ownerCheck.ownerId});
+  return responseJson({ok:true,id,editVersion:1},201);
 }
 
 async function updateCustomer(request, env, user, id) {
@@ -1253,27 +1364,188 @@ async function updateCustomer(request, env, user, id) {
   if (normalizedRole(user.role) === "sales" && current.assigned_user_id !== user.id) return fail("无权修改该客户", 403);
 
   const body = await readBody(request);
-  const name = body.name !== undefined ? String(body.name).trim() : current.name;
-  let assigned = current.assigned_user_id;
-  if (normalizedRole(user.role) === "admin" && body.assignedUserId !== undefined) assigned = body.assignedUserId || null;
+  const nameCheck=validateCustomerName(body.name!==undefined?body.name:current.name);
+  if(!nameCheck.ok)return fail(nameCheck.message);
+
+  const ownerCheck=await resolveCustomerOwner(
+    env,user,current,
+    normalizedRole(user.role)==="admin" && body.assignedUserId!==undefined,
+    body.assignedUserId
+  );
+  if(!ownerCheck.ok)return fail(ownerCheck.message);
+
+  const values = body.values && typeof body.values === "object" && !Array.isArray(body.values) ? body.values : null;
+  let valuesCheck={ok:true,values:{}};
+  if(values){
+    valuesCheck=await validateCustomerValues(env,values,{requireRequired:true});
+    if(!valuesCheck.ok)return fail(valuesCheck.message);
+  }
+
   const archived = body.archived !== undefined ? (body.archived ? 1 : 0) : current.archived;
   const t = now();
-  await env.DB.prepare(
-    "UPDATE customers SET name=?,assigned_user_id=?,archived=?,updated_at=? WHERE id=?"
-  ).bind(name, assigned, archived, t, id).run();
+  const statements=[];
 
-  const values = body.values && typeof body.values === "object" ? body.values : null;
-  if (values) {
-    const stmts = Object.entries(values).map(([fieldId, value]) =>
-      env.DB.prepare(
-        `INSERT INTO customer_values(customer_id,field_id,value,updated_at) VALUES(?,?,?,?)
-         ON CONFLICT(customer_id,field_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`
-      ).bind(id, fieldId, String(value ?? ""), t)
-    );
-    if (stmts.length) await env.DB.batch(stmts);
+  for(const [fieldId,value] of Object.entries(valuesCheck.values||{})){
+    statements.push(env.DB.prepare(
+      `INSERT INTO customer_values(customer_id,field_id,value,updated_at)
+       VALUES(?,?,?,?)
+       ON CONFLICT(customer_id,field_id) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at`
+    ).bind(id,fieldId,value,t));
   }
-  await audit(env, user, "update", "customer", id, { name, assignedUserId: assigned, archived: !!archived });
-  return responseJson({ ok: true });
+
+  statements.push(env.DB.prepare(
+    `UPDATE customers
+     SET name=?,assigned_user_id=?,archived=?,updated_at=?,edit_version=edit_version+1
+     WHERE id=?`
+  ).bind(nameCheck.value,ownerCheck.ownerId,archived,t,id));
+
+  await env.DB.batch(statements);
+  await audit(env,user,"update","customer",id,{
+    name:nameCheck.value,assignedUserId:ownerCheck.ownerId,archived:!!archived
+  });
+  return responseJson({ok:true,editVersion:Number(current.edit_version||1)+1,updatedAt:t});
+}
+
+async function saveCustomerAtomic(request,env,user,id,ctx){
+  const current=await env.DB.prepare(
+    "SELECT * FROM customers WHERE id=? AND deleted_at IS NULL"
+  ).bind(id).first();
+  if(!current)return fail("客户不存在",404,"NOT_FOUND");
+  if(normalizedRole(user.role)==="sales"&&current.assigned_user_id!==user.id){
+    return fail("无权修改该客户",403,"FORBIDDEN");
+  }
+
+  const body=await readBody(request);
+  const expectedVersion=safeInt(body.expectedVersion,0,0,2147483647);
+  const currentVersion=Number(current.edit_version||1);
+  if(!expectedVersion || expectedVersion!==currentVersion){
+    return fail(
+      "这名客户已经被其他人修改。为了避免覆盖别人的最新内容，本次保存已被阻止，请重新载入客户资料后确认。",
+      409,
+      "EDIT_CONFLICT"
+    );
+  }
+
+  const hasProfile=body.name!==undefined || body.values!==undefined || body.assignedUserId!==undefined || body.archived!==undefined;
+  const nameCheck=validateCustomerName(body.name!==undefined?body.name:current.name);
+  if(!nameCheck.ok)return fail(nameCheck.message);
+
+  const ownerCheck=await resolveCustomerOwner(
+    env,user,current,
+    normalizedRole(user.role)==="admin"&&body.assignedUserId!==undefined,
+    body.assignedUserId
+  );
+  if(!ownerCheck.ok)return fail(ownerCheck.message);
+
+  let valuesCheck={ok:true,values:{}};
+  if(body.values!==undefined){
+    valuesCheck=await validateCustomerValues(env,body.values,{requireRequired:true});
+    if(!valuesCheck.ok)return fail(valuesCheck.message);
+  }
+
+  const progressInput=Array.isArray(body.progressChanges)?body.progressChanges:[];
+  const uniqueProgress=new Map();
+  for(const p of progressInput){
+    const pid=String(p?.id||"").trim();
+    if(pid)uniqueProgress.set(pid,!!p.completed);
+  }
+
+  const [defsResult,progressResult]=await Promise.all([
+    env.DB.prepare(
+      "SELECT id,label,description,color,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
+    ).all(),
+    env.DB.prepare(
+      "SELECT progress_id,completed FROM customer_progress WHERE customer_id=?"
+    ).bind(id).all()
+  ]);
+  const defs=defsResult.results||[];
+  const defsById=new Map(defs.map(x=>[x.id,x]));
+  for(const pid of uniqueProgress.keys()){
+    if(!defsById.has(pid))return fail("客户进度已经发生变化，请刷新页面后重试",409,"PROGRESS_CHANGED");
+  }
+
+  const completedMap=new Map((progressResult.results||[]).map(x=>[x.progress_id,Number(x.completed||0)===1]));
+  const transitioned=[];
+  for(const [pid,completed] of uniqueProgress.entries()){
+    const before=completedMap.get(pid)===true;
+    if(completed&&!before)transitioned.push(defsById.get(pid));
+    completedMap.set(pid,completed);
+  }
+
+  const total=defs.length;
+  const done=defs.reduce((n,p)=>n+(completedMap.get(p.id)?1:0),0);
+  const percent=total?Math.round(done*100/total):0;
+  const archived=body.archived!==undefined?(body.archived?1:0):current.archived;
+  const t=now();
+  const statements=[];
+
+  for(const [fieldId,value] of Object.entries(valuesCheck.values||{})){
+    statements.push(env.DB.prepare(
+      `INSERT INTO customer_values(customer_id,field_id,value,updated_at)
+       SELECT ?,?,?,?
+       WHERE EXISTS(SELECT 1 FROM customers WHERE id=? AND edit_version=?)
+       ON CONFLICT(customer_id,field_id) DO UPDATE SET
+         value=excluded.value,updated_at=excluded.updated_at`
+    ).bind(id,fieldId,value,t,id,currentVersion));
+  }
+
+  for(const [pid,completed] of uniqueProgress.entries()){
+    statements.push(env.DB.prepare(
+      `INSERT INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at)
+       SELECT ?,?,?,?,?,?
+       WHERE EXISTS(SELECT 1 FROM customers WHERE id=? AND edit_version=?)
+       ON CONFLICT(customer_id,progress_id) DO UPDATE SET
+         completed=excluded.completed,
+         completed_by=excluded.completed_by,
+         completed_at=excluded.completed_at`
+    ).bind(id,pid,completed?1:0,user.id,completed?t:null,id,currentVersion));
+  }
+
+  statements.push(env.DB.prepare(
+    `UPDATE customers SET
+       name=?,assigned_user_id=?,archived=?,
+       progress_done=?,progress_total=?,progress_percent=?,
+       updated_at=?,edit_version=edit_version+1
+     WHERE id=? AND edit_version=?`
+  ).bind(
+    nameCheck.value,ownerCheck.ownerId,archived,
+    done,total,percent,t,id,currentVersion
+  ));
+
+  const results=await env.DB.batch(statements);
+  const finalResult=results[results.length-1];
+  if(Number(finalResult?.meta?.changes||0)!==1){
+    return fail(
+      "这名客户刚刚被其他人修改。为了避免覆盖，本次保存没有生效，请重新载入后确认。",
+      409,
+      "EDIT_CONFLICT"
+    );
+  }
+
+  await audit(env,user,"update","customer",id,{
+    atomic:true,
+    profileChanged:!!hasProfile,
+    progressChanges:[...uniqueProgress.entries()].map(([progressId,completed])=>({progressId,completed})),
+    editVersionBefore:currentVersion,
+    editVersionAfter:currentVersion+1
+  });
+
+  if(transitioned.length){
+    const summary={done,total,percent};
+    const jobs=transitioned.map(pd=>
+      sendTelegramProgressNotification(request,env,user,id,pd,summary,t+":"+pd.id).catch(()=>{})
+    );
+    const job=Promise.all(jobs);
+    if(ctx?.waitUntil)ctx.waitUntil(job);
+    else await job;
+  }
+
+  return responseJson({
+    ok:true,
+    done,total,percent,
+    editVersion:currentVersion+1,
+    updatedAt:t
+  });
 }
 
 async function toggleProgress(request, env, user, customerId, progressId, ctx) {
@@ -2254,6 +2526,16 @@ async function capacity(env) {
   });
 }
 
+async function salesOptions(env){
+  const r=await env.DB.prepare(
+    `SELECT id,username,display_name,active,created_at,updated_at
+     FROM users
+     WHERE role='sales'
+     ORDER BY active DESC,display_name,id`
+  ).all();
+  return responseJson({ok:true,items:r.results||[]});
+}
+
 async function usersList(request,env) {
   const url=new URL(request.url);
   const page=safeInt(url.searchParams.get("page"),1,1,1000000);
@@ -2690,6 +2972,7 @@ async function api(request, env, ctx) {
   let m=path.match(/^\/api\/customers\/([^/]+)$/);
   if(m && method==="GET") return getCustomer(env,user,m[1]);
   if(m && method==="PATCH") return updateCustomer(request,env,user,m[1]);
+  if(m && method==="PUT") return saveCustomerAtomic(request,env,user,m[1],ctx);
   if(m && method==="DELETE") return softDeleteCustomer(env,user,m[1]);
   m=path.match(/^\/api\/customers\/([^/]+)\/progress\/([^/]+)$/);
   if(m && method==="PUT") return toggleProgress(request,env,user,m[1],m[2],ctx);
@@ -2697,6 +2980,7 @@ async function api(request, env, ctx) {
   if (!requireRole(user,"admin")) return fail("需要管理员权限",403,"ADMIN_REQUIRED");
 
   if (path === "/api/admin/users" && method === "GET") return usersList(request,env);
+  if (path === "/api/admin/sales-options" && method === "GET") return salesOptions(env);
   if (path === "/api/admin/users" && method === "POST") return createUser(request,env,user);
   m=path.match(/^\/api\/admin\/users\/([^/]+)$/);
   if(m && method==="PATCH") return updateUser(request,env,user,m[1]);
