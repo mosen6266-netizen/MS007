@@ -270,7 +270,9 @@ async function refreshMiniStatus(){
   }catch{}
 }
 async function logout(){
+  const draftUserId=state.user?.id||"";
   try{await api("/api/logout",{method:"POST"});}catch{}
+  cleanupExpiredDraftsForUser(draftUserId);
   sessionStorage.removeItem("ms007Role");
   state.user=null;
   location.hash="";
@@ -2934,6 +2936,34 @@ async function renderBackup(view){
 }
 
 const DRAFT_PREFIX="ms007:draft:v1:";
+const DRAFT_MAX_AGE_MS=7*24*60*60*1000;
+
+function draftIsExpired(payload){
+  const savedAt=Date.parse(String(payload?.savedAt||""));
+  if(!Number.isFinite(savedAt))return true;
+  const age=Date.now()-savedAt;
+  return age<0?false:age>DRAFT_MAX_AGE_MS;
+}
+
+function cleanupExpiredDraftsForUser(userId){
+  const id=String(userId||"").trim();
+  if(!id)return 0;
+  const prefix=DRAFT_PREFIX+id+":";
+  let removed=0;
+  try{
+    for(let i=localStorage.length-1;i>=0;i--){
+      const key=localStorage.key(i);
+      if(!key||!key.startsWith(prefix))continue;
+      let payload=null;
+      try{payload=JSON.parse(localStorage.getItem(key)||"null")}catch{}
+      if(!payload||draftIsExpired(payload)){
+        localStorage.removeItem(key);
+        removed++;
+      }
+    }
+  }catch{}
+  return removed;
+}
 
 function draftStorageKey(key){
   return DRAFT_PREFIX+(state.user?.id||"anonymous")+":"+key;
@@ -3023,7 +3053,13 @@ function setupOverlayDraft(root,title,opts={}){
   try{
     const raw=localStorage.getItem(storageKey);
     if(raw)payload=JSON.parse(raw);
-  }catch{}
+    if(payload&&draftIsExpired(payload)){
+      localStorage.removeItem(storageKey);
+      payload=null;
+    }
+  }catch{
+    try{localStorage.removeItem(storageKey)}catch{}
+  }
 
   if(payload?.controls?.length){
     restoreOverlayDraft(root,payload);
