@@ -397,3 +397,76 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover{background:#f8fafc}
   .dashboard-period-switch{width:100%;overflow:auto}
   .dashboard-period-switch .btn{flex:1;min-width:82px}
 }
+
+/* Telegram progress routing */
+.telegram-route-head{
+  display:flex;
+  align-items:flex-start;
+  justify-content:space-between;
+  gap:16px;
+  margin-bottom:14px;
+}
+.telegram-route-legend{
+  display:flex;
+  flex-wrap:wrap;
+  gap:6px;
+  justify-content:flex-end;
+}
+.telegram-route-legend span{
+  padding:5px 8px;
+  border-radius:999px;
+  background:#f8fafc;
+  border:1px solid #e2e8f0;
+  color:#64748b;
+  font-size:11px;
+  white-space:nowrap;
+}
+.telegram-route-list{
+  display:grid;
+  gap:8px;
+}
+.telegram-route-row{
+  display:grid;
+  grid-template-columns:minmax(150px,.8fr) minmax(180px,.9fr) minmax(260px,1.3fr);
+  gap:10px;
+  align-items:center;
+  padding:10px 12px;
+  border:1px solid #e5eaf1;
+  border-radius:11px;
+  background:#f8fafc;
+}
+.telegram-route-progress{
+  min-width:0;
+}
+.telegram-route-progress strong{
+  display:block;
+  font-size:13px;
+  overflow:hidden;
+  text-overflow:ellipsis;
+  white-space:nowrap;
+}
+.telegram-route-progress span{
+  display:block;
+  margin-top:3px;
+  color:var(--muted);
+  font-size:11px;
+}
+.telegram-route-row .tg-route-chat:disabled{
+  background:#eef2f7;
+  color:#94a3b8;
+}
+.telegram-route-example{
+  margin-top:12px;
+  padding:10px 12px;
+  border-radius:10px;
+  background:#fff7ed;
+  border:1px solid #fed7aa;
+  color:#9a3412;
+  font-size:12px;
+  line-height:1.6;
+}
+@media(max-width:900px){
+  .telegram-route-head{flex-direction:column}
+  .telegram-route-legend{justify-content:flex-start}
+  .telegram-route-row{grid-template-columns:1fr}
+}
