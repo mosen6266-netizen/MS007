@@ -2432,6 +2432,67 @@ const entityName={
   business_data:"业务数据",session:"登录会话"
 };
 
+const auditKeyName={
+  name:"客户姓名",assignedUserId:"负责人",archived:"归档状态",
+  label:"名称",fieldType:"字段类型",required:"必填",enabled:"启用状态",
+  listVisible:"客户列表显示",listSortOrder:"列表排序",sortOrder:"排序",
+  options:"选择项",searchable:"可搜索",description:"说明",color:"颜色",
+  title:"标题",widgetType:"组件类型",audience:"显示对象",config:"配置",
+  progressChanges:"进度修改",editVersionBefore:"修改前版本",editVersionAfter:"修改后版本",
+  disabledDashboardWidgets:"自动隐藏仪表盘组件",deletedDashboardWidgets:"删除的仪表盘组件",
+  deletedCustomerValues:"删除客户字段值数量",deletedCustomerProgress:"删除客户进度记录数量",
+  atomic:"原子保存",profileChanged:"客户资料有修改"
+};
+
+function auditValueText(value){
+  if(value===null||value===undefined)return "—";
+  if(typeof value==="boolean")return value?"是":"否";
+  if(Array.isArray(value)){
+    if(!value.length)return "—";
+    return value.map(x=>typeof x==="object"?JSON.stringify(x):String(x)).join("、");
+  }
+  if(typeof value==="object")return JSON.stringify(value);
+  return String(value);
+}
+
+function auditDetailRows(detail){
+  const before=detail?.before&&typeof detail.before==="object"?detail.before:null;
+  const after=detail?.after&&typeof detail.after==="object"?detail.after:null;
+  if(before||after){
+    const keys=[...new Set([...Object.keys(before||{}),...Object.keys(after||{})])];
+    return keys
+      .filter(key=>JSON.stringify(before?.[key])!==JSON.stringify(after?.[key]))
+      .map(key=>({
+        label:auditKeyName[key]||key,
+        before:auditValueText(before?.[key]),
+        after:auditValueText(after?.[key])
+      }));
+  }
+  return Object.entries(detail||{}).map(([key,value])=>({
+    label:auditKeyName[key]||key,
+    before:"",
+    after:auditValueText(value)
+  }));
+}
+
+function openAuditDetail(item){
+  const rows=auditDetailRows(item?.detail||{});
+  openModal("操作变更详情",`
+    <div class="audit-detail-meta">
+      <div><span>时间</span><strong>${esc((item?.created_at||"").replace("T"," ").slice(0,19))}</strong></div>
+      <div><span>操作人</span><strong>${esc(item?.actor_name||"系统")}</strong></div>
+      <div><span>操作</span><strong>${esc(actionName[item?.action]||item?.action||"")}</strong></div>
+      <div><span>对象</span><strong>${esc(entityName[item?.entity_type]||item?.entity_type||"")}</strong></div>
+    </div>
+    <div class="table-wrap" style="margin-top:12px"><table>
+      <thead><tr><th>内容</th><th>修改前</th><th>修改后 / 说明</th></tr></thead>
+      <tbody>
+        ${rows.map(x=>`<tr><td><strong>${esc(x.label)}</strong></td><td>${esc(x.before||"—")}</td><td>${esc(x.after||"—")}</td></tr>`).join("")||'<tr><td colspan="3" class="muted">这条旧记录没有保存更详细的变更内容。</td></tr>'}
+      </tbody>
+    </table></div>
+  `,()=>{}, {draft:false});
+}
+
 async function renderAudit(view,opts={}){
   const stateOpts={
     page:Number(opts.page||1),
@@ -2475,8 +2536,8 @@ async function renderAudit(view,opts={}){
         <button class="btn ghost" id="auditReset">清除筛选</button>
       </div>
     </div>
-    <div class="table-wrap"><table><thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>对象ID</th></tr></thead><tbody>
-      ${items.map(x=>`<tr><td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td><td>${esc(x.actor_name||"系统")}</td><td>${esc(actionName[x.action]||x.action)}</td><td>${esc(entityName[x.entity_type]||x.entity_type)}</td><td><span class="muted">${esc(x.entity_id||"")}</span></td></tr>`).join("")||`<tr><td colspan="5" class="muted">没有符合条件的操作记录</td></tr>`}
+    <div class="table-wrap"><table><thead><tr><th>时间</th><th>操作人</th><th>操作</th><th>对象</th><th>对象ID</th><th>变更详情</th></tr></thead><tbody>
+      ${items.map(x=>`<tr><td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td><td>${esc(x.actor_name||"系统")}</td><td>${esc(actionName[x.action]||x.action)}</td><td>${esc(entityName[x.entity_type]||x.entity_type)}</td><td><span class="muted">${esc(x.entity_id||"")}</span></td><td><button class="btn ghost small" data-audit-detail="${esc(x.id)}">查看</button></td></tr>`).join("")||`<tr><td colspan="6" class="muted">没有符合条件的操作记录</td></tr>`}
     </tbody></table></div>
     ${listPagerHtml("auditPage",currentPage,pages,r.total||0)}`;
 
@@ -2486,6 +2547,10 @@ async function renderAudit(view,opts={}){
     action:val("auditAction"),
     from:val("auditFrom"),
     to:val("auditTo")
+  });
+  document.querySelectorAll("[data-audit-detail]").forEach(btn=>btn.onclick=()=>{
+    const item=items.find(x=>x.id===btn.dataset.auditDetail);
+    if(item)openAuditDetail(item);
   });
   document.querySelector("#auditApply").onclick=()=>renderAudit(view,readFilters());
   document.querySelector("#auditReset").onclick=()=>renderAudit(view,{page:1});
