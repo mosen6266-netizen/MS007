@@ -1524,6 +1524,126 @@ async function stats(request, env, user) {
   },progressCounts,sales});
 }
 
+
+async function statsBundle(request,env,user){
+  const url=new URL(request.url);
+  const validIso=v=>/^\d{4}-\d{2}-\d{2}T/.test(String(v||""));
+  const todayFrom=validIso(url.searchParams.get("todayFrom"))?String(url.searchParams.get("todayFrom")):new Date(new Date().setUTCHours(0,0,0,0)).toISOString();
+  const weekFrom=validIso(url.searchParams.get("weekFrom"))?String(url.searchParams.get("weekFrom")):todayFrom;
+  const monthFrom=validIso(url.searchParams.get("monthFrom"))?String(url.searchParams.get("monthFrom")):todayFrom;
+
+  const salesOnly=normalizedRole(user.role)==="sales";
+  const ownerClause=salesOnly?" AND c.assigned_user_id=?":"";
+  const ownerBind=salesOnly?[user.id]:[];
+
+  const [customers,completed,progressRows]=await Promise.all([
+    env.DB.prepare(
+      `SELECT
+        COUNT(*) total,
+        SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) today,
+        SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) week,
+        SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) month
+       FROM customers c
+       WHERE c.deleted_at IS NULL AND c.archived=0${ownerClause}`
+    ).bind(todayFrom,weekFrom,monthFrom,...ownerBind).first(),
+
+    env.DB.prepare(
+      `WITH completed_dates AS (
+        SELECT c.id,MAX(cp.completed_at) completed_at
+        FROM customers c
+        JOIN customer_progress cp ON cp.customer_id=c.id AND cp.completed=1
+        WHERE c.deleted_at IS NULL
+          AND c.archived=0
+          AND c.progress_percent=100
+          ${salesOnly?"AND c.assigned_user_id=?":""}
+        GROUP BY c.id
+      )
+      SELECT
+        COUNT(*) total,
+        SUM(CASE WHEN completed_at>=? THEN 1 ELSE 0 END) today,
+        SUM(CASE WHEN completed_at>=? THEN 1 ELSE 0 END) week,
+        SUM(CASE WHEN completed_at>=? THEN 1 ELSE 0 END) month
+      FROM completed_dates`
+    ).bind(...ownerBind,todayFrom,weekFrom,monthFrom).first(),
+
+    env.DB.prepare(
+      `SELECT cp.progress_id,
+        COUNT(DISTINCT cp.customer_id) total,
+        COUNT(DISTINCT CASE WHEN cp.completed_at>=? THEN cp.customer_id END) today,
+        COUNT(DISTINCT CASE WHEN cp.completed_at>=? THEN cp.customer_id END) week,
+        COUNT(DISTINCT CASE WHEN cp.completed_at>=? THEN cp.customer_id END) month
+       FROM customer_progress cp
+       JOIN customers c ON c.id=cp.customer_id
+       WHERE cp.completed=1
+         AND c.deleted_at IS NULL
+         AND c.archived=0
+         ${salesOnly?"AND c.assigned_user_id=?":""}
+       GROUP BY cp.progress_id`
+    ).bind(todayFrom,weekFrom,monthFrom,...ownerBind).all()
+  ]);
+
+  let salesRows=[];
+  if(normalizedRole(user.role)==="admin"){
+    const salesResult=await env.DB.prepare(
+      `SELECT u.id,u.display_name,
+        COUNT(c.id) total_count,
+        SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) today_count,
+        SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) week_count,
+        SUM(CASE WHEN c.created_at>=? THEN 1 ELSE 0 END) month_count,
+        COALESCE(ROUND(AVG(c.progress_percent)),0) avg_total,
+        COALESCE(ROUND(AVG(CASE WHEN c.created_at>=? THEN c.progress_percent END)),0) avg_today,
+        COALESCE(ROUND(AVG(CASE WHEN c.created_at>=? THEN c.progress_percent END)),0) avg_week,
+        COALESCE(ROUND(AVG(CASE WHEN c.created_at>=? THEN c.progress_percent END)),0) avg_month
+       FROM users u
+       LEFT JOIN customers c ON c.assigned_user_id=u.id
+         AND c.deleted_at IS NULL
+         AND c.archived=0
+       WHERE u.role='sales' AND u.active=1
+       GROUP BY u.id,u.display_name
+       ORDER BY total_count DESC,u.display_name`
+    ).bind(todayFrom,weekFrom,monthFrom,todayFrom,weekFrom,monthFrom).all();
+    salesRows=salesResult.results||[];
+  }
+
+  const progressByPeriod={total:{},today:{},week:{},month:{}};
+  for(const row of progressRows.results||[]){
+    progressByPeriod.total[row.progress_id]=Number(row.total||0);
+    progressByPeriod.today[row.progress_id]=Number(row.today||0);
+    progressByPeriod.week[row.progress_id]=Number(row.week||0);
+    progressByPeriod.month[row.progress_id]=Number(row.month||0);
+  }
+
+  const salesByPeriod={total:[],today:[],week:[],month:[]};
+  for(const row of salesRows){
+    salesByPeriod.total.push({id:row.id,display_name:row.display_name,customer_count:Number(row.total_count||0),avg_progress:Number(row.avg_total||0)});
+    salesByPeriod.today.push({id:row.id,display_name:row.display_name,customer_count:Number(row.today_count||0),avg_progress:Number(row.avg_today||0)});
+    salesByPeriod.week.push({id:row.id,display_name:row.display_name,customer_count:Number(row.week_count||0),avg_progress:Number(row.avg_week||0)});
+    salesByPeriod.month.push({id:row.id,display_name:row.display_name,customer_count:Number(row.month_count||0),avg_progress:Number(row.avg_month||0)});
+  }
+
+  const makePeriod=(key)=>({
+    summary:{
+      total:Number(customers?.[key]||0),
+      today:Number(customers?.today||0),
+      completed:Number(completed?.[key]||0),
+      archived:0
+    },
+    progressCounts:progressByPeriod[key],
+    sales:salesByPeriod[key]
+  });
+
+  return responseJson({
+    ok:true,
+    boundaries:{todayFrom,weekFrom,monthFrom},
+    periods:{
+      total:makePeriod("total"),
+      today:makePeriod("today"),
+      week:makePeriod("week"),
+      month:makePeriod("month")
+    }
+  });
+}
+
 async function capacity(env) {
   const config=await getSystemSetting(env,"capacity_config",{
     provider:"Cloudflare",database:"D1",free_single_db_mb:500,free_account_gb:5,
@@ -1865,6 +1985,7 @@ async function api(request, env, ctx) {
   if (path === "/api/progress-defs" && method === "GET") return listProgressDefs(env,user);
   if (path === "/api/customers" && method === "GET") return listCustomers(request,env,user);
   if (path === "/api/customers" && method === "POST") return createCustomer(request,env,user);
+  if (path === "/api/stats-bundle" && method === "GET") return statsBundle(request,env,user);
   if (path === "/api/stats" && method === "GET") return stats(request,env,user);
 
   let m=path.match(/^\/api\/customers\/([^/]+)$/);
