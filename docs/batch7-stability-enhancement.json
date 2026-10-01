@@ -1,22 +1,30 @@
 {
   "batch": "Batch 7",
-  "step": "Step 5",
-  "title": "System Stability Enhancement",
+  "step": "7.5",
+  "title": "Scale, stability and recovery validation",
+  "status": "implemented",
   "customer_data_modified": false,
-  "schema_migration_required": false,
   "production_records_touched": false,
-  "protection_scope": [
-    "customer data",
-    "customer progress",
-    "salesperson data",
-    "field definitions",
-    "workflow scripts",
-    "system configuration"
-  ],
-  "checks": [
-    "import export safety",
-    "data consistency validation",
-    "large dataset backup protection",
-    "restore flow verification"
-  ]
+  "validation": {
+    "test": "tests/batch7_scale.py",
+    "scale_customers": 20000,
+    "scale_salespeople": 25,
+    "scale_progress_rows": 40000,
+    "checks": [
+      "keyset customer pagination",
+      "customer-list index usage",
+      "dashboard aggregate query shape",
+      "statistics cache upsert/read/invalidation",
+      "large relational-core backup/restore round trip",
+      "fresh schema plus all migrations"
+    ],
+    "ci": [
+      ".github/workflows/test.yml",
+      ".github/workflows/deploy.yml"
+    ]
+  },
+  "applicability_review": {
+    "file_resource_base64_optimization": "not applicable: MS007 has no attachment/data-URL pipeline",
+    "tool_hover_iframe_optimization": "not applicable: MS007 has no iframe tool-preview implementation"
+  }
 }
