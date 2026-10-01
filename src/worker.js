@@ -692,6 +692,7 @@ async function telegramAdminSave(request,env,user){
   let messageTemplate=b.messageTemplate!==undefined?String(b.messageTemplate):await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
   messageTemplate=messageTemplate.replace(/\r\n/g,"\n").slice(0,6000);
   if(!messageTemplate.trim())messageTemplate=defaultTelegramTemplate();
+  messageTemplate=await normalizeTelegramTemplateTokens(env,messageTemplate);
 
   const available=await telegramAvailableFields(env);
   const allowed=new Set(available.map(x=>x.key));
@@ -2196,15 +2197,27 @@ async function updateDashboardWidget(request,env,user,id){
     if(!exists)return fail("请选择有效的客户进度");
     configJson=JSON.stringify({progressId});
   }
+  const after={
+    audience,
+    widgetType:type,
+    title:b.title!==undefined?String(b.title):old.title,
+    enabled:b.enabled!==undefined?!!b.enabled:!!old.enabled,
+    sortOrder:b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
+    config:(()=>{try{return JSON.parse(configJson||"{}")}catch{return{}}})()
+  };
   await env.DB.prepare(
     "UPDATE dashboard_widgets SET audience=?,widget_type=?,title=?,enabled=?,sort_order=?,config_json=? WHERE id=?"
-  ).bind(audience,type,b.title!==undefined?String(b.title):old.title,b.enabled!==undefined?(b.enabled?1:0):old.enabled,
-    b.sortOrder!==undefined?safeInt(b.sortOrder,old.sort_order,0,100000):old.sort_order,
-    configJson,id).run();
-  await audit(env,user,"update","dashboard_widget",id,b);
+  ).bind(after.audience,after.widgetType,after.title,after.enabled?1:0,after.sortOrder,JSON.stringify(after.config),id).run();
+  await audit(env,user,"update","dashboard_widget",id,{
+    before:{
+      audience:old.audience,widgetType:old.widget_type,title:old.title,
+      enabled:!!old.enabled,sortOrder:old.sort_order,
+      config:(()=>{try{return JSON.parse(old.config_json||"{}")}catch{return{}}})()
+    },
+    after
+  });
   return responseJson({ok:true});
 }
-
 
 function defaultRegistrationLayout() {
   return {
