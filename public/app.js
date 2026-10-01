@@ -1605,9 +1605,11 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[],nextSort=1,insert=
 async function renderTelegramSettings(view){
   const r=await api("/api/admin/telegram");
   const s=r.settings||{};
-  const available=r.availableFields||[];
   const progressDefs=r.progressDefs||[];
+  const templateVariables=r.templateVariables||[];
+  const defaultTemplate="✅ 客户进度已更新\n\n业务员：{{业务员}}\n\n客户姓名：{{客户姓名}}\n\n已完成进度：{{已完成进度}}\n\n下一步进度：{{下一步进度}}\n\n当前完成度：{{当前完成度}}\n\n{{查看客户详情}}";
   let fields=(s.fields||[]).map(x=>({...x}));
+  let messageTemplate=String(s.messageTemplate||defaultTemplate);
 
   const routeMap=new Map((r.routes||[]).map(x=>[
     x.progress_id,
@@ -1644,17 +1646,38 @@ async function renderTelegramSettings(view){
         </div>
         <div class="row wrap">
           <button class="btn" id="tgSave">保存全部设置</button>
-          <button class="btn secondary" id="tgTest">保存并测试默认群</button>
+          <button class="btn secondary" id="tgTest">保存并发送模板测试</button>
         </div>
       </section>
 
-      <section class="card">
-        <h3 style="margin-top:0">播报内容</h3>
-        <p class="muted">这里决定 Telegram 群里每条通知显示哪些客户资料。可以添加、删除、改标题和调整顺序。</p>
-        <div id="tgFieldRows" class="telegram-field-list"></div>
-        <div class="row wrap" style="margin-top:12px">
-          <select class="input grow" id="tgAddField"></select>
-          <button class="btn secondary" id="tgAddFieldBtn">＋ 添加显示内容</button>
+      <section class="card telegram-template-card">
+        <div class="telegram-template-title">
+          <div>
+            <h3 style="margin:0">通知模板编辑器</h3>
+            <p class="muted" style="margin:6px 0 0">下面就是机器人实际发送的模板。空一行就会在 Telegram 里空一行。</p>
+          </div>
+          <button class="btn ghost small" id="tgResetTemplate">恢复默认模板</button>
+        </div>
+
+        <div class="telegram-template-workspace">
+          <div>
+            <label class="field-label">模板内容</label>
+            <textarea class="input telegram-template-textarea" id="tgMessageTemplate" rows="16">${esc(messageTemplate)}</textarea>
+            <div class="muted" style="font-size:12px;margin-top:7px">直接编辑文字、顺序和空行。变量请保留双大括号，例如 {{客户姓名}}。</div>
+
+            <div class="telegram-variable-panel">
+              <div class="telegram-variable-head">点击变量可插入到光标位置</div>
+              <div class="telegram-variable-buttons">
+                ${templateVariables.map(v=>`<button type="button" class="tg-variable-chip" data-template-token="${esc(v.token)}">${esc(v.label)}</button>`).join("")}
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <label class="field-label">实时预览</label>
+            <div class="telegram-template-preview" id="tgTemplatePreview"></div>
+            <div class="muted" style="font-size:12px;margin-top:7px">这里使用示例数据预览；真正发送时会自动替换为对应客户资料。</div>
+          </div>
         </div>
       </section>
     </div>
@@ -1714,63 +1737,56 @@ async function renderTelegramSettings(view){
       </div>
     </section>`;
 
-  const rows=document.querySelector("#tgFieldRows");
-  const add=document.querySelector("#tgAddField");
+  const templateBox=document.querySelector("#tgMessageTemplate");
+  const preview=document.querySelector("#tgTemplatePreview");
 
-  function syncLabels(){
-    rows.querySelectorAll("[data-tg-field-row]").forEach(el=>{
-      const i=Number(el.dataset.tgFieldRow);
-      if(fields[i])fields[i].label=el.querySelector(".tg-field-label")?.value||fields[i].label;
-    });
+  function replaceAllPreview(source,needle,replacement){
+    return String(source).split(String(needle)).join(String(replacement));
   }
 
-  function refillAdd(){
-    const used=new Set(fields.map(x=>x.key));
-    add.innerHTML=available.filter(x=>!used.has(x.key)).map(x=>
-      `<option value="${esc(x.key)}">${esc(x.label)}</option>`
-    ).join("")||'<option value="">没有其他可添加内容</option>';
+  function updateTemplatePreview(){
+    messageTemplate=templateBox.value;
+    let rendered=esc(messageTemplate);
+    const samples={
+      sales_name:"张三",
+      customer_name:"李四",
+      assigned_sales:"张三",
+      completed_progress:"客户建档",
+      current_progress:"客户建档",
+      next_progress:"已联系",
+      progress_percent:"20%",
+      progress_fraction:"1/5"
+    };
+    for(const v of templateVariables){
+      const tokenEsc=esc(v.token||"");
+      if(v.key==="detail_link"){
+        rendered=replaceAllPreview(rendered,tokenEsc,'<span class="telegram-preview-link">'+esc(val("tgLinkLabel")||"查看客户详情")+'</span>');
+      }else{
+        const sample=String(v.key||"").startsWith("field:")?"示例内容":(samples[v.key]||"");
+        rendered=replaceAllPreview(rendered,tokenEsc,esc(sample));
+      }
+    }
+    preview.innerHTML=rendered;
   }
 
-  function redraw(){
-    rows.innerHTML=fields.map((x,i)=>`<div class="telegram-field-row" data-tg-field-row="${i}">
-      <span class="drag">⋮⋮</span>
-      <div class="grow">
-        <input class="input tg-field-label" value="${esc(x.label||"")}" placeholder="Telegram 中显示的标题">
-        <div class="muted" style="font-size:11px;margin-top:3px">${esc(available.find(a=>a.key===x.key)?.label||x.key)}</div>
-      </div>
-      <button class="btn ghost small" data-tg-up="${i}" ${i===0?"disabled":""}>↑</button>
-      <button class="btn ghost small" data-tg-down="${i}" ${i===fields.length-1?"disabled":""}>↓</button>
-      <button class="btn danger small" data-tg-del="${i}">删除</button>
-    </div>`).join("")||'<div class="empty-options">当前没有播报内容。</div>';
+  templateBox.addEventListener("input",updateTemplatePreview);
+  document.querySelector("#tgLinkLabel").addEventListener("input",updateTemplatePreview);
 
-    rows.querySelectorAll("[data-tg-up]").forEach(b=>b.onclick=()=>{
-      syncLabels();
-      const i=Number(b.dataset.tgUp);
-      if(i>0)[fields[i-1],fields[i]]=[fields[i],fields[i-1]];
-      redraw();
-    });
-    rows.querySelectorAll("[data-tg-down]").forEach(b=>b.onclick=()=>{
-      syncLabels();
-      const i=Number(b.dataset.tgDown);
-      if(i<fields.length-1)[fields[i+1],fields[i]]=[fields[i],fields[i+1]];
-      redraw();
-    });
-    rows.querySelectorAll("[data-tg-del]").forEach(b=>b.onclick=()=>{
-      syncLabels();
-      fields.splice(Number(b.dataset.tgDel),1);
-      redraw();
-    });
-    refillAdd();
-  }
+  document.querySelectorAll("[data-template-token]").forEach(btn=>btn.onclick=()=>{
+    const token=btn.dataset.templateToken||"";
+    const start=templateBox.selectionStart??templateBox.value.length;
+    const end=templateBox.selectionEnd??start;
+    templateBox.value=templateBox.value.slice(0,start)+token+templateBox.value.slice(end);
+    const next=start+token.length;
+    templateBox.focus();
+    templateBox.setSelectionRange(next,next);
+    templateBox.dispatchEvent(new Event("input",{bubbles:true}));
+  });
 
-  document.querySelector("#tgAddFieldBtn").onclick=()=>{
-    syncLabels();
-    const key=add.value;
-    if(!key)return;
-    const x=available.find(a=>a.key===key);
-    if(!x)return;
-    fields.push({key:x.key,label:x.label});
-    redraw();
+  document.querySelector("#tgResetTemplate").onclick=async()=>{
+    if(!await uiConfirm("恢复默认 Telegram 通知模板？\n\n你当前编辑但尚未保存的模板内容会被替换。",{title:"恢复默认模板",confirmText:"恢复默认"}))return;
+    templateBox.value=defaultTemplate;
+    templateBox.dispatchEvent(new Event("input",{bubbles:true}));
   };
 
   document.querySelectorAll("[data-route-index]").forEach(row=>{
@@ -1807,7 +1823,6 @@ async function renderTelegramSettings(view){
   }
 
   async function saveSettings(showToast=true){
-    syncLabels();
     const routePayload=collectRoutes();
     const body={
       botToken:val("tgBotToken"),
@@ -1816,12 +1831,13 @@ async function renderTelegramSettings(view){
       enabled:checked("tgEnabled"),
       notifyAdmin:checked("tgNotifyAdmin"),
       fields,
-      routes:routePayload
+      routes:routePayload,
+      messageTemplate:templateBox.value
     };
     const out=await api("/api/admin/telegram",{method:"PUT",body});
     document.querySelector("#tgBotToken").value="";
     document.querySelector("#tgBotToken").placeholder="已保存 "+(out.tokenHint||"")+"，不修改请留空";
-    if(showToast)toast("Telegram 设置和进度通知群已保存");
+    if(showToast)toast("Telegram 设置、通知模板和进度通知群已保存");
   }
 
   document.querySelector("#tgSave").onclick=async()=>{
@@ -1831,18 +1847,18 @@ async function renderTelegramSettings(view){
   document.querySelector("#tgTest").onclick=async()=>{
     const btn=document.querySelector("#tgTest");
     btn.disabled=true;
-    btn.textContent="正在测试...";
+    btn.textContent="正在发送模板测试...";
     try{
       await saveSettings(false);
       await api("/api/admin/telegram/test",{method:"POST"});
-      toast("测试消息已发送到默认 Telegram 群");
+      toast("模板测试消息已发送到默认 Telegram 群");
       setTimeout(()=>renderTelegramSettings(view),500);
     }catch(e){toast(e.message)}
     btn.disabled=false;
-    btn.textContent="保存并测试默认群";
+    btn.textContent="保存并发送模板测试";
   };
 
-  redraw();
+  updateTemplatePreview();
 }
 
 async function renderCapacity(view){
