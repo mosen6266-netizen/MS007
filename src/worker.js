@@ -252,14 +252,23 @@ async function telegramAdminGet(env){
     const parsed=JSON.parse(row.fields_json||"[]");
     if(Array.isArray(parsed))fields=parsed;
   }catch{}
-  const availableFields=await telegramAvailableFields(env);
-  const logs=await env.DB.prepare(
-    `SELECT l.id,l.status,l.error_text,l.created_at,c.name customer_name,u.display_name actor_name
-     FROM telegram_delivery_logs l
-     LEFT JOIN customers c ON c.id=l.customer_id
-     LEFT JOIN users u ON u.id=l.actor_user_id
-     ORDER BY l.created_at DESC LIMIT 20`
-  ).all();
+  const [availableFields,logs,progressDefs,routes]=await Promise.all([
+    telegramAvailableFields(env),
+    env.DB.prepare(
+      `SELECT l.id,l.status,l.error_text,l.created_at,c.name customer_name,u.display_name actor_name,p.label progress_name
+       FROM telegram_delivery_logs l
+       LEFT JOIN customers c ON c.id=l.customer_id
+       LEFT JOIN users u ON u.id=l.actor_user_id
+       LEFT JOIN progress_definitions p ON p.id=l.progress_id
+       ORDER BY l.created_at DESC LIMIT 20`
+    ).all(),
+    env.DB.prepare(
+      "SELECT id,label,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
+    ).all(),
+    env.DB.prepare(
+      "SELECT progress_id,route_mode,chat_id FROM telegram_progress_routes"
+    ).all()
+  ]);
   return responseJson({
     ok:true,
     settings:{
@@ -272,6 +281,8 @@ async function telegramAdminGet(env){
       linkLabel:row.link_label||"查看客户详情"
     },
     availableFields,
+    progressDefs:progressDefs.results||[],
+    routes:routes.results||[],
     logs:logs.results||[]
   });
 }
@@ -308,18 +319,46 @@ async function telegramAdminSave(request,env,user){
     fields.push({key,label:String(item?.label||fieldLabel.get(key)||key).trim().slice(0,80)});
   }
   if(enabled && !encToken)return fail("请先填写 Telegram Bot Token");
-  if(enabled && !chatId)return fail("请先填写 Telegram 群 ID");
+  if(enabled && !chatId)return fail("请先填写默认 Telegram 群 ID");
 
-  await env.DB.prepare(
-    `UPDATE telegram_settings
-     SET enabled=?,chat_id=?,bot_token_enc=?,bot_token_hint=?,fields_json=?,notify_admin=?,link_label=?,updated_at=?
-     WHERE id=1`
-  ).bind(enabled?1:0,chatId,encToken,hint,JSON.stringify(fields),notifyAdmin?1:0,linkLabel,now()).run();
+  const progressResult=await env.DB.prepare(
+    "SELECT id FROM progress_definitions WHERE enabled=1"
+  ).all();
+  const validProgressIds=new Set((progressResult.results||[]).map(x=>x.id));
+  const routeInput=Array.isArray(b.routes)?b.routes:[];
+  const routes=[];
+  const seenRouteProgress=new Set();
+  for(const item of routeInput.slice(0,200)){
+    const progressId=String(item?.progressId||"").trim();
+    const mode=["replace","additional"].includes(item?.mode)?item.mode:"";
+    const routeChatId=String(item?.chatId||"").trim();
+    if(!progressId||!validProgressIds.has(progressId)||!mode||!routeChatId||seenRouteProgress.has(progressId))continue;
+    seenRouteProgress.add(progressId);
+    routes.push({progressId,mode,chatId:routeChatId});
+  }
+
+  const t=now();
+  const stmts=[
+    env.DB.prepare(
+      `UPDATE telegram_settings
+       SET enabled=?,chat_id=?,bot_token_enc=?,bot_token_hint=?,fields_json=?,notify_admin=?,link_label=?,updated_at=?
+       WHERE id=1`
+    ).bind(enabled?1:0,chatId,encToken,hint,JSON.stringify(fields),notifyAdmin?1:0,linkLabel,t),
+    env.DB.prepare("DELETE FROM telegram_progress_routes")
+  ];
+  for(const route of routes){
+    stmts.push(
+      env.DB.prepare(
+        "INSERT INTO telegram_progress_routes(progress_id,route_mode,chat_id,updated_at) VALUES(?,?,?,?)"
+      ).bind(route.progressId,route.mode,route.chatId,t)
+    );
+  }
+  await env.DB.batch(stmts);
 
   await audit(env,user,"update","telegram_settings","1",{
-    enabled,chatId,hasToken:!!encToken,fieldCount:fields.length,notifyAdmin
+    enabled,chatId,hasToken:!!encToken,fieldCount:fields.length,notifyAdmin,routeCount:routes.length
   });
-  return responseJson({ok:true,tokenHint:hint,hasToken:!!encToken});
+  return responseJson({ok:true,tokenHint:hint,hasToken:!!encToken,routeCount:routes.length});
 }
 
 async function telegramAdminTest(request,env,user){
@@ -372,8 +411,28 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
   const row=await telegramSettingsRow(env);
   if(!row.enabled)return;
   if(normalizedRole(user.role)==="admin"&&!row.notify_admin)return;
-  if(!row.bot_token_enc||!row.chat_id){
-    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"Telegram 设置不完整"});
+  if(!row.bot_token_enc){
+    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"Telegram Bot Token 未设置"});
+    return;
+  }
+
+  const route=await env.DB.prepare(
+    "SELECT route_mode,chat_id FROM telegram_progress_routes WHERE progress_id=?"
+  ).bind(progressDef.id).first();
+
+  let targetChatIds=[];
+  if(route?.route_mode==="replace"){
+    if(route.chat_id)targetChatIds=[String(route.chat_id)];
+  }else if(route?.route_mode==="additional"){
+    if(row.chat_id)targetChatIds.push(String(row.chat_id));
+    if(route.chat_id)targetChatIds.push(String(route.chat_id));
+  }else if(row.chat_id){
+    targetChatIds=[String(row.chat_id)];
+  }
+  targetChatIds=[...new Set(targetChatIds.filter(Boolean))];
+
+  if(!targetChatIds.length){
+    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"这个进度没有可用的通知群"});
     return;
   }
 
@@ -437,16 +496,18 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
   lines.push("");
   lines.push('<a href="'+telegramHtmlEscape(detailUrl)+'">'+telegramHtmlEscape(row.link_label||"查看客户详情")+"</a>");
 
-  try{
-    await telegramApiCall(token,"sendMessage",{
-      chat_id:row.chat_id,
-      text:lines.join("\n"),
-      parse_mode:"HTML",
-      disable_web_page_preview:true
-    });
-    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"success"});
-  }catch(e){
-    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"failed",error:String(e?.message||e)});
+  for(const targetChatId of targetChatIds){
+    try{
+      await telegramApiCall(token,"sendMessage",{
+        chat_id:targetChatId,
+        text:lines.join("\n"),
+        parse_mode:"HTML",
+        disable_web_page_preview:true
+      });
+      await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"success",error:"群 "+targetChatId});
+    }catch(e){
+      await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"failed",error:"群 "+targetChatId+"："+String(e?.message||e)});
+    }
   }
 }
 
@@ -1014,6 +1075,7 @@ async function hardDeleteProgressDef(env,user,id){
   const valueCount=Number(valueCountRow?.n||0);
 
   await env.DB.prepare("DELETE FROM customer_progress WHERE progress_id=?").bind(id).run();
+  await env.DB.prepare("DELETE FROM telegram_progress_routes WHERE progress_id=?").bind(id).run();
   await env.DB.prepare("DELETE FROM progress_definitions WHERE id=?").bind(id).run();
   await recalcAllProgress(env);
   await audit(env,user,"delete_permanent","progress_definition",id,{label:progress.label,deletedCustomerProgress:valueCount});
