@@ -24,7 +24,7 @@ for token in [
     "requires_admin",
     "dead_lettered_at",
     "needs_admin",
-    "/api/admin/telegram/queue/",
+    "retryTelegramQueueItem(env,user,m[1],ctx)",
 ]:
     assert token in worker,token
 
