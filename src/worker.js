@@ -3187,6 +3187,235 @@ async function exportBusinessData(env,user){
   });
 }
 
+const BACKUP_V3_SECTIONS=[
+  "users","customers","fieldDefinitions","customerValues","progressDefinitions","customerProgress",
+  "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets",
+  "systemSettings","telegramSettings","telegramProgressRoutes","auditLogs","telegramDeliveryLogs"
+];
+
+function backupSectionSpec(section){
+  const specs={
+    users:{
+      count:"SELECT COUNT(*) n FROM users",
+      sql:`SELECT id,username,display_name,role,active,created_at,updated_at
+           FROM users ORDER BY created_at,id LIMIT ? OFFSET ?`
+    },
+    customers:{
+      count:"SELECT COUNT(*) n FROM customers",
+      sql:`SELECT c.*,au.username assigned_username,cu.username created_by_username
+           FROM customers c
+           LEFT JOIN users au ON au.id=c.assigned_user_id
+           LEFT JOIN users cu ON cu.id=c.created_by_id
+           ORDER BY c.created_at,c.id LIMIT ? OFFSET ?`
+    },
+    fieldDefinitions:{
+      count:"SELECT COUNT(*) n FROM field_definitions",
+      sql:"SELECT * FROM field_definitions ORDER BY sort_order,id LIMIT ? OFFSET ?"
+    },
+    customerValues:{
+      count:"SELECT COUNT(*) n FROM customer_values",
+      sql:"SELECT * FROM customer_values ORDER BY customer_id,field_id LIMIT ? OFFSET ?"
+    },
+    progressDefinitions:{
+      count:"SELECT COUNT(*) n FROM progress_definitions",
+      sql:"SELECT * FROM progress_definitions ORDER BY sort_order,id LIMIT ? OFFSET ?"
+    },
+    customerProgress:{
+      count:"SELECT COUNT(*) n FROM customer_progress",
+      sql:`SELECT cp.*,u.username completed_by_username
+           FROM customer_progress cp
+           LEFT JOIN users u ON u.id=cp.completed_by
+           ORDER BY cp.customer_id,cp.progress_id LIMIT ? OFFSET ?`
+    },
+    sidebarCategories:{
+      count:"SELECT COUNT(*) n FROM sidebar_categories",
+      sql:"SELECT * FROM sidebar_categories ORDER BY audience,sort_order,label,id LIMIT ? OFFSET ?"
+    },
+    sidebarItems:{
+      count:"SELECT COUNT(*) n FROM sidebar_items",
+      sql:"SELECT * FROM sidebar_items ORDER BY audience,sort_order,label,id LIMIT ? OFFSET ?"
+    },
+    sidebarItemCategories:{
+      count:"SELECT COUNT(*) n FROM sidebar_item_categories",
+      sql:"SELECT * FROM sidebar_item_categories ORDER BY audience,category_id,item_id LIMIT ? OFFSET ?"
+    },
+    listColumns:{
+      count:"SELECT COUNT(*) n FROM list_columns",
+      sql:"SELECT * FROM list_columns ORDER BY audience,sort_order,id LIMIT ? OFFSET ?"
+    },
+    dashboardWidgets:{
+      count:"SELECT COUNT(*) n FROM dashboard_widgets",
+      sql:"SELECT * FROM dashboard_widgets ORDER BY audience,sort_order,id LIMIT ? OFFSET ?"
+    },
+    systemSettings:{
+      count:"SELECT COUNT(*) n FROM system_settings",
+      sql:"SELECT setting_key,value_json,updated_at FROM system_settings ORDER BY setting_key LIMIT ? OFFSET ?"
+    },
+    telegramSettings:{
+      count:"SELECT COUNT(*) n FROM telegram_settings",
+      sql:`SELECT id,enabled,chat_id,fields_json,notify_admin,link_label,updated_at
+           FROM telegram_settings ORDER BY id LIMIT ? OFFSET ?`
+    },
+    telegramProgressRoutes:{
+      count:"SELECT COUNT(*) n FROM telegram_progress_routes",
+      sql:"SELECT * FROM telegram_progress_routes ORDER BY progress_id LIMIT ? OFFSET ?"
+    },
+    auditLogs:{
+      count:"SELECT COUNT(*) n FROM audit_logs",
+      sql:`SELECT a.*,u.username actor_username
+           FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id
+           ORDER BY a.created_at,a.id LIMIT ? OFFSET ?`
+    },
+    telegramDeliveryLogs:{
+      count:"SELECT COUNT(*) n FROM telegram_delivery_logs",
+      sql:`SELECT l.*,u.username actor_username
+           FROM telegram_delivery_logs l LEFT JOIN users u ON u.id=l.actor_user_id
+           ORDER BY l.created_at,l.id LIMIT ? OFFSET ?`
+    }
+  };
+  return specs[section]||null;
+}
+
+async function exportBackupManifest(env,user){
+  const sections={};
+  for(const section of BACKUP_V3_SECTIONS){
+    const spec=backupSectionSpec(section);
+    const row=await env.DB.prepare(spec.count).first();
+    sections[section]={count:Number(row?.n||0)};
+  }
+  const exportedAt=now();
+  await audit(env,user,"export_manifest","business_data",null,{version:3,sections});
+  return responseJson({
+    ok:true,
+    format:"MS007-BUSINESS-BACKUP",
+    version:3,
+    exportedAt,
+    appVersion:env.APP_VERSION||"dev",
+    manifest:{
+      sections,
+      excluded:[
+        "password_hashes","password_salts","login_sessions","bootstrap_token",
+        "telegram_bot_token","telegram_send_queue","telegram_chat_rate"
+      ],
+      securityNote:"账号密码、登录会话、Bootstrap Token 和 Telegram Bot Token 不进入备份。恢复的账号需要重新设置密码后启用。"
+    }
+  });
+}
+
+async function exportBackupSection(request,env){
+  const url=new URL(request.url);
+  const section=String(url.searchParams.get("section")||"");
+  const spec=backupSectionSpec(section);
+  if(!spec)return fail("未知的备份数据部分");
+  const offset=safeInt(url.searchParams.get("offset"),0,0,2000000000);
+  const limit=safeInt(url.searchParams.get("limit"),500,1,1000);
+  const r=await env.DB.prepare(spec.sql).bind(limit,offset).all();
+  const items=r.results||[];
+  return responseJson({
+    ok:true,section,offset,limit,items,
+    nextOffset:items.length===limit?offset+items.length:null
+  });
+}
+
+async function importPreviewChunk(request,env){
+  const body=await readBody(request);
+  if(body?.format!=="MS007-BUSINESS-BACKUP"||Number(body?.version||0)<3||!BACKUP_V3_SECTIONS.includes(String(body?.section||""))||!Array.isArray(body?.rows)){
+    return fail("备份预演分片格式不正确");
+  }
+  const section=String(body.section);
+  const rows=body.rows.slice(0,200);
+  const result={section,rows:rows.length,newCount:0,updateCount:0,mergeCount:0,conflicts:[],warnings:[]};
+
+  if(!rows.length)return responseJson({ok:true,...result});
+
+  const simpleIdTable={
+    customers:"customers",
+    progressDefinitions:"progress_definitions",
+    sidebarItems:"sidebar_items",
+    listColumns:"list_columns",
+    dashboardWidgets:"dashboard_widgets",
+    auditLogs:"audit_logs",
+    telegramDeliveryLogs:"telegram_delivery_logs"
+  }[section];
+
+  if(simpleIdTable){
+    const ids=rows.map(x=>String(x.id||"")).filter(Boolean);
+    const existing=new Set();
+    if(ids.length){
+      const marks=ids.map(()=>"?").join(",");
+      const q=await env.DB.prepare(`SELECT id FROM ${simpleIdTable} WHERE id IN (${marks})`).bind(...ids).all();
+      for(const row of q.results||[])existing.add(row.id);
+    }
+    for(const row of rows){
+      if(existing.has(String(row.id||"")))result.updateCount++;
+      else result.newCount++;
+    }
+  }else if(section==="fieldDefinitions"){
+    const ids=rows.map(x=>String(x.id||"")).filter(Boolean);
+    const keys=rows.map(x=>String(x.field_key||"")).filter(Boolean);
+    const existing=[];
+    if(ids.length||keys.length){
+      const idMarks=ids.length?ids.map(()=>"?").join(","):"''";
+      const keyMarks=keys.length?keys.map(()=>"?").join(","):"''";
+      const q=await env.DB.prepare(
+        `SELECT id,field_key FROM field_definitions WHERE id IN (${idMarks}) OR field_key IN (${keyMarks})`
+      ).bind(...ids,...keys).all();
+      existing.push(...(q.results||[]));
+    }
+    for(const row of rows){
+      const sameId=existing.find(x=>x.id===row.id);
+      const sameKey=existing.find(x=>x.field_key===row.field_key);
+      if(sameKey && sameKey.id!==row.id){
+        result.conflicts.push({type:"field_key",value:row.field_key,backupId:row.id,currentId:sameKey.id});
+      }else if(sameId)result.updateCount++;
+      else result.newCount++;
+    }
+  }else if(section==="users"){
+    const ids=rows.map(x=>String(x.id||"")).filter(Boolean);
+    const names=rows.map(x=>String(x.username||"")).filter(Boolean);
+    const existing=[];
+    if(ids.length||names.length){
+      const idMarks=ids.length?ids.map(()=>"?").join(","):"''";
+      const nameMarks=names.length?names.map(()=>"?").join(","):"''";
+      const q=await env.DB.prepare(
+        `SELECT id,username,role FROM users WHERE id IN (${idMarks}) OR username IN (${nameMarks})`
+      ).bind(...ids,...names).all();
+      existing.push(...(q.results||[]));
+    }
+    for(const row of rows){
+      const sameId=existing.find(x=>x.id===row.id);
+      const sameName=existing.find(x=>x.username===row.username);
+      if(sameName && sameName.id!==row.id){
+        result.conflicts.push({type:"username",value:row.username,backupId:row.id,currentId:sameName.id});
+      }else if(sameId)result.updateCount++;
+      else result.newCount++;
+    }
+  }else if(section==="sidebarCategories"){
+    const ids=rows.map(x=>String(x.id||"")).filter(Boolean);
+    const existing=[];
+    if(ids.length){
+      const marks=ids.map(()=>"?").join(",");
+      const q=await env.DB.prepare(
+        `SELECT id,audience,label FROM sidebar_categories
+         WHERE id IN (${marks}) OR (${rows.map(()=>"(audience=? AND label=?)").join(" OR ")})`
+      ).bind(...ids,...rows.flatMap(x=>[x.audience,x.label])).all();
+      existing.push(...(q.results||[]));
+    }
+    for(const row of rows){
+      const sameId=existing.find(x=>x.id===row.id);
+      const sameLabel=existing.find(x=>x.audience===row.audience&&x.label===row.label);
+      if(sameLabel&&sameLabel.id!==row.id){
+        result.conflicts.push({type:"sidebar_category",value:row.audience+":"+row.label,backupId:row.id,currentId:sameLabel.id});
+      }else if(sameId)result.updateCount++;
+      else result.newCount++;
+    }
+  }else{
+    result.mergeCount=rows.length;
+  }
+
+  return responseJson({ok:true,...result});
+}
+
 async function importBusinessData(request,env,user){
   const body=await readBody(request);
   if(body?.format!=="MS007-BUSINESS-BACKUP" || !body?.data) return fail("备份文件格式不正确");
@@ -3366,6 +3595,9 @@ async function api(request, env, ctx) {
   if(m && method==="POST") return restoreCustomer(env,user,m[1]);
   if (path === "/api/admin/audit" && method === "GET") return auditList(request,env);
   if (path === "/api/admin/export" && method === "GET") return exportBusinessData(env,user);
+  if (path === "/api/admin/export-manifest" && method === "GET") return exportBackupManifest(env,user);
+  if (path === "/api/admin/export-section" && method === "GET") return exportBackupSection(request,env);
+  if (path === "/api/admin/import-preview-chunk" && method === "POST") return importPreviewChunk(request,env);
   if (path === "/api/admin/import" && method === "POST") return importBusinessData(request,env,user);
   if (path === "/api/admin/import-chunk" && method === "POST") return importChunk(request,env,user);
   if (path === "/api/admin/import-finish" && method === "POST") return finishImport(env,user);
