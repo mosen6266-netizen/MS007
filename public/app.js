@@ -1533,9 +1533,20 @@ async function renderTelegramSettings(view){
   const r=await api("/api/admin/telegram");
   const s=r.settings||{};
   const available=r.availableFields||[];
+  const progressDefs=r.progressDefs||[];
   let fields=(s.fields||[]).map(x=>({...x}));
 
-  view.innerHTML=pageHead("Telegram 通知","业务员完成客户进度后，机器人自动在指定 Telegram 群播报。")+
+  const routeMap=new Map((r.routes||[]).map(x=>[
+    x.progress_id,
+    {progressId:x.progress_id,mode:x.route_mode||"default",chatId:x.chat_id||""}
+  ]));
+  let routes=progressDefs.map(p=>routeMap.get(p.id)||{
+    progressId:p.id,
+    mode:"default",
+    chatId:""
+  });
+
+  view.innerHTML=pageHead("Telegram 通知","业务员完成客户进度后，机器人自动按你设置的群组规则播报。")+
     `<div class="grid telegram-settings-grid">
       <section class="card">
         <h3 style="margin-top:0">机器人连接</h3>
@@ -1546,8 +1557,9 @@ async function renderTelegramSettings(view){
           <div class="muted" style="font-size:12px;margin-top:5px">Token 保存后不会在页面回显明文，也不会进入普通业务数据备份。</div>
         </div>
         <div class="field">
-          <label>Telegram 群 ID</label>
+          <label>默认 Telegram 群 ID</label>
           <input class="input" id="tgChatId" value="${esc(s.chatId||"")}" placeholder="例如：-1001234567890">
+          <div class="muted" style="font-size:12px;margin-top:5px">没有单独设置通知群的进度，都会发送到这个默认群。</div>
         </div>
         <div class="field">
           <label>详情链接文字</label>
@@ -1558,8 +1570,8 @@ async function renderTelegramSettings(view){
           <label><input type="checkbox" id="tgNotifyAdmin" ${s.notifyAdmin?"checked":""}> 管理员勾选进度时也播报</label>
         </div>
         <div class="row wrap">
-          <button class="btn" id="tgSave">保存设置</button>
-          <button class="btn secondary" id="tgTest">保存并发送测试消息</button>
+          <button class="btn" id="tgSave">保存全部设置</button>
+          <button class="btn secondary" id="tgTest">保存并测试默认群</button>
         </div>
       </section>
 
@@ -1575,18 +1587,55 @@ async function renderTelegramSettings(view){
     </div>
 
     <section class="card" style="margin-top:16px">
+      <div class="telegram-route-head">
+        <div>
+          <h3 style="margin:0">进度通知群设置</h3>
+          <p class="muted" style="margin:6px 0 0">每个客户进度都可以单独指定通知群。没有设置的进度自动使用上面的默认群。</p>
+        </div>
+        <div class="telegram-route-legend">
+          <span>默认群</span>
+          <span>仅指定群</span>
+          <span>默认群 + 指定群</span>
+        </div>
+      </div>
+
+      <div class="telegram-route-list" id="tgRouteRows">
+        ${progressDefs.map((p,i)=>{
+          const route=routes[i];
+          return `<div class="telegram-route-row" data-route-index="${i}">
+            <div class="telegram-route-progress">
+              <strong>${esc(p.label)}</strong>
+              <span>客户进度</span>
+            </div>
+            <select class="input tg-route-mode">
+              <option value="default" ${route.mode==="default"?"selected":""}>使用默认群</option>
+              <option value="replace" ${route.mode==="replace"?"selected":""}>仅发送到指定群</option>
+              <option value="additional" ${route.mode==="additional"?"selected":""}>默认群 + 指定群</option>
+            </select>
+            <input class="input tg-route-chat" value="${esc(route.chatId||"")}" placeholder="指定 Telegram 群 ID，例如 -100..." ${route.mode==="default"?"disabled":""}>
+          </div>`;
+        }).join("")||'<div class="empty-options">还没有客户进度，请先在“客户进度管理”中添加。</div>'}
+      </div>
+
+      <div class="telegram-route-example">
+        <strong>例：</strong>所有进度都使用默认群；“客户建档”选择“仅发送到指定群”，再填写另一个群 ID，那么只有客户建档会改发到那个群。
+      </div>
+    </section>
+
+    <section class="card" style="margin-top:16px">
       <h3 style="margin-top:0">最近发送记录</h3>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>时间</th><th>业务员</th><th>客户</th><th>状态</th><th>说明</th></tr></thead>
+          <thead><tr><th>时间</th><th>业务员</th><th>客户</th><th>进度</th><th>状态</th><th>群/说明</th></tr></thead>
           <tbody>
             ${(r.logs||[]).map(x=>`<tr>
               <td>${esc((x.created_at||"").replace("T"," ").slice(0,19))}</td>
               <td>${esc(x.actor_name||"")}</td>
               <td>${esc(x.customer_name||"")}</td>
+              <td>${esc(x.progress_name||"")}</td>
               <td><span class="tag">${x.status==="success"?"发送成功":x.status==="failed"?"发送失败":"已跳过"}</span></td>
               <td>${esc(x.error_text||"")}</td>
-            </tr>`).join("")||'<tr><td colspan="5" class="muted">还没有发送记录</td></tr>'}
+            </tr>`).join("")||'<tr><td colspan="6" class="muted">还没有发送记录</td></tr>'}
           </tbody>
         </table>
       </div>
@@ -1622,54 +1671,102 @@ async function renderTelegramSettings(view){
     </div>`).join("")||'<div class="empty-options">当前没有播报内容。</div>';
 
     rows.querySelectorAll("[data-tg-up]").forEach(b=>b.onclick=()=>{
-      syncLabels();const i=Number(b.dataset.tgUp);if(i>0)[fields[i-1],fields[i]]=[fields[i],fields[i-1]];redraw();
+      syncLabels();
+      const i=Number(b.dataset.tgUp);
+      if(i>0)[fields[i-1],fields[i]]=[fields[i],fields[i-1]];
+      redraw();
     });
     rows.querySelectorAll("[data-tg-down]").forEach(b=>b.onclick=()=>{
-      syncLabels();const i=Number(b.dataset.tgDown);if(i<fields.length-1)[fields[i+1],fields[i]]=[fields[i],fields[i+1]];redraw();
+      syncLabels();
+      const i=Number(b.dataset.tgDown);
+      if(i<fields.length-1)[fields[i+1],fields[i]]=[fields[i],fields[i+1]];
+      redraw();
     });
     rows.querySelectorAll("[data-tg-del]").forEach(b=>b.onclick=()=>{
-      syncLabels();fields.splice(Number(b.dataset.tgDel),1);redraw();
+      syncLabels();
+      fields.splice(Number(b.dataset.tgDel),1);
+      redraw();
     });
     refillAdd();
   }
 
   document.querySelector("#tgAddFieldBtn").onclick=()=>{
     syncLabels();
-    const key=add.value;if(!key)return;
-    const x=available.find(a=>a.key===key);if(!x)return;
+    const key=add.value;
+    if(!key)return;
+    const x=available.find(a=>a.key===key);
+    if(!x)return;
     fields.push({key:x.key,label:x.label});
     redraw();
   };
 
+  document.querySelectorAll("[data-route-index]").forEach(row=>{
+    const i=Number(row.dataset.routeIndex);
+    const mode=row.querySelector(".tg-route-mode");
+    const chat=row.querySelector(".tg-route-chat");
+
+    mode.onchange=()=>{
+      routes[i].mode=mode.value;
+      chat.disabled=mode.value==="default";
+      if(mode.value!=="default")chat.focus();
+    };
+    chat.oninput=()=>routes[i].chatId=chat.value.trim();
+  });
+
+  function collectRoutes(){
+    const output=[];
+    document.querySelectorAll("[data-route-index]").forEach(row=>{
+      const i=Number(row.dataset.routeIndex);
+      const mode=row.querySelector(".tg-route-mode").value;
+      const chatId=row.querySelector(".tg-route-chat").value.trim();
+      routes[i].mode=mode;
+      routes[i].chatId=chatId;
+      if(mode!=="default"){
+        if(!chatId)throw new Error("请填写「"+progressDefs[i].label+"」的指定 Telegram 群 ID");
+        output.push({
+          progressId:progressDefs[i].id,
+          mode,
+          chatId
+        });
+      }
+    });
+    return output;
+  }
+
   async function saveSettings(showToast=true){
     syncLabels();
+    const routePayload=collectRoutes();
     const body={
       botToken:val("tgBotToken"),
       chatId:val("tgChatId"),
       linkLabel:val("tgLinkLabel"),
       enabled:checked("tgEnabled"),
       notifyAdmin:checked("tgNotifyAdmin"),
-      fields
+      fields,
+      routes:routePayload
     };
     const out=await api("/api/admin/telegram",{method:"PUT",body});
     document.querySelector("#tgBotToken").value="";
     document.querySelector("#tgBotToken").placeholder="已保存 "+(out.tokenHint||"")+"，不修改请留空";
-    if(showToast)toast("Telegram 设置已保存");
+    if(showToast)toast("Telegram 设置和进度通知群已保存");
   }
 
   document.querySelector("#tgSave").onclick=async()=>{
     try{await saveSettings(true)}catch(e){toast(e.message)}
   };
+
   document.querySelector("#tgTest").onclick=async()=>{
     const btn=document.querySelector("#tgTest");
-    btn.disabled=true;btn.textContent="正在测试...";
+    btn.disabled=true;
+    btn.textContent="正在测试...";
     try{
       await saveSettings(false);
       await api("/api/admin/telegram/test",{method:"POST"});
-      toast("测试消息已发送到 Telegram 群");
+      toast("测试消息已发送到默认 Telegram 群");
       setTimeout(()=>renderTelegramSettings(view),500);
     }catch(e){toast(e.message)}
-    btn.disabled=false;btn.textContent="保存并发送测试消息";
+    btn.disabled=false;
+    btn.textContent="保存并测试默认群";
   };
 
   redraw();
