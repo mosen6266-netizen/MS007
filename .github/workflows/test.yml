@@ -8,7 +8,11 @@ on:
       - "public/**"
       - "src/**"
       - "schema.sql"
+      - "migrations/**"
+      - "scripts/**"
+      - "wrangler.toml"
       - ".github/workflows/test.yml"
+      - ".github/workflows/deploy.yml"
   pull_request:
     branches: [main]
 
@@ -33,25 +37,54 @@ jobs:
           cp src/worker.js /tmp/worker.mjs
           node --check /tmp/worker.mjs
 
-      - name: Validate SQLite schema
+      - name: Database destructive-change safety gate
+        run: node scripts/check-db-safety.mjs
+
+      - name: Validate fresh database plus migrations
         shell: bash
         run: |
           python - <<'PY'
-          import sqlite3, pathlib
-          sql = pathlib.Path("schema.sql").read_text(encoding="utf-8")
-          con = sqlite3.connect(":memory:")
-          con.executescript(sql)
-          required = {
+          import pathlib, sqlite3
+
+          con=sqlite3.connect(":memory:")
+          con.execute("PRAGMA foreign_keys=ON")
+          con.executescript(pathlib.Path("schema.sql").read_text(encoding="utf-8"))
+
+          for p in sorted(pathlib.Path("migrations").glob("*.sql")):
+              con.executescript(p.read_text(encoding="utf-8"))
+              print("Applied migration:",p.name)
+
+          required={
               "users","sessions","customers","field_definitions","customer_values",
-              "progress_definitions","customer_progress","sidebar_items","list_columns",
-              "dashboard_widgets","audit_logs","system_settings"
+              "progress_definitions","customer_progress","sidebar_items",
+              "sidebar_categories","sidebar_item_categories","list_columns",
+              "dashboard_widgets","audit_logs","system_settings","telegram_settings",
+              "telegram_progress_routes","telegram_delivery_logs","telegram_send_queue",
+              "telegram_chat_rate","ms007_migration_guard"
           }
-          tables = {r[0] for r in con.execute("select name from sqlite_master where type='table'")}
-          missing = sorted(required - tables)
+          tables={r[0] for r in con.execute("select name from sqlite_master where type='table'")}
+          missing=sorted(required-tables)
           if missing:
-              raise SystemExit("Missing tables: " + ", ".join(missing))
-          print("Schema OK. Tables:", len(tables))
+              raise SystemExit("Missing tables: "+", ".join(missing))
+
+          guard=con.execute(
+              "select guard_value from ms007_migration_guard where guard_key='migration_system'"
+          ).fetchone()
+          if not guard or guard[0]!="enabled":
+              raise SystemExit("Migration baseline marker missing")
+
+          print("Fresh schema + migrations OK. Tables:",len(tables))
           PY
+
+      - name: Verify bootstrap defaults do not leak into migration files
+        shell: bash
+        run: |
+          set -euo pipefail
+          if grep -RniE "p_registered|f_phone|sa_dashboard|ss_dashboard" migrations; then
+            echo "Default seed records must stay in fresh-database schema only." >&2
+            exit 1
+          fi
+          echo "No bootstrap defaults found in migrations."
 
       - name: Check required project files
         shell: bash
@@ -62,4 +95,6 @@ jobs:
           test -f src/worker.js
           test -f schema.sql
           test -f wrangler.toml
+          test -f migrations/0000_baseline_migration_system.sql
+          test -f scripts/check-db-safety.mjs
           echo "Required files OK"
