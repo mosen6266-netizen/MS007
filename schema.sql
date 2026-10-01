@@ -227,3 +227,38 @@ INSERT OR IGNORE INTO sidebar_items
 INSERT OR IGNORE INTO sidebar_items
 (id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
 ('sa_reglayout','admin','登记面板设置','list-plus','#/admin/registration-layout','same',1,58,'管理',datetime('now'),datetime('now'));
+
+
+CREATE TABLE IF NOT EXISTS telegram_settings (
+  id INTEGER PRIMARY KEY CHECK (id=1),
+  enabled INTEGER NOT NULL DEFAULT 0,
+  chat_id TEXT NOT NULL DEFAULT '',
+  bot_token_enc TEXT NOT NULL DEFAULT '',
+  bot_token_hint TEXT NOT NULL DEFAULT '',
+  fields_json TEXT NOT NULL DEFAULT '[{"key":"sales_name","label":"业务员"},{"key":"customer_name","label":"客户姓名"},{"key":"completed_progress","label":"已完成进度"},{"key":"next_progress","label":"下一步进度"},{"key":"progress_percent","label":"当前完成度"}]',
+  notify_admin INTEGER NOT NULL DEFAULT 0,
+  link_label TEXT NOT NULL DEFAULT '查看客户详情',
+  updated_at TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO telegram_settings
+(id,enabled,chat_id,bot_token_enc,bot_token_hint,fields_json,notify_admin,link_label,updated_at)
+VALUES
+(1,0,'','','','[{"key":"sales_name","label":"业务员"},{"key":"customer_name","label":"客户姓名"},{"key":"completed_progress","label":"已完成进度"},{"key":"next_progress","label":"下一步进度"},{"key":"progress_percent","label":"当前完成度"}]',0,'查看客户详情',datetime('now'));
+
+CREATE TABLE IF NOT EXISTS telegram_delivery_logs (
+  id TEXT PRIMARY KEY,
+  customer_id TEXT,
+  actor_user_id TEXT,
+  progress_id TEXT,
+  status TEXT NOT NULL CHECK (status IN ('success','failed','skipped')),
+  error_text TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL,
+  FOREIGN KEY (customer_id) REFERENCES customers(id),
+  FOREIGN KEY (actor_user_id) REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS idx_telegram_delivery_created ON telegram_delivery_logs(created_at DESC);
+
+INSERT OR IGNORE INTO sidebar_items
+(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
+('sa_telegram','admin','Telegram 通知','link','#/admin/telegram','same',1,75,'通知',datetime('now'),datetime('now'));
