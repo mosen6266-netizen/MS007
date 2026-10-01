@@ -294,36 +294,54 @@ function dashboardPeriodStart(period){
     d.setHours(0,0,0,0);
     return d.toISOString();
   }
+  if(period==="month"){
+    d.setDate(1);
+    d.setHours(0,0,0,0);
+    return d.toISOString();
+  }
   return "";
 }
 
-async function renderDashboard(view,period=null){
+async function renderDashboard(view,period=null,cache=null){
   const stored=sessionStorage.getItem("ms007DashboardPeriod");
-  period=period||(["total","today","week"].includes(stored)?stored:"total");
+  period=period||(["total","today","week","month"].includes(stored)?stored:"total");
   sessionStorage.setItem("ms007DashboardPeriod",period);
 
-  const qs=new URLSearchParams({period});
-  const from=dashboardPeriodStart(period);
-  if(from)qs.set("from",from);
-  qs.set("todayFrom",dashboardPeriodStart("today"));
+  if(!cache){
+    const qs=new URLSearchParams({
+      todayFrom:dashboardPeriodStart("today"),
+      weekFrom:dashboardPeriodStart("week"),
+      monthFrom:dashboardPeriodStart("month")
+    });
 
-  const [r,wr]=await Promise.all([
-    api("/api/stats?"+qs.toString()),
-    api("/api/dashboard-widgets")
-  ]);
-  const s=r.summary, widgets=wr.items||[];
-  let capacityHtml="";
-  if(state.user.role==="admin"){
-    const cap=await api("/api/admin/capacity");
-    if(cap.level!=="normal"){
-      capacityHtml=`<div class="notice ${cap.level==="warning"?"warning":"urgent"}" style="margin-bottom:16px"><strong>系统容量提醒：</strong> ${esc(cap.message)} <a href="#/admin/capacity">查看详情</a></div>`;
-    }
+    const requests=[
+      api("/api/stats-bundle?"+qs.toString()),
+      api("/api/dashboard-widgets")
+    ];
+    if(state.user.role==="admin")requests.push(api("/api/admin/capacity"));
+
+    const results=await Promise.all(requests);
+    cache={
+      bundle:results[0],
+      widgets:results[1],
+      capacity:state.user.role==="admin"?results[2]:null
+    };
   }
 
-  const periodName={total:"总数据",today:"当日数据",week:"本周数据"}[period]||"总数据";
+  const data=cache.bundle?.periods?.[period]||cache.bundle?.periods?.total||{summary:{},progressCounts:{},sales:[]};
+  const s=data.summary||{};
+  const widgets=cache.widgets?.items||[];
+
+  let capacityHtml="";
+  const cap=cache.capacity;
+  if(state.user.role==="admin"&&cap&&cap.level!=="normal"){
+    capacityHtml=`<div class="notice ${cap.level==="warning"?"warning":"urgent"}" style="margin-bottom:16px"><strong>系统容量提醒：</strong> ${esc(cap.message)} <a href="#/admin/capacity">查看详情</a></div>`;
+  }
+
+  const periodName={total:"总数据",today:"当日数据",week:"本周数据",month:"本月数据"}[period]||"总数据";
   const metricValue={
     metric_total:s.total,
-    metric_today:s.today,
+    metric_today:cache.bundle?.periods?.today?.summary?.total||0,
     metric_complete:s.completed,
     metric_archived:0
   };
@@ -336,8 +354,9 @@ async function renderDashboard(view,period=null){
     state.user.role==="admin"?"查看整个团队的客户情况":"查看你的客户情况",
     `<div class="dashboard-period-switch">
       <button class="btn ${period==="total"?"":"ghost"} small" data-dashboard-period="total">总数据</button>
-      <button class="btn ${period==="today"?"":"ghost"} small" data-dashboard-period="today">当日数据</button>
-      <button class="btn ${period==="week"?"":"ghost"} small" data-dashboard-period="week">本周数据</button>
+      <button class="btn ${period==="today"?"":"ghost"} small" data-dashboard-period="today">当日</button>
+      <button class="btn ${period==="week"?"":"ghost"} small" data-dashboard-period="week">本周</button>
+      <button class="btn ${period==="month"?"":"ghost"} small" data-dashboard-period="month">本月</button>
     </div>`
   ) + capacityHtml;
 
@@ -347,9 +366,9 @@ async function renderDashboard(view,period=null){
       let subtitle=periodName;
       if(w.widget_type==="metric_progress"){
         let cfg={};try{cfg=JSON.parse(w.config_json||"{}")}catch{}
-        value=Number(r.progressCounts?.[cfg.progressId]||0);
+        value=Number(data.progressCounts?.[cfg.progressId]||0);
       }else if(w.widget_type==="metric_today"){
-        subtitle="今天新增（固定）";
+        subtitle="今日新增（固定）";
       }else if(w.widget_type==="metric_archived"){
         subtitle="归档客户不计入统计";
       }
@@ -362,8 +381,13 @@ async function renderDashboard(view,period=null){
   }
 
   for(const w of largeWidgets){
-    if(w.widget_type==="sales_breakdown" && state.user.role==="admin"){
-      html+=`<div class="card" style="margin-top:18px"><div class="dashboard-card-head"><h3>${esc(w.title)}</h3><span>${esc(periodName)}</span></div><div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead><tbody>${(r.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">当前时间范围内没有数据</td></tr>`}</tbody></table></div></div>`;
+    if(w.widget_type==="sales_breakdown"&&state.user.role==="admin"){
+      html+=`<div class="card" style="margin-top:18px">
+        <div class="dashboard-card-head"><h3>${esc(w.title)}</h3><span>${esc(periodName)}</span></div>
+        <div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead><tbody>
+        ${(data.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">当前时间范围内没有数据</td></tr>`}
+        </tbody></table></div>
+      </div>`;
     }
   }
 
@@ -371,7 +395,7 @@ async function renderDashboard(view,period=null){
   view.innerHTML=html;
 
   view.querySelectorAll("[data-dashboard-period]").forEach(b=>b.onclick=()=>{
-    renderDashboard(view,b.dataset.dashboardPeriod);
+    renderDashboard(view,b.dataset.dashboardPeriod,cache);
   });
 }
 
@@ -1450,73 +1474,79 @@ async function renderDashboardSettings(view,audience="admin"){
 }
 
 function dashboardWidgetModal(view,audience,w,progressDefs=[]){
-  const baseAllowed=audience==="admin"
-    ?["metric_total","metric_complete","metric_progress","sales_breakdown"]
-    :["metric_total","metric_complete","metric_progress"];
-  const allowed=w?.widget_type&&!baseAllowed.includes(w.widget_type)?[...baseAllowed,w.widget_type]:baseAllowed;
-
   let config={};try{config=JSON.parse(w?.config_json||"{}")}catch{}
 
+  const normalOptions=audience==="admin"
+    ?[
+      {value:"metric_total",label:"客户数量"},
+      {value:"metric_complete",label:"已完成客户"},
+      {value:"sales_breakdown",label:"业务员客户分布"}
+    ]
+    :[
+      {value:"metric_total",label:"客户数量"},
+      {value:"metric_complete",label:"已完成客户"}
+    ];
+
+  const progressOptions=progressDefs.map(p=>({
+    value:"progress:"+p.id,
+    label:"客户进度 · "+p.label,
+    progressId:p.id,
+    progressLabel:p.label
+  }));
+
+  let selectedValue=w?.widget_type==="metric_progress"&&config.progressId
+    ?("progress:"+config.progressId)
+    :(w?.widget_type||"metric_total");
+
+  const allOptions=[...normalOptions,...progressOptions];
+  if(!allOptions.some(x=>x.value===selectedValue)){
+    allOptions.push({value:selectedValue,label:widgetTypeName[w?.widget_type]||w?.widget_type||"原组件"});
+  }
+
   openModal(w?"编辑仪表盘组件":"添加仪表盘组件",`
-    <div class="field"><label>组件内容</label><select class="input" id="wType">${allowed.map(x=>`<option value="${x}" ${w?.widget_type===x?"selected":""}>${esc(widgetTypeName[x]||x)}</option>`).join("")}</select></div>
-
-    <div class="field hidden" id="wProgressBox">
-      <label>选择客户进度</label>
-      <select class="input" id="wProgressId">
-        <option value="">请选择进度</option>
-        ${progressDefs.map(p=>`<option value="${esc(p.id)}" ${config.progressId===p.id?"selected":""}>${esc(p.label)}</option>`).join("")}
+    <div class="field">
+      <label>组件内容</label>
+      <select class="input" id="wType">
+        ${allOptions.map(x=>`<option value="${esc(x.value)}" ${selectedValue===x.value?"selected":""}>${esc(x.label)}</option>`).join("")}
       </select>
-      <div class="muted" style="font-size:12px">例如选择“客户建档”，仪表盘就会显示该进度在当前时间范围内完成的客户数量。</div>
+      <div class="muted" style="font-size:12px;margin-top:5px">客户进度已经直接列出来，选择例如“客户进度 · 客户建档”即可。</div>
     </div>
-
     <div class="field"><label>显示标题</label><input class="input" id="wTitle" value="${esc(w?.title||"")}"></div>
     <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="wSort" type="number" value="${w?.sort_order??100}"></div>
     <label><input type="checkbox" id="wEnabled" ${w?.enabled!==0?"checked":""}> 显示</label>
     <button class="btn full" id="wSave" style="margin-top:16px">保存</button>
   `,()=>{
     const type=document.querySelector("#wType");
-    const progressBox=document.querySelector("#wProgressBox");
-    const progressSelect=document.querySelector("#wProgressId");
     const title=document.querySelector("#wTitle");
 
-    const updateTypeUi=()=>{
-      const isProgress=type.value==="metric_progress";
-      progressBox.classList.toggle("hidden",!isProgress);
-      if(!w||!title.value){
-        if(isProgress){
-          const selected=progressDefs.find(x=>x.id===progressSelect.value);
-          title.value=selected?(selected.label+"总数"):"客户进度统计";
-        }else{
-          title.value=widgetTypeName[type.value]||"统计组件";
-        }
+    const autoTitle=()=>{
+      const value=type.value;
+      if(value.startsWith("progress:")){
+        const pid=value.slice(9);
+        const p=progressDefs.find(x=>x.id===pid);
+        return p?(p.label+"总数"):"客户进度统计";
       }
+      return widgetTypeName[value]||allOptions.find(x=>x.value===value)?.label||"统计组件";
     };
 
-    if(!w)title.value=widgetTypeName[type.value]||"统计组件";
-    type.onchange=updateTypeUi;
-    progressSelect.onchange=()=>{
-      if(type.value==="metric_progress"){
-        const selected=progressDefs.find(x=>x.id===progressSelect.value);
-        if(selected)title.value=selected.label+"总数";
-      }
-    };
-    updateTypeUi();
+    if(!w||!title.value)title.value=autoTitle();
+    type.onchange=()=>{title.value=autoTitle()};
 
     document.querySelector("#wSave").onclick=async()=>{
-      const widgetType=val("wType");
+      const selected=val("wType");
+      const isProgress=selected.startsWith("progress:");
+      const widgetType=isProgress?"metric_progress":selected;
       const body={
         audience,
         widgetType,
-        title:val("wTitle")||widgetTypeName[widgetType]||"统计组件",
+        title:val("wTitle")||autoTitle(),
         sortOrder:Number(val("wSort")||100),
         enabled:checked("wEnabled"),
-        config:{}
+        config:isProgress?{progressId:selected.slice(9)}:{}
       };
-      if(widgetType==="metric_progress"){
-        const progressId=val("wProgressId");
-        if(!progressId){toast("请选择一个客户进度");return}
-        body.config={progressId};
-      }
+
+      if(isProgress&&!body.config.progressId){toast("请选择一个客户进度");return}
+
       try{
         if(w)await api("/api/admin/dashboard-widgets/"+w.id,{method:"PATCH",body});
         else await api("/api/admin/dashboard-widgets",{method:"POST",body});
