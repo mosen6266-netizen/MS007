@@ -691,6 +691,66 @@ async function telegramUnresolvedItems(env,limit=200){
   };
 }
 
+async function telegramRetryableFailureItems(env,limit=500){
+  const safeLimit=Math.max(1,Math.min(500,Number(limit)||500));
+  const r=await env.DB.prepare(
+    `SELECT * FROM (
+       SELECT
+         q.id,'queue' source,'needs_admin' status,
+         q.last_error error_text,q.created_at,q.updated_at,
+         q.chat_id,q.next_attempt_at,q.attempts,q.requires_admin,
+         c.name customer_name,u.display_name actor_name,p.label progress_name,
+         q.customer_id,q.actor_user_id,q.progress_id
+       FROM telegram_send_queue q
+       LEFT JOIN customers c ON c.id=q.customer_id
+       LEFT JOIN users u ON u.id=q.actor_user_id
+       LEFT JOIN progress_definitions p ON p.id=q.progress_id
+       WHERE COALESCE(q.requires_admin,0)=1
+
+       UNION ALL
+
+       SELECT
+         l.id,'delivery' source,l.status,
+         l.error_text,l.created_at,l.created_at updated_at,
+         NULL chat_id,NULL next_attempt_at,NULL attempts,0 requires_admin,
+         c.name customer_name,u.display_name actor_name,p.label progress_name,
+         l.customer_id,l.actor_user_id,l.progress_id
+       FROM telegram_delivery_logs l
+       LEFT JOIN customers c ON c.id=l.customer_id
+       LEFT JOIN users u ON u.id=l.actor_user_id
+       LEFT JOIN progress_definitions p ON p.id=l.progress_id
+       WHERE l.status IN ('failed','skipped')
+         AND l.customer_id IS NOT NULL
+         AND l.progress_id IS NOT NULL
+         AND NOT EXISTS (
+           SELECT 1 FROM telegram_send_queue q2
+           WHERE q2.customer_id IS l.customer_id
+             AND q2.progress_id IS l.progress_id
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM telegram_delivery_logs s
+           WHERE s.status='success'
+             AND s.customer_id IS l.customer_id
+             AND s.progress_id IS l.progress_id
+             AND s.created_at>l.created_at
+         )
+         AND NOT EXISTS (
+           SELECT 1 FROM telegram_delivery_logs newer
+           WHERE newer.status IN ('failed','skipped')
+             AND newer.customer_id IS l.customer_id
+             AND newer.progress_id IS l.progress_id
+             AND (
+               newer.created_at>l.created_at
+               OR (newer.created_at=l.created_at AND newer.id>l.id)
+             )
+         )
+     ) failed
+     ORDER BY failed.updated_at DESC,failed.created_at DESC,failed.id DESC
+     LIMIT ?`
+  ).bind(safeLimit).all();
+  return r.results||[];
+}
+
 async function telegramQueueMonitor(env){
   const cutoff=new Date(Date.now()-24*60*60*1000).toISOString();
   const [queue,delivery]=await Promise.all([
@@ -1407,9 +1467,9 @@ async function retryFailedTelegramBatch(request,env,user,ctx){
   if(!settings?.enabled)return fail("Telegram 自动通知当前已关闭，请先启用后再执行批量重新发送",409);
   if(!settings?.bot_token_enc)return fail("Telegram Bot Token 未设置，请先保存 Token 后再执行批量重新发送",409);
 
-  const unresolved=await telegramUnresolvedItems(env,500);
-  const candidates=(unresolved.items||[])
-    .filter(x=>(x.status==="needs_admin" || x.source==="delivery") && !skipIds.has(String(x.id||"")))
+  const retryableFailures=await telegramRetryableFailureItems(env,500);
+  const candidates=retryableFailures
+    .filter(x=>!skipIds.has(String(x.id||"")))
     .slice(0,BATCH_SIZE);
 
   if(!candidates.length){
@@ -1551,9 +1611,9 @@ async function retryFailedTelegramBatch(request,env,user,ctx){
   if(ctx?.waitUntil)ctx.waitUntil(job);
 
   const blockedIds=new Set([...skipIds,...blocked.map(x=>String(x.id||""))]);
-  const after=await telegramUnresolvedItems(env,500);
-  const hasMoreActionable=(after.items||[]).some(
-    x=>(x.status==="needs_admin" || x.source==="delivery") && !blockedIds.has(String(x.id||""))
+  const after=await telegramRetryableFailureItems(env,500);
+  const hasMoreActionable=after.some(
+    x=>!blockedIds.has(String(x.id||""))
   );
 
   return responseJson({
