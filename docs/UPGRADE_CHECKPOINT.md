@@ -156,4 +156,33 @@ Verification:
 - Production deployment and smoke test: success.
 - Production database was not bootstrapped/recreated.
 
-Next work: Batch 5 - Draft and Telegram reliability.
+Next work: Batch 5 - Draft and Telegram reliability. (completed below)
+
+
+## Batch 5 completed verification
+
+Final verified commit: 9eedab35ab2363dc640f4c70260590c5bb98a15d
+
+Implemented:
+- Local overlay drafts expire after 7 days.
+- Expired drafts for the currently logged-in account are cleaned on logout; drafts belonging to other accounts are not touched.
+- Added Telegram queue monitor with pending count, retry count, administrator-attention count, oldest active wait, and rolling 24-hour delivery success rate.
+- Permanent Telegram errors and repeated automatic failures are retained in the queue as administrator-attention items instead of being deleted.
+- Added manual retry after the administrator fixes Telegram token/chat/template/permission issues.
+- Automatic processing skips administrator-attention items until manually retried.
+- Preserved existing Telegram queue rows in place; migration 0004 only added requires_admin and dead_lettered_at metadata plus an index.
+- Added Batch 5 reliability regression checks to both quality and deployment gates.
+- Used a pull-request validation branch before merge so Batch 5 was fully checked without touching Cloudflare production.
+
+Verification:
+- Pull Request #1 Quality Check run 36927987144: success.
+- Main Quality Check run 36928037590: success.
+- Main Deploy run 36928037427: success.
+- Frontend/Worker syntax, database destructive-change safety gate, fresh schema+migrations, Batch 1-5 regressions: success.
+- Staging migration, deployment and smoke test: success.
+- Production recovery point recorded and uploaded before migration.
+- Production migration applied successfully; no unapplied migration remained.
+- Production deployment and smoke test: success.
+- Production database was not bootstrapped/recreated.
+
+Next work: Batch 6.
