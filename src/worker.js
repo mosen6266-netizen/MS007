@@ -402,7 +402,8 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
   let processed=0;
 
   const settings=await telegramSettingsRow(env);
-  if(!settings?.enabled || !settings?.bot_token_enc)return {processed,reason:"disabled"};
+  if(!settings?.bot_token_enc)return {processed,reason:"token_missing"};
+  const notificationsEnabled=!!settings?.enabled;
 
   let token="";
   try{
@@ -447,6 +448,20 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
       break;
     }
 
+    if(task.progress_id && !notificationsEnabled){
+      await env.DB.prepare(
+        `UPDATE telegram_send_queue
+         SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
+         WHERE id=?`
+      ).bind(
+        telegramAfterSeconds(300),
+        "Telegram 自动通知当前已关闭，消息保留在队列中，重新启用后会继续发送",
+        now(),
+        task.id
+      ).run();
+      continue;
+    }
+
     const lockUntil=telegramAfterSeconds(75);
     const claim=await env.DB.prepare(
       `UPDATE telegram_send_queue
@@ -459,6 +474,20 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
     ).bind(lockUntil,current,task.id,current,current).run();
     if(Number(claim?.meta?.changes||0)!==1)continue;
 
+    const globalLease=await acquireTelegramChatLease(env,"__bot_global__",1);
+    if(!globalLease.acquired){
+      const rate=await env.DB.prepare(
+        "SELECT next_allowed_at FROM telegram_chat_rate WHERE chat_id='__bot_global__'"
+      ).first();
+      const retryAt=String(rate?.next_allowed_at||telegramAfterSeconds(1));
+      await env.DB.prepare(
+        `UPDATE telegram_send_queue
+         SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
+         WHERE id=?`
+      ).bind(retryAt,"Telegram 全局发送正在安全限速，系统会自动发送",now(),task.id).run();
+      continue;
+    }
+
     const lease=await acquireTelegramChatLease(env,task.chat_id,4);
     if(!lease.acquired){
       const rate=await env.DB.prepare(
@@ -469,7 +498,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
         `UPDATE telegram_send_queue
          SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
          WHERE id=?`
-      ).bind(retryAt,"同一群组正在限速排队，系统会自动发送",now(),task.id).run();
+      ).bind(retryAt,"同一群组正在安全限速排队，系统会自动发送",now(),task.id).run();
       continue;
     }
 
@@ -1414,6 +1443,7 @@ async function hardDeleteProgressDef(env,user,id){
 
   await env.DB.prepare("DELETE FROM customer_progress WHERE progress_id=?").bind(id).run();
   await env.DB.prepare("DELETE FROM telegram_progress_routes WHERE progress_id=?").bind(id).run();
+  await env.DB.prepare("DELETE FROM telegram_send_queue WHERE progress_id=?").bind(id).run();
   await env.DB.prepare("DELETE FROM progress_definitions WHERE id=?").bind(id).run();
   await recalcAllProgress(env);
   await audit(env,user,"delete_permanent","progress_definition",id,{label:progress.label,deletedCustomerProgress:valueCount});
