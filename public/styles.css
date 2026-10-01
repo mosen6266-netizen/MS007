@@ -553,3 +553,139 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
 @media(max-width:620px){
   .telegram-template-title{flex-direction:column}
 }
+
+/* Customer list responsive safety overrides
+   Display-only: no customer data, field settings, ordering or business logic is changed. */
+.customer-row{
+  grid-template-columns:minmax(0,1fr) minmax(320px,360px) 64px 220px;
+  grid-template-areas:"customer-info customer-steps customer-percent customer-actions";
+  align-items:center;
+}
+.customer-fields,
+.customer-fields-configurable{
+  grid-area:customer-info;
+  min-width:0;
+}
+.customer-step-status{
+  grid-area:customer-steps;
+  width:100%;
+  min-width:0;
+  grid-template-columns:minmax(0,1fr) minmax(0,1fr);
+}
+.customer-row-progress{grid-area:customer-percent}
+.customer-actions{grid-area:customer-actions}
+
+/* Progress bubbles: never truncate the progress name. */
+.step-status{
+  min-width:0;
+  overflow:visible;
+}
+.step-status strong{
+  width:100%;
+  min-width:0;
+  max-width:none;
+  white-space:normal;
+  overflow:visible;
+  text-overflow:clip;
+  overflow-wrap:anywhere;
+  word-break:break-word;
+}
+.step-status strong i{margin-top:4px}
+
+/* Medium/small laptop screens: keep everything visible and allow customer info to wrap. */
+@media(max-width:1400px){
+  .customer-row{
+    grid-template-columns:minmax(0,1fr) minmax(300px,340px);
+    grid-template-areas:
+      "customer-info customer-steps"
+      "customer-percent customer-actions";
+    row-gap:9px;
+  }
+  .customer-fields,
+  .customer-fields-configurable{
+    flex-wrap:wrap;
+    overflow:visible;
+    row-gap:8px;
+  }
+  .customer-cell{
+    flex:0 1 auto;
+    max-width:190px;
+  }
+  .customer-cell strong{max-width:190px}
+  .customer-row-progress{
+    justify-self:start;
+    text-align:left;
+  }
+  .customer-actions{
+    justify-self:end;
+    width:220px;
+  }
+}
+
+/* Narrow laptop/tablet: information, progress and actions each get their own row. */
+@media(max-width:980px){
+  .customer-row{
+    grid-template-columns:minmax(0,1fr) minmax(260px,320px);
+    grid-template-areas:
+      "customer-info customer-info"
+      "customer-steps customer-percent"
+      "customer-actions customer-actions";
+  }
+  .customer-fields,
+  .customer-fields-configurable{
+    flex-wrap:wrap;
+    overflow:visible;
+  }
+  .customer-cell{
+    max-width:220px;
+  }
+  .customer-cell strong{max-width:220px}
+  .customer-actions{
+    justify-self:start;
+  }
+}
+
+/* Very small screens: stack sections so no field or progress bubble is clipped. */
+@media(max-width:680px){
+  .customer-row{
+    grid-template-columns:1fr;
+    grid-template-areas:
+      "customer-info"
+      "customer-steps"
+      "customer-percent"
+      "customer-actions";
+  }
+  .customer-fields,
+  .customer-fields-configurable{
+    display:grid;
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    gap:9px 12px;
+    overflow:visible;
+  }
+  .customer-cell,
+  .customer-cell strong{
+    max-width:none;
+    width:100%;
+  }
+  .customer-step-status{
+    grid-template-columns:1fr 1fr;
+  }
+  .customer-actions{
+    width:min(100%,320px);
+    grid-template-columns:repeat(3,minmax(0,1fr));
+  }
+}
+
+/* Phone-width fallback. */
+@media(max-width:460px){
+  .customer-fields,
+  .customer-fields-configurable{
+    grid-template-columns:1fr;
+  }
+  .customer-step-status{
+    grid-template-columns:1fr;
+  }
+  .customer-actions{
+    width:100%;
+  }
+}
