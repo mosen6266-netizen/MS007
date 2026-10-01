@@ -131,6 +131,302 @@ async function getSystemSetting(env, key, fallback = null) {
   try { return JSON.parse(row.value_json); } catch { return fallback; }
 }
 
+
+function telegramHtmlEscape(v="") {
+  return String(v).replace(/[&<>]/g, ch => ({"&":"&amp;","<":"&lt;",">":"&gt;"}[ch]));
+}
+
+async function telegramCryptoKey(env) {
+  if(!env.BOOTSTRAP_TOKEN) throw new Error("系统缺少加密密钥");
+  const raw=await crypto.subtle.digest("SHA-256",enc.encode("MS007:telegram:"+env.BOOTSTRAP_TOKEN));
+  return crypto.subtle.importKey("raw",raw,{name:"AES-GCM"},false,["encrypt","decrypt"]);
+}
+
+async function telegramEncryptSecret(env,value) {
+  const iv=new Uint8Array(12);crypto.getRandomValues(iv);
+  const key=await telegramCryptoKey(env);
+  const encrypted=await crypto.subtle.encrypt({name:"AES-GCM",iv},key,enc.encode(String(value||"")));
+  return "v1."+bytesToB64(iv)+"."+bytesToB64(new Uint8Array(encrypted));
+}
+
+async function telegramDecryptSecret(env,value) {
+  if(!value)return "";
+  const parts=String(value).split(".");
+  if(parts.length!==3||parts[0]!=="v1") throw new Error("Telegram Token 数据格式无效");
+  const key=await telegramCryptoKey(env);
+  const plain=await crypto.subtle.decrypt({name:"AES-GCM",iv:b64ToBytes(parts[1])},key,b64ToBytes(parts[2]));
+  return new TextDecoder().decode(plain);
+}
+
+function defaultTelegramFields(){
+  return [
+    {key:"sales_name",label:"业务员"},
+    {key:"customer_name",label:"客户姓名"},
+    {key:"completed_progress",label:"已完成进度"},
+    {key:"next_progress",label:"下一步进度"},
+    {key:"progress_percent",label:"当前完成度"}
+  ];
+}
+
+async function telegramSettingsRow(env){
+  let row=await env.DB.prepare("SELECT * FROM telegram_settings WHERE id=1").first();
+  if(!row){
+    await env.DB.prepare(
+      `INSERT INTO telegram_settings(id,enabled,chat_id,bot_token_enc,bot_token_hint,fields_json,notify_admin,link_label,updated_at)
+       VALUES(1,0,'','','',?,0,'查看客户详情',?)`
+    ).bind(JSON.stringify(defaultTelegramFields()),now()).run();
+    row=await env.DB.prepare("SELECT * FROM telegram_settings WHERE id=1").first();
+  }
+  return row;
+}
+
+async function telegramAvailableFields(env){
+  const r=await env.DB.prepare(
+    "SELECT id,label,field_key FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  return [
+    {key:"sales_name",label:"业务员"},
+    {key:"customer_name",label:"客户姓名"},
+    {key:"assigned_sales",label:"客户所属业务员"},
+    {key:"completed_progress",label:"已完成进度"},
+    {key:"current_progress",label:"当前进度"},
+    {key:"next_progress",label:"下一步进度"},
+    {key:"progress_percent",label:"当前完成度"},
+    {key:"progress_fraction",label:"已完成步骤"},
+    ...(r.results||[]).map(x=>({key:"field:"+x.id,label:x.label,fieldId:x.id}))
+  ];
+}
+
+async function telegramApiCall(token,method,payload){
+  const ctl=new AbortController();
+  const timer=setTimeout(()=>ctl.abort(),8000);
+  try{
+    const res=await fetch("https://api.telegram.org/bot"+encodeURIComponent(token)+"/"+method,{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify(payload||{}),
+      signal:ctl.signal
+    });
+    const data=await res.json().catch(()=>({ok:false,description:"Telegram 返回了无法识别的内容"}));
+    if(!res.ok||!data.ok) throw new Error(data.description||("Telegram HTTP "+res.status));
+    return data;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function telegramValidateToken(token){
+  const data=await telegramApiCall(token,"getMe",{});
+  return data.result||{};
+}
+
+async function telegramAdminGet(env){
+  const row=await telegramSettingsRow(env);
+  let fields=defaultTelegramFields();
+  try{
+    const parsed=JSON.parse(row.fields_json||"[]");
+    if(Array.isArray(parsed)&&parsed.length)fields=parsed;
+  }catch{}
+  const availableFields=await telegramAvailableFields(env);
+  const logs=await env.DB.prepare(
+    `SELECT l.id,l.status,l.error_text,l.created_at,c.name customer_name,u.display_name actor_name
+     FROM telegram_delivery_logs l
+     LEFT JOIN customers c ON c.id=l.customer_id
+     LEFT JOIN users u ON u.id=l.actor_user_id
+     ORDER BY l.created_at DESC LIMIT 20`
+  ).all();
+  return responseJson({
+    ok:true,
+    settings:{
+      enabled:!!row.enabled,
+      chatId:row.chat_id||"",
+      hasToken:!!row.bot_token_enc,
+      tokenHint:row.bot_token_hint||"",
+      fields,
+      notifyAdmin:!!row.notify_admin,
+      linkLabel:row.link_label||"查看客户详情"
+    },
+    availableFields,
+    logs:logs.results||[]
+  });
+}
+
+async function telegramAdminSave(request,env,user){
+  const b=await readBody(request);
+  const old=await telegramSettingsRow(env);
+  let encToken=old.bot_token_enc||"";
+  let hint=old.bot_token_hint||"";
+  const newToken=String(b.botToken||"").trim();
+
+  if(newToken){
+    const me=await telegramValidateToken(newToken);
+    encToken=await telegramEncryptSecret(env,newToken);
+    const username=String(me.username||"");
+    hint=username?("@"+username):("…"+newToken.slice(-6));
+  }
+
+  const chatId=String(b.chatId!==undefined?b.chatId:old.chat_id||"").trim();
+  const enabled=b.enabled!==undefined?!!b.enabled:!!old.enabled;
+  const notifyAdmin=b.notifyAdmin!==undefined?!!b.notifyAdmin:!!old.notify_admin;
+  const linkLabel=String(b.linkLabel||old.link_label||"查看客户详情").trim().slice(0,80)||"查看客户详情";
+
+  const available=await telegramAvailableFields(env);
+  const allowed=new Set(available.map(x=>x.key));
+  const fieldLabel=new Map(available.map(x=>[x.key,x.label]));
+  const input=Array.isArray(b.fields)?b.fields:[];
+  const fields=[];
+  const seen=new Set();
+  for(const item of input.slice(0,40)){
+    const key=String(item?.key||"");
+    if(!allowed.has(key)||seen.has(key))continue;
+    seen.add(key);
+    fields.push({key,label:String(item?.label||fieldLabel.get(key)||key).trim().slice(0,80)});
+  }
+  if(!fields.length)fields.push(...defaultTelegramFields());
+
+  if(enabled && !encToken)return fail("请先填写 Telegram Bot Token");
+  if(enabled && !chatId)return fail("请先填写 Telegram 群 ID");
+
+  await env.DB.prepare(
+    `UPDATE telegram_settings
+     SET enabled=?,chat_id=?,bot_token_enc=?,bot_token_hint=?,fields_json=?,notify_admin=?,link_label=?,updated_at=?
+     WHERE id=1`
+  ).bind(enabled?1:0,chatId,encToken,hint,JSON.stringify(fields),notifyAdmin?1:0,linkLabel,now()).run();
+
+  await audit(env,user,"update","telegram_settings","1",{
+    enabled,chatId,hasToken:!!encToken,fieldCount:fields.length,notifyAdmin
+  });
+  return responseJson({ok:true,tokenHint:hint,hasToken:!!encToken});
+}
+
+async function telegramAdminTest(request,env,user){
+  const row=await telegramSettingsRow(env);
+  if(!row.bot_token_enc)return fail("请先保存 Telegram Bot Token");
+  if(!row.chat_id)return fail("请先填写 Telegram 群 ID");
+  let token="";
+  try{token=await telegramDecryptSecret(env,row.bot_token_enc)}catch(e){return fail("Telegram Token 无法解密，请重新填写 Token")}
+  const origin=new URL(request.url).origin;
+  const text="✅ <b>MS007 Telegram 通知测试成功</b>\n\n机器人已经可以向这个群发送消息。\n\n<a href=\""+telegramHtmlEscape(origin)+"\">打开 MS007</a>";
+  try{
+    await telegramApiCall(token,"sendMessage",{
+      chat_id:row.chat_id,
+      text,
+      parse_mode:"HTML",
+      disable_web_page_preview:true
+    });
+    await audit(env,user,"test","telegram_settings","1",{chatId:row.chat_id});
+    return responseJson({ok:true,message:"测试消息已发送"});
+  }catch(e){
+    return fail("发送失败："+String(e?.message||e));
+  }
+}
+
+async function telegramProgressStatus(env,customerId){
+  const defsResult=await env.DB.prepare(
+    "SELECT id,label,color,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  const doneResult=await env.DB.prepare(
+    "SELECT progress_id FROM customer_progress WHERE customer_id=? AND completed=1"
+  ).bind(customerId).all();
+  const done=new Set((doneResult.results||[]).map(x=>x.progress_id));
+  let current=null,next=null;
+  for(const p of defsResult.results||[]){
+    if(done.has(p.id))current=p;
+    else if(!next)next=p;
+  }
+  return {current,next,total:(defsResult.results||[]).length,done:done.size};
+}
+
+async function logTelegramDelivery(env,{customerId,actorUserId,progressId,status,error=""}){
+  try{
+    await env.DB.prepare(
+      "INSERT INTO telegram_delivery_logs(id,customer_id,actor_user_id,progress_id,status,error_text,created_at) VALUES(?,?,?,?,?,?,?)"
+    ).bind(uid("tg_"),customerId||null,actorUserId||null,progressId||null,status,String(error||"").slice(0,1000),now()).run();
+  }catch{}
+}
+
+async function sendTelegramProgressNotification(request,env,user,customerId,progressDef,summary){
+  const row=await telegramSettingsRow(env);
+  if(!row.enabled)return;
+  if(user.role==="admin"&&!row.notify_admin)return;
+  if(!row.bot_token_enc||!row.chat_id){
+    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"Telegram 设置不完整"});
+    return;
+  }
+
+  let token="";
+  try{token=await telegramDecryptSecret(env,row.bot_token_enc)}
+  catch(e){
+    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"failed",error:"Token 无法解密"});
+    return;
+  }
+
+  const customer=await env.DB.prepare(
+    `SELECT c.id,c.name,c.assigned_user_id,u.display_name owner_name
+     FROM customers c LEFT JOIN users u ON u.id=c.assigned_user_id
+     WHERE c.id=?`
+  ).bind(customerId).first();
+  if(!customer)return;
+
+  const status=await telegramProgressStatus(env,customerId);
+  let fields=defaultTelegramFields();
+  try{
+    const parsed=JSON.parse(row.fields_json||"[]");
+    if(Array.isArray(parsed)&&parsed.length)fields=parsed;
+  }catch{}
+
+  const customIds=[...new Set(fields.filter(x=>String(x.key||"").startsWith("field:")).map(x=>String(x.key).slice(6)).filter(Boolean))];
+  const customValues={};
+  if(customIds.length){
+    const marks=customIds.map(()=>"?").join(",");
+    const vals=await env.DB.prepare(
+      `SELECT field_id,value FROM customer_values WHERE customer_id=? AND field_id IN (${marks})`
+    ).bind(customerId,...customIds).all();
+    for(const v of vals.results||[])customValues[v.field_id]=v.value||"";
+  }
+
+  const available=await telegramAvailableFields(env);
+  const defaultLabels=new Map(available.map(x=>[x.key,x.label]));
+  const values={
+    sales_name:user.display_name||user.username||"",
+    customer_name:customer.name||"",
+    assigned_sales:customer.owner_name||"未分配",
+    completed_progress:progressDef.label||"",
+    current_progress:status.current?.label||"未开始",
+    next_progress:status.next?.label||"已全部完成",
+    progress_percent:String(summary.percent||0)+"%",
+    progress_fraction:String(summary.done||0)+"/"+String(summary.total||0)
+  };
+
+  const lines=["✅ <b>客户进度已更新</b>",""];
+  for(const item of fields){
+    const key=String(item.key||"");
+    const label=String(item.label||defaultLabels.get(key)||key);
+    let value="";
+    if(key.startsWith("field:"))value=customValues[key.slice(6)]||"";
+    else value=values[key]??"";
+    if(value==="")continue;
+    lines.push("<b>"+telegramHtmlEscape(label)+"：</b>"+telegramHtmlEscape(value));
+  }
+
+  const origin=new URL(request.url).origin;
+  const detailUrl=origin+"/#/customer/"+encodeURIComponent(customerId);
+  lines.push("");
+  lines.push('<a href="'+telegramHtmlEscape(detailUrl)+'">'+telegramHtmlEscape(row.link_label||"查看客户详情")+"</a>");
+
+  try{
+    await telegramApiCall(token,"sendMessage",{
+      chat_id:row.chat_id,
+      text:lines.join("\n"),
+      parse_mode:"HTML",
+      disable_web_page_preview:true
+    });
+    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"success"});
+  }catch(e){
+    await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"failed",error:String(e?.message||e)});
+  }
+}
+
 async function bumpVersion(env, key) {
   const t = now();
   await env.DB.prepare(
@@ -524,13 +820,17 @@ async function updateCustomer(request, env, user, id) {
   return responseJson({ ok: true });
 }
 
-async function toggleProgress(request, env, user, customerId, progressId) {
+async function toggleProgress(request, env, user, customerId, progressId, ctx) {
   const customer = await env.DB.prepare("SELECT * FROM customers WHERE id=? AND deleted_at IS NULL").bind(customerId).first();
   if (!customer) return fail("客户不存在", 404);
   if (user.role === "sales" && customer.assigned_user_id !== user.id) return fail("无权修改该客户", 403);
 
-  const pd = await env.DB.prepare("SELECT id FROM progress_definitions WHERE id=? AND enabled=1").bind(progressId).first();
+  const pd = await env.DB.prepare("SELECT id,label,description,color,sort_order FROM progress_definitions WHERE id=? AND enabled=1").bind(progressId).first();
   if (!pd) return fail("进度项目不存在", 404);
+  const previous=await env.DB.prepare(
+    "SELECT completed FROM customer_progress WHERE customer_id=? AND progress_id=?"
+  ).bind(customerId,progressId).first();
+
   const body = await readBody(request);
   const completed = body.completed ? 1 : 0;
   const t = now();
@@ -542,6 +842,14 @@ async function toggleProgress(request, env, user, customerId, progressId) {
   ).bind(customerId, progressId, completed, user.id, completed ? t : null).run();
   const summary = await recalcProgress(env, customerId);
   await audit(env, user, completed ? "progress_complete" : "progress_uncomplete", "customer", customerId, { progressId });
+
+  const transitionedToComplete=completed===1 && Number(previous?.completed||0)!==1;
+  if(transitionedToComplete){
+    const job=sendTelegramProgressNotification(request,env,user,customerId,pd,summary).catch(()=>{});
+    if(ctx?.waitUntil)ctx.waitUntil(job);
+    else await job;
+  }
+
   return responseJson({ ok: true, ...summary });
 }
 
@@ -1211,7 +1519,7 @@ async function importBusinessData(request,env,user){
   return responseJson({ok:true,message:"业务数据已导入。备份中的业务员账号为安全起见会保持停用，需要管理员重新设置密码并启用。"});
 }
 
-async function api(request, env) {
+async function api(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
   const method = request.method.toUpperCase();
@@ -1250,7 +1558,7 @@ async function api(request, env) {
   if(m && method==="PATCH") return updateCustomer(request,env,user,m[1]);
   if(m && method==="DELETE") return softDeleteCustomer(env,user,m[1]);
   m=path.match(/^\/api\/customers\/([^/]+)\/progress\/([^/]+)$/);
-  if(m && method==="PUT") return toggleProgress(request,env,user,m[1],m[2]);
+  if(m && method==="PUT") return toggleProgress(request,env,user,m[1],m[2],ctx);
 
   if (!requireRole(user,"admin")) return fail("需要管理员权限",403,"ADMIN_REQUIRED");
 
@@ -1288,6 +1596,9 @@ async function api(request, env) {
   }
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
+  if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
+  if (path === "/api/admin/telegram" && method === "PUT") return telegramAdminSave(request,env,user);
+  if (path === "/api/admin/telegram/test" && method === "POST") return telegramAdminTest(request,env,user);
   if (path === "/api/admin/registration-layout" && method === "GET") return adminRegistrationLayout(env);
   if (path === "/api/admin/registration-layout" && method === "PUT") return saveRegistrationLayout(request,env,user);
   if (path === "/api/admin/recycle" && method === "GET") return recycleList(env);
@@ -1323,10 +1634,10 @@ function withSecurityHeaders(response) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
       const url=new URL(request.url);
-      if(url.pathname.startsWith("/api/")) return withSecurityHeaders(await api(request,env));
+      if(url.pathname.startsWith("/api/")) return withSecurityHeaders(await api(request,env,ctx));
       const asset=await env.ASSETS.fetch(request);
       return withSecurityHeaders(asset);
     } catch (e) {
