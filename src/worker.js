@@ -301,6 +301,7 @@ async function processMaintenanceBatch(env,{batchSize=100}={}){
        WHERE id=?`
     ).bind(progressTotal,progressTotal,progressTotal,row.id));
     if(statements.length)await env.DB.batch(statements);
+    if(rows.length)await invalidateDashboardStatistics(env);
   }else{
     await env.DB.prepare(
       "UPDATE maintenance_jobs SET status='failed',detail_json=?,updated_at=? WHERE task_key=?"
@@ -2912,6 +2913,55 @@ async function updateSidebarItem(request, env, user, id) {
   return responseJson({ok:true});
 }
 
+// Batch 7.2: dashboard statistics cache.
+// Cache failures must never block customer/business operations. If the migration
+// has not been applied yet, reads simply fall back to the authoritative queries.
+function dashboardStatisticsCacheKey(kind,user,parts=[]){
+  const role=normalizedRole(user?.role)||"unknown";
+  const scope=role==="sales"?String(user?.id||""):"all";
+  return ["v1",String(kind||"stats"),role,scope,...parts.map(x=>String(x??""))].join("|");
+}
+
+async function readDashboardStatisticsCache(env,cacheKey,{maxAgeMs=26*60*60*1000}={}){
+  try{
+    const row=await env.DB.prepare(
+      "SELECT value_json,updated_at FROM dashboard_statistics_cache WHERE cache_key=?"
+    ).bind(cacheKey).first();
+    if(!row)return null;
+    const updatedMs=Date.parse(String(row.updated_at||""));
+    if(Number.isFinite(updatedMs)&&Date.now()-updatedMs>maxAgeMs)return null;
+    const value=JSON.parse(row.value_json||"null");
+    return value&&typeof value==="object"?value:null;
+  }catch{
+    return null;
+  }
+}
+
+async function writeDashboardStatisticsCache(env,cacheKey,value){
+  try{
+    await env.DB.prepare(
+      `INSERT INTO dashboard_statistics_cache(cache_key,value_json,updated_at)
+       VALUES(?,?,?)
+       ON CONFLICT(cache_key) DO UPDATE SET
+         value_json=excluded.value_json,updated_at=excluded.updated_at`
+    ).bind(cacheKey,JSON.stringify(value),now()).run();
+  }catch{}
+}
+
+async function invalidateDashboardStatistics(env){
+  try{
+    await env.DB.prepare("DELETE FROM dashboard_statistics_cache").run();
+  }catch{}
+}
+
+async function withDashboardStatisticsInvalidation(env,work){
+  const response=await work;
+  if(response&&Number(response.status)>=200&&Number(response.status)<400){
+    await invalidateDashboardStatistics(env);
+  }
+  return response;
+}
+
 async function stats(request, env, user) {
   const url=new URL(request.url);
   const period=["total","today","week"].includes(url.searchParams.get("period"))?url.searchParams.get("period"):"total";
@@ -2923,6 +2973,10 @@ async function stats(request, env, user) {
   const ownerBind=salesOnly?[user.id]:[];
   const createdPeriodSql=from?" AND c.created_at>=?":"";
   const createdBind=from?[from]:[];
+
+  const statsCacheKey=dashboardStatisticsCacheKey("stats",user,[period,from||"",String(url.searchParams.get("todayFrom")||"")]);
+  const statsCached=await readDashboardStatisticsCache(env,statsCacheKey);
+  if(statsCached)return responseJson(statsCached);
 
   const base=await env.DB.prepare(
     `SELECT COUNT(*) total
@@ -2993,12 +3047,14 @@ async function stats(request, env, user) {
     sales=r.results||[];
   }
 
-  return responseJson({ok:true,period,from:from||null,summary:{
+  const payload={ok:true,period,from:from||null,summary:{
     total:Number(base?.total||0),
     today:Number(today?.n||0),
     completed:Number(completed?.n||0),
     archived:0
-  },progressCounts,sales});
+  },progressCounts,sales};
+  await writeDashboardStatisticsCache(env,statsCacheKey,payload);
+  return responseJson(payload);
 }
 
 
@@ -3012,6 +3068,10 @@ async function statsBundle(request,env,user){
   const salesOnly=normalizedRole(user.role)==="sales";
   const ownerClause=salesOnly?" AND c.assigned_user_id=?":"";
   const ownerBind=salesOnly?[user.id]:[];
+
+  const bundleCacheKey=dashboardStatisticsCacheKey("bundle",user,[todayFrom,weekFrom,monthFrom]);
+  const bundleCached=await readDashboardStatisticsCache(env,bundleCacheKey);
+  if(bundleCached)return responseJson(bundleCached);
 
   const [customers,completed,progressRows]=await Promise.all([
     env.DB.prepare(
@@ -3110,7 +3170,7 @@ async function statsBundle(request,env,user){
     sales:salesByPeriod[key]
   });
 
-  return responseJson({
+  const payload={
     ok:true,
     boundaries:{todayFrom,weekFrom,monthFrom},
     periods:{
@@ -3119,7 +3179,9 @@ async function statsBundle(request,env,user){
       week:makePeriod("week"),
       month:makePeriod("month")
     }
-  });
+  };
+  await writeDashboardStatisticsCache(env,bundleCacheKey,payload);
+  return responseJson(payload);
 }
 
 async function computeCapacitySnapshot(env){
@@ -4030,25 +4092,25 @@ async function api(request, env, ctx) {
   if (path === "/api/fields" && method === "GET") return listFields(env,user);
   if (path === "/api/progress-defs" && method === "GET") return listProgressDefs(env,user);
   if (path === "/api/customers" && method === "GET") return listCustomers(request,env,user);
-  if (path === "/api/customers" && method === "POST") return createCustomer(request,env,user);
+  if (path === "/api/customers" && method === "POST") return withDashboardStatisticsInvalidation(env,createCustomer(request,env,user));
   if (path === "/api/stats-bundle" && method === "GET") return statsBundle(request,env,user);
   if (path === "/api/stats" && method === "GET") return stats(request,env,user);
 
   let m=path.match(/^\/api\/customers\/([^/]+)$/);
   if(m && method==="GET") return getCustomer(env,user,m[1]);
-  if(m && method==="PATCH") return updateCustomer(request,env,user,m[1]);
-  if(m && method==="PUT") return saveCustomerAtomic(request,env,user,m[1],ctx);
-  if(m && method==="DELETE") return softDeleteCustomer(env,user,m[1]);
+  if(m && method==="PATCH") return withDashboardStatisticsInvalidation(env,updateCustomer(request,env,user,m[1]));
+  if(m && method==="PUT") return withDashboardStatisticsInvalidation(env,saveCustomerAtomic(request,env,user,m[1],ctx));
+  if(m && method==="DELETE") return withDashboardStatisticsInvalidation(env,softDeleteCustomer(env,user,m[1]));
   m=path.match(/^\/api\/customers\/([^/]+)\/progress\/([^/]+)$/);
-  if(m && method==="PUT") return toggleProgress(request,env,user,m[1],m[2],ctx);
+  if(m && method==="PUT") return withDashboardStatisticsInvalidation(env,toggleProgress(request,env,user,m[1],m[2],ctx));
 
   if (!requireRole(user,"admin")) return fail("需要管理员权限",403,"ADMIN_REQUIRED");
 
   if (path === "/api/admin/users" && method === "GET") return usersList(request,env);
   if (path === "/api/admin/sales-options" && method === "GET") return salesOptions(env);
-  if (path === "/api/admin/users" && method === "POST") return createUser(request,env,user);
+  if (path === "/api/admin/users" && method === "POST") return withDashboardStatisticsInvalidation(env,createUser(request,env,user));
   m=path.match(/^\/api\/admin\/users\/([^/]+)$/);
-  if(m && method==="PATCH") return updateUser(request,env,user,m[1]);
+  if(m && method==="PATCH") return withDashboardStatisticsInvalidation(env,updateUser(request,env,user,m[1]));
   if (path === "/api/admin/fields" && method === "POST") return createField(request,env,user);
   m=path.match(/^\/api\/admin\/fields\/([^/]+)$/);
   if(m && method==="PATCH") return updateField(request,env,user,m[1]);
@@ -4063,17 +4125,18 @@ async function api(request, env, ctx) {
   m=path.match(/^\/api\/admin\/fields\/([^/]+)\/hard-delete$/);
   if(m && method==="DELETE") return hardDeleteField(env,user,m[1]);
 
-  if (path === "/api/admin/progress" && method === "POST") return createProgressDef(request,env,user);
+  if (path === "/api/admin/progress" && method === "POST") return withDashboardStatisticsInvalidation(env,createProgressDef(request,env,user));
   m=path.match(/^\/api\/admin\/progress\/([^/]+)$/);
-  if(m && method==="PATCH") return updateProgressDef(request,env,user,m[1]);
+  if(m && method==="PATCH") return withDashboardStatisticsInvalidation(env,updateProgressDef(request,env,user,m[1]));
   if(m && method==="DELETE"){
     await env.DB.prepare("UPDATE progress_definitions SET enabled=0,updated_at=? WHERE id=?").bind(now(),m[1]).run();
     await recalcAllProgress(env);
     await audit(env,user,"disable","progress_definition",m[1],{});
+    await invalidateDashboardStatistics(env);
     return responseJson({ok:true,recalculationQueued:true});
   }
   m=path.match(/^\/api\/admin\/progress\/([^/]+)\/hard-delete$/);
-  if(m && method==="DELETE") return hardDeleteProgressDef(env,user,m[1]);
+  if(m && method==="DELETE") return withDashboardStatisticsInvalidation(env,hardDeleteProgressDef(env,user,m[1]));
 
   if (path === "/api/admin/sidebar" && method === "GET") return adminSidebar(env);
   if (path === "/api/admin/sidebar" && method === "POST") return createSidebarItem(request,env,user);
@@ -4104,15 +4167,15 @@ async function api(request, env, ctx) {
   if (path === "/api/admin/registration-layout" && method === "PUT") return saveRegistrationLayout(request,env,user);
   if (path === "/api/admin/recycle" && method === "GET") return recycleList(request,env);
   m=path.match(/^\/api\/admin\/recycle\/([^/]+)\/restore$/);
-  if(m && method==="POST") return restoreCustomer(env,user,m[1]);
+  if(m && method==="POST") return withDashboardStatisticsInvalidation(env,restoreCustomer(env,user,m[1]));
   if (path === "/api/admin/audit" && method === "GET") return auditList(request,env);
   if (path === "/api/admin/export" && method === "GET") return exportBusinessData(env,user);
   if (path === "/api/admin/export-manifest" && method === "GET") return exportBackupManifest(env,user);
   if (path === "/api/admin/export-section" && method === "GET") return exportBackupSection(request,env);
   if (path === "/api/admin/import-preview-chunk" && method === "POST") return importPreviewChunk(request,env);
-  if (path === "/api/admin/import" && method === "POST") return importBusinessData(request,env,user);
-  if (path === "/api/admin/import-chunk" && method === "POST") return importChunk(request,env,user);
-  if (path === "/api/admin/import-finish" && method === "POST") return finishImport(env,user);
+  if (path === "/api/admin/import" && method === "POST") return withDashboardStatisticsInvalidation(env,importBusinessData(request,env,user));
+  if (path === "/api/admin/import-chunk" && method === "POST") return withDashboardStatisticsInvalidation(env,importChunk(request,env,user));
+  if (path === "/api/admin/import-finish" && method === "POST") return withDashboardStatisticsInvalidation(env,finishImport(env,user));
   if (path === "/api/admin/list-columns" && method === "GET") return adminListColumns(request,env);
   if (path === "/api/admin/list-columns" && method === "PUT") return saveListColumns(request,env,user);
   if (path === "/api/admin/dashboard-widgets" && method === "GET") return adminDashboardWidgets(request,env);
