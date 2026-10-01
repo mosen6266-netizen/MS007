@@ -660,7 +660,6 @@ async function telegramUnresolvedItems(env,limit=200){
            SELECT 1 FROM telegram_send_queue q2
            WHERE q2.customer_id IS l.customer_id
              AND q2.progress_id IS l.progress_id
-             AND q2.created_at>=l.created_at
          )
          AND NOT EXISTS (
            SELECT 1 FROM telegram_delivery_logs s
@@ -1331,9 +1330,9 @@ async function retryTelegramDeliveryLog(request,env,user,id,ctx){
 
   const existingQueue=await env.DB.prepare(
     `SELECT id FROM telegram_send_queue
-     WHERE customer_id IS ? AND progress_id IS ? AND created_at>=?
+     WHERE customer_id IS ? AND progress_id IS ?
      ORDER BY created_at DESC LIMIT 1`
-  ).bind(log.customer_id,log.progress_id,log.created_at).first();
+  ).bind(log.customer_id,log.progress_id).first();
   if(existingQueue)return retryTelegramQueueItem(env,user,existingQueue.id,ctx);
 
   if(!log.customer_id||!log.progress_id)return fail("这条历史记录缺少客户或进度信息，无法重新生成通知",409);
