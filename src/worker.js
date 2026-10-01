@@ -191,6 +191,54 @@ function defaultTelegramFields(){
   ];
 }
 
+function defaultTelegramTemplate(){
+  return "✅ 客户进度已更新\n\n业务员：{{业务员}}\n\n客户姓名：{{客户姓名}}\n\n已完成进度：{{已完成进度}}\n\n下一步进度：{{下一步进度}}\n\n当前完成度：{{当前完成度}}\n\n{{查看客户详情}}";
+}
+
+function telegramBuiltInTemplateVariables(){
+  return [
+    {token:"{{业务员}}",key:"sales_name",label:"业务员"},
+    {token:"{{客户姓名}}",key:"customer_name",label:"客户姓名"},
+    {token:"{{客户所属业务员}}",key:"assigned_sales",label:"客户所属业务员"},
+    {token:"{{已完成进度}}",key:"completed_progress",label:"已完成进度"},
+    {token:"{{当前进度}}",key:"current_progress",label:"当前进度"},
+    {token:"{{下一步进度}}",key:"next_progress",label:"下一步进度"},
+    {token:"{{当前完成度}}",key:"progress_percent",label:"当前完成度"},
+    {token:"{{已完成步骤}}",key:"progress_fraction",label:"已完成步骤"},
+    {token:"{{查看客户详情}}",key:"detail_link",label:"查看客户详情链接"}
+  ];
+}
+
+async function telegramTemplateVariables(env){
+  const fields=await env.DB.prepare(
+    "SELECT id,label FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  return [
+    ...telegramBuiltInTemplateVariables(),
+    ...(fields.results||[]).map(x=>({
+      token:"{{"+String(x.label||"登记字段")+"}}",
+      key:"field:"+x.id,
+      fieldId:x.id,
+      label:String(x.label||"登记字段")
+    }))
+  ];
+}
+
+function replaceAllLiteral(source,needle,replacement){
+  return String(source).split(String(needle)).join(String(replacement));
+}
+
+function renderTelegramTemplate(template,variables,detailUrl,linkLabel){
+  let out=telegramHtmlEscape(String(template||defaultTelegramTemplate()));
+  for(const item of variables||[]){
+    if(!item?.token||item.key==="detail_link")continue;
+    out=replaceAllLiteral(out,item.token,telegramHtmlEscape(String(item.value??"")));
+  }
+  const link='<a href="'+telegramHtmlEscape(detailUrl)+'">'+telegramHtmlEscape(linkLabel||"查看客户详情")+"</a>";
+  out=replaceAllLiteral(out,"{{查看客户详情}}",link);
+  return out;
+}
+
 async function telegramSettingsRow(env){
   let row=await env.DB.prepare("SELECT * FROM telegram_settings WHERE id=1").first();
   if(!row){
@@ -252,7 +300,7 @@ async function telegramAdminGet(env){
     const parsed=JSON.parse(row.fields_json||"[]");
     if(Array.isArray(parsed))fields=parsed;
   }catch{}
-  const [availableFields,logs,progressDefs,routes]=await Promise.all([
+  const [availableFields,logs,progressDefs,routes,templateVariables]=await Promise.all([
     telegramAvailableFields(env),
     env.DB.prepare(
       `SELECT l.id,l.status,l.error_text,l.created_at,c.name customer_name,u.display_name actor_name,p.label progress_name
@@ -267,8 +315,10 @@ async function telegramAdminGet(env){
     ).all(),
     env.DB.prepare(
       "SELECT progress_id,route_mode,chat_id FROM telegram_progress_routes"
-    ).all()
+    ).all(),
+    telegramTemplateVariables(env)
   ]);
+  const messageTemplate=await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
   return responseJson({
     ok:true,
     settings:{
@@ -278,9 +328,11 @@ async function telegramAdminGet(env){
       tokenHint:row.bot_token_hint||"",
       fields,
       notifyAdmin:!!row.notify_admin,
-      linkLabel:row.link_label||"查看客户详情"
+      linkLabel:row.link_label||"查看客户详情",
+      messageTemplate:String(messageTemplate||defaultTelegramTemplate())
     },
     availableFields,
+    templateVariables,
     progressDefs:progressDefs.results||[],
     routes:routes.results||[],
     logs:logs.results||[]
@@ -305,6 +357,9 @@ async function telegramAdminSave(request,env,user){
   const enabled=b.enabled!==undefined?!!b.enabled:!!old.enabled;
   const notifyAdmin=b.notifyAdmin!==undefined?!!b.notifyAdmin:!!old.notify_admin;
   const linkLabel=String(b.linkLabel||old.link_label||"查看客户详情").trim().slice(0,80)||"查看客户详情";
+  let messageTemplate=b.messageTemplate!==undefined?String(b.messageTemplate):await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
+  messageTemplate=messageTemplate.replace(/\r\n/g,"\n").slice(0,6000);
+  if(!messageTemplate.trim())messageTemplate=defaultTelegramTemplate();
 
   const available=await telegramAvailableFields(env);
   const allowed=new Set(available.map(x=>x.key));
@@ -344,7 +399,11 @@ async function telegramAdminSave(request,env,user){
        SET enabled=?,chat_id=?,bot_token_enc=?,bot_token_hint=?,fields_json=?,notify_admin=?,link_label=?,updated_at=?
        WHERE id=1`
     ).bind(enabled?1:0,chatId,encToken,hint,JSON.stringify(fields),notifyAdmin?1:0,linkLabel,t),
-    env.DB.prepare("DELETE FROM telegram_progress_routes")
+    env.DB.prepare("DELETE FROM telegram_progress_routes"),
+    env.DB.prepare(
+      `INSERT INTO system_settings(setting_key,value_json,updated_at) VALUES('telegram_message_template',?,?)
+       ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
+    ).bind(JSON.stringify(messageTemplate),t)
   ];
   for(const route of routes){
     stmts.push(
@@ -356,7 +415,7 @@ async function telegramAdminSave(request,env,user){
   await env.DB.batch(stmts);
 
   await audit(env,user,"update","telegram_settings","1",{
-    enabled,chatId,hasToken:!!encToken,fieldCount:fields.length,notifyAdmin,routeCount:routes.length
+    enabled,chatId,hasToken:!!encToken,fieldCount:fields.length,notifyAdmin,routeCount:routes.length,templateLength:messageTemplate.length
   });
   return responseJson({ok:true,tokenHint:hint,hasToken:!!encToken,routeCount:routes.length});
 }
@@ -367,8 +426,31 @@ async function telegramAdminTest(request,env,user){
   if(!row.chat_id)return fail("请先填写 Telegram 群 ID");
   let token="";
   try{token=await telegramDecryptSecret(env,row.bot_token_enc)}catch(e){return fail("Telegram Token 无法解密，请重新填写 Token")}
+
   const origin=new URL(request.url).origin;
-  const text="✅ <b>MS007 Telegram 通知测试成功</b>\n\n机器人已经可以向这个群发送消息。\n\n<a href=\""+telegramHtmlEscape(origin)+"\">打开 MS007</a>";
+  const template=await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
+  const templateVariables=await telegramTemplateVariables(env);
+  const sampleValues={
+    sales_name:"测试业务员",
+    customer_name:"测试客户",
+    assigned_sales:"测试业务员",
+    completed_progress:"客户建档",
+    current_progress:"客户建档",
+    next_progress:"已联系",
+    progress_percent:"20%",
+    progress_fraction:"1/5"
+  };
+  const renderedVariables=templateVariables.map(v=>({
+    ...v,
+    value:v.key.startsWith("field:")?"示例内容":sampleValues[v.key]||""
+  }));
+  const text=renderTelegramTemplate(
+    template,
+    renderedVariables,
+    origin+"/#/customer/test",
+    row.link_label||"查看客户详情"
+  );
+
   try{
     await telegramApiCall(token,"sendMessage",{
       chat_id:row.chat_id,
@@ -376,8 +458,8 @@ async function telegramAdminTest(request,env,user){
       parse_mode:"HTML",
       disable_web_page_preview:true
     });
-    await audit(env,user,"test","telegram_settings","1",{chatId:row.chat_id});
-    return responseJson({ok:true,message:"测试消息已发送"});
+    await audit(env,user,"test","telegram_settings","1",{chatId:row.chat_id,template:true});
+    return responseJson({ok:true,message:"模板测试消息已发送"});
   }catch(e){
     return fail("发送失败："+String(e?.message||e));
   }
@@ -451,13 +533,10 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
   if(!customer)return;
 
   const status=await telegramProgressStatus(env,customerId);
-  let fields=defaultTelegramFields();
-  try{
-    const parsed=JSON.parse(row.fields_json||"[]");
-    if(Array.isArray(parsed))fields=parsed;
-  }catch{}
+  const template=await getSystemSetting(env,"telegram_message_template",defaultTelegramTemplate());
+  const templateVariables=await telegramTemplateVariables(env);
 
-  const customIds=[...new Set(fields.filter(x=>String(x.key||"").startsWith("field:")).map(x=>String(x.key).slice(6)).filter(Boolean))];
+  const customIds=[...new Set(templateVariables.filter(x=>String(x.key||"").startsWith("field:")).map(x=>String(x.key).slice(6)).filter(Boolean))];
   const customValues={};
   if(customIds.length){
     const marks=customIds.map(()=>"?").join(",");
@@ -467,8 +546,6 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
     for(const v of vals.results||[])customValues[v.field_id]=v.value||"";
   }
 
-  const available=await telegramAvailableFields(env);
-  const defaultLabels=new Map(available.map(x=>[x.key,x.label]));
   const values={
     sales_name:user.display_name||user.username||"",
     customer_name:customer.name||"",
@@ -480,27 +557,27 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
     progress_fraction:String(summary.done||0)+"/"+String(summary.total||0)
   };
 
-  const lines=["✅ <b>客户进度已更新</b>",""];
-  for(const item of fields){
-    const key=String(item.key||"");
-    const label=String(item.label||defaultLabels.get(key)||key);
-    let value="";
-    if(key.startsWith("field:"))value=customValues[key.slice(6)]||"";
-    else value=values[key]??"";
-    if(value==="")continue;
-    lines.push("<b>"+telegramHtmlEscape(label)+"：</b>"+telegramHtmlEscape(value));
-  }
+  const renderedVariables=templateVariables.map(v=>({
+    ...v,
+    value:String(v.key||"").startsWith("field:")
+      ?(customValues[String(v.key).slice(6)]||"")
+      :(values[v.key]??"")
+  }));
 
   const origin=new URL(request.url).origin;
   const detailUrl=origin+"/#/customer/"+encodeURIComponent(customerId);
-  lines.push("");
-  lines.push('<a href="'+telegramHtmlEscape(detailUrl)+'">'+telegramHtmlEscape(row.link_label||"查看客户详情")+"</a>");
+  const messageText=renderTelegramTemplate(
+    template,
+    renderedVariables,
+    detailUrl,
+    row.link_label||"查看客户详情"
+  );
 
   for(const targetChatId of targetChatIds){
     try{
       await telegramApiCall(token,"sendMessage",{
         chat_id:targetChatId,
-        text:lines.join("\n"),
+        text:messageText,
         parse_mode:"HTML",
         disable_web_page_preview:true
       });
