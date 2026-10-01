@@ -758,6 +758,136 @@ async function softDeleteCustomer(env,user,id){
   return responseJson({ok:true});
 }
 
+
+async function recycleList(env) {
+  const r=await env.DB.prepare(
+    `SELECT c.id,c.name,c.deleted_at,c.updated_at,u.display_name owner_name
+     FROM customers c LEFT JOIN users u ON u.id=c.assigned_user_id
+     WHERE c.deleted_at IS NOT NULL
+     ORDER BY c.deleted_at DESC LIMIT 200`
+  ).all();
+  return responseJson({ok:true,items:r.results||[]});
+}
+
+async function restoreCustomer(env,user,id){
+  const row=await env.DB.prepare("SELECT id FROM customers WHERE id=? AND deleted_at IS NOT NULL").bind(id).first();
+  if(!row)return fail("回收站中找不到这个客户",404);
+  await env.DB.prepare("UPDATE customers SET deleted_at=NULL,updated_at=? WHERE id=?").bind(now(),id).run();
+  await audit(env,user,"restore","customer",id,{});
+  return responseJson({ok:true});
+}
+
+async function auditList(request,env){
+  const url=new URL(request.url);
+  const limit=safeInt(url.searchParams.get("limit"),100,1,200);
+  const r=await env.DB.prepare(
+    `SELECT a.id,a.action,a.entity_type,a.entity_id,a.detail_json,a.created_at,u.display_name actor_name
+     FROM audit_logs a LEFT JOIN users u ON u.id=a.actor_user_id
+     ORDER BY a.created_at DESC LIMIT ?`
+  ).bind(limit).all();
+  return responseJson({ok:true,items:(r.results||[]).map(x=>({
+    ...x,
+    detail:(()=>{try{return JSON.parse(x.detail_json||"{}")}catch{return{}}})()
+  }))});
+}
+
+async function exportBusinessData(env,user){
+  const [users,customers,fields,values,progressDefs,customerProgress,sidebars,listCols,dash,settings] = await Promise.all([
+    env.DB.prepare("SELECT id,username,display_name,role,active,created_at,updated_at FROM users ORDER BY created_at").all(),
+    env.DB.prepare("SELECT * FROM customers ORDER BY created_at").all(),
+    env.DB.prepare("SELECT * FROM field_definitions ORDER BY sort_order").all(),
+    env.DB.prepare("SELECT * FROM customer_values").all(),
+    env.DB.prepare("SELECT * FROM progress_definitions ORDER BY sort_order").all(),
+    env.DB.prepare("SELECT * FROM customer_progress").all(),
+    env.DB.prepare("SELECT * FROM sidebar_items ORDER BY audience,sort_order").all(),
+    env.DB.prepare("SELECT * FROM list_columns ORDER BY audience,sort_order").all(),
+    env.DB.prepare("SELECT * FROM dashboard_widgets ORDER BY audience,sort_order").all(),
+    env.DB.prepare("SELECT setting_key,value_json,updated_at FROM system_settings ORDER BY setting_key").all()
+  ]);
+  await audit(env,user,"export","business_data",null,{});
+  return responseJson({
+    ok:true,
+    format:"MS007-BUSINESS-BACKUP",
+    version:1,
+    exportedAt:now(),
+    data:{
+      users:users.results||[],
+      customers:customers.results||[],
+      fieldDefinitions:fields.results||[],
+      customerValues:values.results||[],
+      progressDefinitions:progressDefs.results||[],
+      customerProgress:customerProgress.results||[],
+      sidebarItems:sidebars.results||[],
+      listColumns:listCols.results||[],
+      dashboardWidgets:dash.results||[],
+      systemSettings:settings.results||[]
+    }
+  });
+}
+
+async function importBusinessData(request,env,user){
+  const body=await readBody(request);
+  if(body?.format!=="MS007-BUSINESS-BACKUP" || !body?.data) return fail("备份文件格式不正确");
+  const d=body.data;
+  const tx=[];
+  const t=now();
+  // Do not import admin passwords/sessions. Existing users remain; sales users are upserted with disabled login until password reset.
+  for(const u of d.users||[]){
+    if(u.role!=="sales") continue;
+    const exists=await env.DB.prepare("SELECT id FROM users WHERE id=? OR username=?").bind(u.id,u.username).first();
+    if(!exists){
+      const salt=newSalt(), hash=await derivePassword(uid("disabled_"),salt,150000);
+      tx.push(env.DB.prepare(
+        `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
+         VALUES(?,?,?,?,?,150000,'sales',0,?,?)`
+      ).bind(u.id,u.username,u.display_name,hash,salt,u.created_at||t,t));
+    }
+  }
+  for(const f of d.fieldDefinitions||[]) tx.push(env.DB.prepare(
+    `INSERT OR REPLACE INTO field_definitions(id,field_key,label,field_type,required,enabled,list_visible,list_sort_order,sort_order,options_json,searchable,created_at,updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(f.id,f.field_key,f.label,f.field_type,f.required,f.enabled,f.list_visible,f.list_sort_order,f.sort_order,f.options_json,f.searchable,f.created_at||t,f.updated_at||t));
+  for(const p of d.progressDefinitions||[]) tx.push(env.DB.prepare(
+    `INSERT OR REPLACE INTO progress_definitions(id,label,description,enabled,sort_order,color,created_at,updated_at)
+     VALUES(?,?,?,?,?,?,?,?)`
+  ).bind(p.id,p.label,p.description,p.enabled,p.sort_order,p.color,p.created_at||t,p.updated_at||t));
+  for(const x of d.customers||[]) tx.push(env.DB.prepare(
+    `INSERT OR REPLACE INTO customers(id,assigned_user_id,name,progress_done,progress_total,progress_percent,archived,deleted_at,created_by_id,created_at,updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(x.id,x.assigned_user_id,x.name,x.progress_done,x.progress_total,x.progress_percent,x.archived,x.deleted_at,x.created_by_id,x.created_at,x.updated_at));
+  if(tx.length) await env.DB.batch(tx);
+
+  const batch2=[];
+  for(const x of d.customerValues||[]) batch2.push(env.DB.prepare(
+    "INSERT OR REPLACE INTO customer_values(customer_id,field_id,value,updated_at) VALUES(?,?,?,?)"
+  ).bind(x.customer_id,x.field_id,x.value,x.updated_at||t));
+  for(const x of d.customerProgress||[]) batch2.push(env.DB.prepare(
+    "INSERT OR REPLACE INTO customer_progress(customer_id,progress_id,completed,completed_by,completed_at) VALUES(?,?,?,?,?)"
+  ).bind(x.customer_id,x.progress_id,x.completed,x.completed_by,x.completed_at));
+  if(batch2.length) await env.DB.batch(batch2);
+
+  const batch3=[];
+  for(const x of d.sidebarItems||[]) batch3.push(env.DB.prepare(
+    `INSERT OR REPLACE INTO sidebar_items(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+  ).bind(x.id,x.audience,x.label,x.icon,x.url,x.target,x.enabled,x.sort_order,x.group_label,x.created_at||t,x.updated_at||t));
+  for(const x of d.listColumns||[]) batch3.push(env.DB.prepare(
+    "INSERT OR REPLACE INTO list_columns(id,audience,column_key,field_id,label,enabled,sort_order) VALUES(?,?,?,?,?,?,?)"
+  ).bind(x.id,x.audience,x.column_key,x.field_id,x.label,x.enabled,x.sort_order));
+  for(const x of d.dashboardWidgets||[]) batch3.push(env.DB.prepare(
+    "INSERT OR REPLACE INTO dashboard_widgets(id,audience,widget_type,title,enabled,sort_order,config_json) VALUES(?,?,?,?,?,?,?)"
+  ).bind(x.id,x.audience,x.widget_type,x.title,x.enabled,x.sort_order,x.config_json||"{}"));
+  for(const x of d.systemSettings||[]) batch3.push(env.DB.prepare(
+    `INSERT INTO system_settings(setting_key,value_json,updated_at) VALUES(?,?,?)
+     ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
+  ).bind(x.setting_key,x.value_json,x.updated_at||t));
+  if(batch3.length) await env.DB.batch(batch3);
+  await recalcAllProgress(env);
+  await bumpVersion(env,"sidebar_version");
+  await audit(env,user,"import","business_data",null,{sourceExportedAt:body.exportedAt||null});
+  return responseJson({ok:true,message:"业务数据已导入。备份中的业务员账号为安全起见会保持停用，需要管理员重新设置密码并启用。"});
+}
+
 async function api(request, env) {
   const url = new URL(request.url);
   const path = url.pathname;
@@ -828,6 +958,12 @@ async function api(request, env) {
   }
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
+  if (path === "/api/admin/recycle" && method === "GET") return recycleList(env);
+  m=path.match(/^\/api\/admin\/recycle\/([^/]+)\/restore$/);
+  if(m && method==="POST") return restoreCustomer(env,user,m[1]);
+  if (path === "/api/admin/audit" && method === "GET") return auditList(request,env);
+  if (path === "/api/admin/export" && method === "GET") return exportBusinessData(env,user);
+  if (path === "/api/admin/import" && method === "POST") return importBusinessData(request,env,user);
   if (path === "/api/admin/list-columns" && method === "GET") return adminListColumns(request,env);
   if (path === "/api/admin/list-columns" && method === "PUT") return saveListColumns(request,env,user);
   if (path === "/api/admin/dashboard-widgets" && method === "GET") return adminDashboardWidgets(request,env);
