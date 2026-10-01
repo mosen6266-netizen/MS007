@@ -957,6 +957,69 @@ async function updateField(request, env, user, id) {
   return responseJson({ok:true});
 }
 
+
+async function hardDeleteField(env,user,id){
+  const field=await env.DB.prepare("SELECT * FROM field_definitions WHERE id=?").bind(id).first();
+  if(!field)return fail("登记条目不存在",404);
+
+  const valueCountRow=await env.DB.prepare("SELECT COUNT(*) n FROM customer_values WHERE field_id=?").bind(id).first();
+  const valueCount=Number(valueCountRow?.n||0);
+  const t=now();
+
+  // Remove references first because these tables intentionally do not use ON DELETE CASCADE.
+  await env.DB.batch([
+    env.DB.prepare("DELETE FROM customer_values WHERE field_id=?").bind(id),
+    env.DB.prepare("DELETE FROM list_columns WHERE field_id=?").bind(id)
+  ]);
+
+  // Remove the field from the registration panel layout.
+  const layoutRow=await env.DB.prepare("SELECT value_json FROM system_settings WHERE setting_key='sales_registration_layout'").first();
+  if(layoutRow?.value_json){
+    try{
+      const layout=JSON.parse(layoutRow.value_json);
+      if(Array.isArray(layout?.sections)){
+        for(const section of layout.sections){
+          if(Array.isArray(section.items))section.items=section.items.filter(x=>String(x)!==id);
+        }
+        await env.DB.prepare(
+          "UPDATE system_settings SET value_json=?,updated_at=? WHERE setting_key='sales_registration_layout'"
+        ).bind(JSON.stringify(layout),t).run();
+      }
+    }catch{}
+  }
+
+  // Remove the field from Telegram notification templates.
+  const tg=await env.DB.prepare("SELECT fields_json FROM telegram_settings WHERE id=1").first();
+  if(tg?.fields_json){
+    try{
+      const items=JSON.parse(tg.fields_json);
+      if(Array.isArray(items)){
+        const filtered=items.filter(x=>String(x?.key||"")!=="field:"+id);
+        await env.DB.prepare("UPDATE telegram_settings SET fields_json=?,updated_at=? WHERE id=1")
+          .bind(JSON.stringify(filtered),t).run();
+      }
+    }catch{}
+  }
+
+  await env.DB.prepare("DELETE FROM field_definitions WHERE id=?").bind(id).run();
+  await audit(env,user,"delete_permanent","field",id,{label:field.label,deletedCustomerValues:valueCount});
+  return responseJson({ok:true,deletedCustomerValues:valueCount,label:field.label});
+}
+
+async function hardDeleteProgressDef(env,user,id){
+  const progress=await env.DB.prepare("SELECT * FROM progress_definitions WHERE id=?").bind(id).first();
+  if(!progress)return fail("客户进度不存在",404);
+
+  const valueCountRow=await env.DB.prepare("SELECT COUNT(*) n FROM customer_progress WHERE progress_id=?").bind(id).first();
+  const valueCount=Number(valueCountRow?.n||0);
+
+  await env.DB.prepare("DELETE FROM customer_progress WHERE progress_id=?").bind(id).run();
+  await env.DB.prepare("DELETE FROM progress_definitions WHERE id=?").bind(id).run();
+  await recalcAllProgress(env);
+  await audit(env,user,"delete_permanent","progress_definition",id,{label:progress.label,deletedCustomerProgress:valueCount});
+  return responseJson({ok:true,deletedCustomerProgress:valueCount,label:progress.label});
+}
+
 async function listProgressDefs(env, user) {
   const sql = normalizedRole(user.role)==="admin"
     ? "SELECT * FROM progress_definitions ORDER BY sort_order,label"
@@ -1648,6 +1711,8 @@ async function api(request, env, ctx) {
     await audit(env,user,"disable","field",m[1],{});
     return responseJson({ok:true});
   }
+  m=path.match(/^\/api\/admin\/fields\/([^/]+)\/hard-delete$/);
+  if(m && method==="DELETE") return hardDeleteField(env,user,m[1]);
 
   if (path === "/api/admin/progress" && method === "POST") return createProgressDef(request,env,user);
   m=path.match(/^\/api\/admin\/progress\/([^/]+)$/);
@@ -1657,6 +1722,8 @@ async function api(request, env, ctx) {
     await audit(env,user,"disable","progress_definition",m[1],{});
     return responseJson({ok:true});
   }
+  m=path.match(/^\/api\/admin\/progress\/([^/]+)\/hard-delete$/);
+  if(m && method==="DELETE") return hardDeleteProgressDef(env,user,m[1]);
 
   if (path === "/api/admin/sidebar" && method === "GET") return adminSidebar(env);
   if (path === "/api/admin/sidebar" && method === "POST") return createSidebarItem(request,env,user);
