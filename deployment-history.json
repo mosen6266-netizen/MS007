@@ -1,0 +1,11 @@
+{
+  "version": "batch6-governance",
+  "purpose": "Deployment history and rollback tracking",
+  "records": [],
+  "rules": {
+    "record_before_deploy": true,
+    "keep_previous_checkpoint": true,
+    "customer_data_changes": false,
+    "automatic_data_migration": false
+  }
+}
