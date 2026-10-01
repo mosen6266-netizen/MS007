@@ -84,6 +84,9 @@ jobs:
       - name: Batch 4 performance regression
         run: python tests/batch4_performance.py
 
+      - name: Batch 5 draft and Telegram reliability regression
+        run: python tests/batch5_reliability.py
+
   staging:
     needs: validate
     runs-on: ubuntu-latest
