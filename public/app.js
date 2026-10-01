@@ -209,6 +209,8 @@ async function renderRoute(){
     if(role==="admin"&&page==="fields")return renderFields(view);
     if(role==="admin"&&page==="progress")return renderProgressAdmin(view);
     if(role==="admin"&&page==="sidebar")return renderSidebarAdmin(view);
+    if(role==="admin"&&page==="list-settings")return renderListSettings(view);
+    if(role==="admin"&&page==="dashboard-settings")return renderDashboardSettings(view);
     if(role==="admin"&&page==="capacity")return renderCapacity(view);
     view.innerHTML=pageHead("页面不存在");
   }catch(err){
@@ -218,30 +220,34 @@ async function renderRoute(){
 }
 
 async function renderDashboard(view){
-  const r=await api("/api/stats");
-  const s=r.summary;
+  const [r,wr]=await Promise.all([api("/api/stats"),api("/api/dashboard-widgets")]);
+  const s=r.summary, widgets=wr.items||[];
   let capacityHtml="";
   if(state.user.role==="admin"){
-    const c=await api("/api/admin/capacity");
-    if(c.level!=="normal"){
-      capacityHtml=`<div class="notice ${c.level==="warning"?"warning":"urgent"}" style="margin-bottom:16px"><strong>系统容量提醒：</strong> ${esc(c.message)} <a href="#/admin/capacity">查看详情</a></div>`;
+    const cap=await api("/api/admin/capacity");
+    if(cap.level!=="normal"){
+      capacityHtml=`<div class="notice ${cap.level==="warning"?"warning":"urgent"}" style="margin-bottom:16px"><strong>系统容量提醒：</strong> ${esc(cap.message)} <a href="#/admin/capacity">查看详情</a></div>`;
     }
   }
-  view.innerHTML=
-    pageHead("仪表盘",state.user.role==="admin"?"查看整个团队的客户情况":"查看你的客户情况")+
-    capacityHtml+
-    `<div class="grid metrics">
-      <div class="card metric"><div class="label">${state.user.role==="admin"?"客户总数":"我的客户"}</div><div class="value">${money(s.total)}</div></div>
-      <div class="card metric"><div class="label">今日新增</div><div class="value">${money(s.today)}</div></div>
-      <div class="card metric"><div class="label">已完成</div><div class="value">${money(s.completed)}</div></div>
-      <div class="card metric"><div class="label">已归档</div><div class="value">${money(s.archived)}</div></div>
-    </div>
-    ${state.user.role==="admin"?`
-      <div class="card" style="margin-top:18px">
-        <h3 style="margin-top:0">业务员客户分布</h3>
-        <div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead>
-        <tbody>${(r.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">还没有业务员</td></tr>`}</tbody></table></div>
-      </div>`:""}`;
+  const metricValue={
+    metric_total:s.total,
+    metric_today:s.today,
+    metric_complete:s.completed,
+    metric_archived:s.archived
+  };
+  const metricWidgets=widgets.filter(x=>x.widget_type.startsWith("metric_"));
+  const largeWidgets=widgets.filter(x=>!x.widget_type.startsWith("metric_"));
+  let html=pageHead("仪表盘",state.user.role==="admin"?"查看整个团队的客户情况":"查看你的客户情况") + capacityHtml;
+  if(metricWidgets.length){
+    html+=`<div class="grid metrics">${metricWidgets.map(w=>`<div class="card metric"><div class="label">${esc(w.title)}</div><div class="value">${money(metricValue[w.widget_type]??0)}</div></div>`).join("")}</div>`;
+  }
+  for(const w of largeWidgets){
+    if(w.widget_type==="sales_breakdown" && state.user.role==="admin"){
+      html+=`<div class="card" style="margin-top:18px"><h3 style="margin-top:0">${esc(w.title)}</h3><div class="table-wrap"><table><thead><tr><th>业务员</th><th>客户数量</th><th>平均进度</th></tr></thead><tbody>${(r.sales||[]).map(x=>`<tr><td>${esc(x.display_name)}</td><td>${money(x.customer_count)}</td><td>${money(x.avg_progress)}%</td></tr>`).join("")||`<tr><td colspan="3" class="muted">还没有业务员</td></tr>`}</tbody></table></div></div>`;
+    }
+  }
+  if(!widgets.length) html+=`<div class="empty card">当前仪表盘没有启用任何组件。</div>`;
+  view.innerHTML=html;
 }
 
 async function getSales(){
@@ -250,8 +256,13 @@ async function getSales(){
   state.sales=(r.items||[]).filter(x=>x.role==="sales"&&x.active);
   return state.sales;
 }
+let currentListColumns=[];
 async function renderCustomers(view){
-  const sales=state.user.role==="admin"?await getSales():[];
+  const [sales,lc]=await Promise.all([
+    state.user.role==="admin"?getSales():Promise.resolve([]),
+    api("/api/list-columns")
+  ]);
+  currentListColumns=lc.items||[];
   view.innerHTML=
     pageHead(state.user.role==="admin"?"全部客户":"我的客户","每次只读取当前需要的数据，避免客户数量增加后卡顿",
       `<button class="btn" id="newCustomer">＋ 登记客户</button>`)+
@@ -287,8 +298,17 @@ function renderCustomerCards(host,items,fields,hasMore){
   if(!items.length){host.innerHTML=`<div class="empty card">还没有客户资料</div>`;return;}
   host.innerHTML=`<div class="customer-grid">${items.map(c=>{
     const meta=[];
-    if(state.user.role==="admin"&&c.ownerName)meta.push(`<div>业务员：${esc(c.ownerName)}</div>`);
-    for(const f of fields){const v=c.values?.[f.id];if(v)meta.push(`<div>${esc(f.label)}：${esc(v)}</div>`);}
+    for(const col of currentListColumns){
+      if(col.column_key==="name") continue;
+      if(col.column_key==="owner"){
+        if(state.user.role==="admin"&&c.ownerName)meta.push(`<div>${esc(col.label||"业务员")}：${esc(c.ownerName)}</div>`);
+        continue;
+      }
+      if(col.column_key==="dynamic"&&col.field_id){
+        const v=c.values?.[col.field_id];
+        if(v)meta.push(`<div>${esc(col.label)}：${esc(v)}</div>`);
+      }
+    }
     return `<article class="customer-card" data-cid="${esc(c.id)}" style="--pct:${Number(c.progressPercent||0)}%;--progress-color:${progressTone(Number(c.progressPercent||0))}">
       <h3>${esc(c.name)}</h3><div class="customer-meta">${meta.join("")||'<span class="muted">暂无其他列表字段</span>'}</div>
       <div class="customer-progress"><span>${c.progressDone}/${c.progressTotal} 个步骤</span><span class="pct">${c.progressPercent}%</span></div>
@@ -476,6 +496,116 @@ function enableSidebarDrag(view,items){
       }catch(err){toast(err.message)}
     });
   });
+}
+
+
+async function renderListSettings(view,audience="admin"){
+  const r=await api("/api/admin/list-columns?audience="+audience);
+  const fields=r.fields||[];
+  let items=(r.items||[]).map(x=>({...x}));
+  if(!items.some(x=>x.column_key==="name"))items.unshift({id:"fixed_name",column_key:"name",field_id:null,label:"客户姓名",enabled:1,sort_order:0});
+  const titleAudience=audience==="admin"?"管理员":"业务员";
+  view.innerHTML=pageHead("客户列表显示设置","管理员统一决定客户卡片显示哪些资料以及显示顺序")+
+    `<div class="row" style="margin-bottom:14px">
+      <button class="btn ${audience==="admin"?"":"ghost"} small" id="listAdmin">管理员列表</button>
+      <button class="btn ${audience==="sales"?"":"ghost"} small" id="listSales">业务员列表</button>
+    </div>
+    <div class="card">
+      <h3 style="margin-top:0">${titleAudience}客户卡片内容</h3>
+      <p class="muted">客户姓名固定显示。其他内容可以添加、删除、改显示名称和拖动排序。</p>
+      <div class="settings-list" id="listColumnRows"></div>
+      <div class="row wrap" style="margin-top:14px">
+        <select class="input grow" id="addColumnSelect"></select>
+        <button class="btn secondary" id="addColumnBtn">＋ 添加显示内容</button>
+        <button class="btn" id="saveColumns">保存并同步</button>
+      </div>
+    </div>`;
+  document.querySelector("#listAdmin").onclick=()=>renderListSettings(view,"admin");
+  document.querySelector("#listSales").onclick=()=>renderListSettings(view,"sales");
+
+  const rows=document.querySelector("#listColumnRows");
+  function redraw(){
+    rows.innerHTML=items.map((x,i)=>`<div class="setting-row" draggable="${x.column_key!=="name"}" data-ci="${i}">
+      <div class="drag">${x.column_key==="name"?"🔒":"⋮⋮"}</div>
+      <div><input class="input list-label" value="${esc(x.label)}" ${x.column_key==="name"?"disabled":""}><div class="muted" style="font-size:12px">${x.column_key==="dynamic"?"自定义字段":x.column_key==="owner"?"业务员":"固定字段"}</div></div>
+      <div><span class="tag">${x.column_key==="dynamic"?"字段":x.column_key}</span></div>
+      <div>${i+1}</div>
+      <div>${x.column_key==="name"?"":`<button class="btn danger small remove-col">移除</button>`}</div>
+    </div>`).join("");
+    rows.querySelectorAll(".remove-col").forEach(btn=>btn.onclick=()=>{
+      const idx=Number(btn.closest("[data-ci]").dataset.ci);items.splice(idx,1);redraw();fillAdd();
+    });
+    enableListDrag();
+  }
+  function fillAdd(){
+    const selected=new Set(items.filter(x=>x.column_key==="dynamic").map(x=>x.field_id));
+    let opts=[];
+    if(audience==="admin"&&!items.some(x=>x.column_key==="owner"))opts.push(`<option value="owner:">业务员</option>`);
+    for(const f of fields)if(!selected.has(f.id))opts.push(`<option value="dynamic:${esc(f.id)}">${esc(f.label)}</option>`);
+    document.querySelector("#addColumnSelect").innerHTML=opts.join("")||`<option value="">没有可添加的字段</option>`;
+  }
+  function enableListDrag(){
+    let from=null;
+    rows.querySelectorAll("[data-ci][draggable='true']").forEach(row=>{
+      row.ondragstart=()=>from=Number(row.dataset.ci);
+      row.ondragover=e=>e.preventDefault();
+      row.ondrop=e=>{e.preventDefault();const to=Number(row.dataset.ci);if(from===null||from===to||items[to]?.column_key==="name")return;const [m]=items.splice(from,1);items.splice(to,0,m);redraw();};
+    });
+  }
+  redraw();fillAdd();
+  document.querySelector("#addColumnBtn").onclick=()=>{
+    const v=val("addColumnSelect");if(!v)return;const [key,fid]=v.split(":");
+    if(key==="owner")items.push({column_key:"owner",field_id:null,label:"业务员",enabled:1});
+    else{const f=fields.find(x=>x.id===fid);if(f)items.push({column_key:"dynamic",field_id:f.id,label:f.label,enabled:1});}
+    redraw();fillAdd();
+  };
+  document.querySelector("#saveColumns").onclick=async()=>{
+    const rowEls=[...rows.querySelectorAll("[data-ci]")];
+    const payload=rowEls.map((el,i)=>{
+      const item=items[Number(el.dataset.ci)];
+      return {columnKey:item.column_key,fieldId:item.field_id||null,label:item.column_key==="name"?"客户姓名":el.querySelector(".list-label")?.value||item.label,enabled:true,sortOrder:(i+1)*10};
+    });
+    try{await api("/api/admin/list-columns",{method:"PUT",body:{audience,items:payload}});toast("客户列表显示设置已同步");renderListSettings(view,audience)}catch(e){toast(e.message)}
+  };
+}
+
+const widgetTypeName={
+  metric_total:"客户总数",
+  metric_today:"今日新增",
+  metric_complete:"已完成",
+  metric_archived:"已归档",
+  sales_breakdown:"业务员客户分布"
+};
+
+async function renderDashboardSettings(view,audience="admin"){
+  const r=await api("/api/admin/dashboard-widgets?audience="+audience);
+  const items=r.items||[];
+  view.innerHTML=pageHead("仪表盘设置","管理员可以添加、减少、编辑和排序仪表盘内容",`<button class="btn" id="addWidget">＋ 添加组件</button>`)+
+    `<div class="row" style="margin-bottom:14px">
+      <button class="btn ${audience==="admin"?"":"ghost"} small" id="dashAdmin">管理员仪表盘</button>
+      <button class="btn ${audience==="sales"?"":"ghost"} small" id="dashSales">业务员仪表盘</button>
+    </div>
+    <div class="table-wrap"><table><thead><tr><th>顺序</th><th>标题</th><th>内容</th><th>状态</th><th>操作</th></tr></thead><tbody>
+    ${items.map(x=>`<tr><td>${x.sort_order}</td><td><strong>${esc(x.title)}</strong></td><td>${esc(widgetTypeName[x.widget_type]||x.widget_type)}</td><td>${x.enabled?"显示":"隐藏"}</td><td><button class="btn ghost small" data-widget-edit="${esc(x.id)}">编辑</button> <button class="btn danger small" data-widget-del="${esc(x.id)}">删除</button></td></tr>`).join("")||`<tr><td colspan="5" class="muted">当前没有组件</td></tr>`}</tbody></table></div>`;
+  document.querySelector("#dashAdmin").onclick=()=>renderDashboardSettings(view,"admin");
+  document.querySelector("#dashSales").onclick=()=>renderDashboardSettings(view,"sales");
+  document.querySelector("#addWidget").onclick=()=>dashboardWidgetModal(view,audience,null);
+  document.querySelectorAll("[data-widget-edit]").forEach(b=>b.onclick=()=>dashboardWidgetModal(view,audience,items.find(x=>x.id===b.dataset.widgetEdit)));
+  document.querySelectorAll("[data-widget-del]").forEach(b=>b.onclick=async()=>{if(!confirm("删除这个仪表盘组件？"))return;try{await api("/api/admin/dashboard-widgets/"+b.dataset.widgetDel,{method:"DELETE"});toast("组件已删除");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}});
+}
+function dashboardWidgetModal(view,audience,w){
+  const allowed=audience==="admin"?Object.keys(widgetTypeName):Object.keys(widgetTypeName).filter(x=>x!=="sales_breakdown");
+  openModal(w?"编辑仪表盘组件":"添加仪表盘组件",`
+    <div class="field"><label>组件内容</label><select class="input" id="wType">${allowed.map(x=>`<option value="${x}" ${w?.widget_type===x?"selected":""}>${esc(widgetTypeName[x])}</option>`).join("")}</select></div>
+    <div class="field"><label>显示标题</label><input class="input" id="wTitle" value="${esc(w?.title||"")}"></div>
+    <div class="field"><label>排序数字（越小越靠前）</label><input class="input" id="wSort" type="number" value="${w?.sort_order??100}"></div>
+    <label><input type="checkbox" id="wEnabled" ${w?.enabled!==0?"checked":""}> 显示</label>
+    <button class="btn full" id="wSave" style="margin-top:16px">保存</button>`,()=>{
+      const type=document.querySelector("#wType");
+      if(!w)document.querySelector("#wTitle").value=widgetTypeName[type.value];
+      type.onchange=()=>{if(!w||!val("wTitle"))document.querySelector("#wTitle").value=widgetTypeName[type.value]};
+      document.querySelector("#wSave").onclick=async()=>{const body={audience,widgetType:val("wType"),title:val("wTitle")||widgetTypeName[val("wType")],sortOrder:Number(val("wSort")||100),enabled:checked("wEnabled")};try{if(w)await api("/api/admin/dashboard-widgets/"+w.id,{method:"PATCH",body});else await api("/api/admin/dashboard-widgets",{method:"POST",body});closeModal();toast("仪表盘设置已保存");renderDashboardSettings(view,audience)}catch(e){toast(e.message)}};
+    });
 }
 
 async function renderCapacity(view){
