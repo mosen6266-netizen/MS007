@@ -206,3 +206,12 @@ INSERT OR IGNORE INTO dashboard_widgets
 
 INSERT OR IGNORE INTO system_settings(setting_key,value_json,updated_at) VALUES
 ('capacity_config','{"provider":"Cloudflare","database":"D1","free_single_db_mb":500,"free_account_gb":5,"free_rows_read_day":5000000,"free_rows_write_day":100000,"free_worker_requests_day":100000,"paid_base_usd_month":5,"warning_percent":70,"upgrade_percent":85,"urgent_percent":95,"upgrade_url":"https://dash.cloudflare.com/","pricing_checked":"2026-10-01"}',datetime('now'));
+
+
+INSERT OR IGNORE INTO sidebar_items
+(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
+('sa_listsettings','admin','客户列表设置','list-plus','#/admin/list-settings','same',1,55,'管理',datetime('now'),datetime('now')),
+('sa_dashsettings','admin','仪表盘设置','layout-dashboard','#/admin/dashboard-settings','same',1,65,'管理',datetime('now'),datetime('now'));
+
+INSERT OR IGNORE INTO system_settings(setting_key,value_json,updated_at)
+VALUES('sidebar_version','1',datetime('now'));
