@@ -176,6 +176,64 @@ async function bootstrapStatus(env) {
   return Number(row?.n || 0) === 0;
 }
 
+async function bootstrapDiagnostic(request, env) {
+  const token = request.headers.get("x-bootstrap-token") || "";
+  if (!env.BOOTSTRAP_TOKEN || token !== env.BOOTSTRAP_TOKEN) {
+    return fail("初始化授权无效", 403, "BOOTSTRAP_FORBIDDEN");
+  }
+
+  let step = "start";
+  let testUserId = null;
+  let testUsername = null;
+  try {
+    step = "bootstrap_status";
+    const empty = await bootstrapStatus(env);
+    if (!empty) return responseJson({ ok:true, skipped:true, reason:"already_initialized" });
+
+    step = "password_hash";
+    const salt = newSalt();
+    const iterations = 150000;
+    const hash = await derivePassword("MS007-diagnostic-password", salt, iterations);
+
+    step = "insert_test_user";
+    testUserId = uid("diag_");
+    testUsername = "diag_" + crypto.randomUUID().replace(/-/g,"").slice(0,16);
+    const t = now();
+    await env.DB.prepare(
+      `INSERT INTO users(id,username,display_name,password_hash,password_salt,password_iterations,role,active,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,'admin',0,?,?)`
+    ).bind(testUserId, testUsername, "Diagnostic", hash, salt, iterations, t, t).run();
+
+    step = "insert_audit";
+    const auditId = uid("diag_a_");
+    await env.DB.prepare(
+      "INSERT INTO audit_logs(id,actor_user_id,action,entity_type,entity_id,detail_json,created_at) VALUES(?,?,?,?,?,?,?)"
+    ).bind(auditId, testUserId, "diagnostic", "user", testUserId, "{}", now()).run();
+
+    step = "cleanup_audit";
+    await env.DB.prepare("DELETE FROM audit_logs WHERE id=?").bind(auditId).run();
+
+    step = "cleanup_user";
+    await env.DB.prepare("DELETE FROM users WHERE id=?").bind(testUserId).run();
+
+    return responseJson({ ok:true, diagnostic:true });
+  } catch (e) {
+    try {
+      if (testUserId) {
+        await env.DB.prepare("DELETE FROM audit_logs WHERE actor_user_id=? OR entity_id=?").bind(testUserId,testUserId).run();
+        await env.DB.prepare("DELETE FROM users WHERE id=?").bind(testUserId).run();
+      }
+    } catch {}
+    return responseJson({
+      ok:false,
+      diagnostic:true,
+      step,
+      errorName:String(e?.name||"Error"),
+      errorMessage:String(e?.message||e)
+    },500);
+  }
+}
+
 async function handleBootstrap(request, env) {
   const empty = await bootstrapStatus(env);
   if (!empty) return fail("系统已经初始化", 409, "ALREADY_INITIALIZED");
@@ -1014,6 +1072,7 @@ async function api(request, env) {
     const valid = configured && token === env.BOOTSTRAP_TOKEN;
     return responseJson({ ok:true, configured, valid });
   }
+  if (path === "/api/bootstrap-diagnostic" && method === "POST") return bootstrapDiagnostic(request, env);
   if (path === "/api/bootstrap" && method === "POST") return handleBootstrap(request, env);
   if (path === "/api/login" && method === "POST") return handleLogin(request, env);
 
