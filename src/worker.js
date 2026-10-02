@@ -1011,6 +1011,56 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
   return {processed};
 }
 
+
+const DAILY_PLAN_FIELD_SETTING_KEY="daily_plan_field_config_v1";
+
+function dailyPlanBeijingParts(ms=Date.now()){
+  const iso=new Date(Number(ms)+8*60*60*1000).toISOString();
+  return {date:iso.slice(0,10),time:iso.slice(11,16),dateTime:iso.slice(0,16).replace("T"," ")};
+}
+
+function dailyPlanValidTime(value){
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value||""));
+}
+
+function dailyPlanCleanValue(value,max=360){
+  const text=String(value??"").replace(/\s+/g," ").trim();
+  if(!text)return "—";
+  return text.length>max?text.slice(0,max-1)+"…":text;
+}
+
+async function dailyPlanFieldState(env){
+  const result=await env.DB.prepare(
+    "SELECT id,label,field_key FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  const fields=result.results||[];
+  const valid=new Set(fields.map(x=>String(x.id)));
+  const stored=await getSystemSetting(env,DAILY_PLAN_FIELD_SETTING_KEY,{});
+  const findField=(candidates)=>{
+    for(const term of candidates){
+      const exact=fields.find(x=>String(x.label||"").trim()===term);
+      if(exact)return exact.id;
+    }
+    for(const term of candidates){
+      const fuzzy=fields.find(x=>String(x.label||"").includes(term));
+      if(fuzzy)return fuzzy.id;
+    }
+    return "";
+  };
+  const config={
+    transferDateFieldId:valid.has(String(stored?.transferDateFieldId||""))
+      ?String(stored.transferDateFieldId)
+      :findField(["转主号日期","转主日期","转主号时间","转主号"]),
+    sourceFieldId:valid.has(String(stored?.sourceFieldId||""))
+      ?String(stored.sourceFieldId)
+      :findField(["客户来源","来源渠道","客户渠道","来源"]),
+    lossFieldId:valid.has(String(stored?.lossFieldId||""))
+      ?String(stored.lossFieldId)
+      :findField(["损失本金","损失金额","本金损失","损失"])
+  };
+  return {fields,config};
+}
+
 async function telegramAdminGet(env){
   const row=await telegramSettingsRow(env);
   const normalizedTemplate=await normalizeTelegramTemplateTokens(env);
