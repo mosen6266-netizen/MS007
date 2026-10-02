@@ -1173,6 +1173,86 @@ async function dailyPlanBuild(env,salesUserId){
   };
 }
 
+function dailyPlanQueueMeta(dedupeKey){
+  const m=String(dedupeKey||"").match(/^dailyplan:([^:]+):(\d{4}-\d{2}-\d{2}):(\d+)$/);
+  return m?{salesUserId:m[1],planDate:m[2],chunkIndex:Number(m[3]||0)}:null;
+}
+
+async function dailyPlanMarkQueueState(env,task,status,error=""){
+  const meta=dailyPlanQueueMeta(task?.dedupe_key);
+  if(!meta)return;
+  const t=now();
+  if(status==="success"){
+    await env.DB.prepare(
+      `UPDATE daily_plan_runs
+       SET delivered_count=MIN(message_count,delivered_count+1),
+           status=CASE WHEN delivered_count+1>=message_count THEN 'success' ELSE 'sending' END,
+           error_text='',updated_at=?
+       WHERE sales_user_id=? AND plan_date=?`
+    ).bind(t,meta.salesUserId,meta.planDate).run();
+    return;
+  }
+  const allowed=new Set(["sending","retry","needs_admin","failed"]);
+  if(!allowed.has(status))return;
+  await env.DB.prepare(
+    `UPDATE daily_plan_runs
+     SET status=?,error_text=?,updated_at=?
+     WHERE sales_user_id=? AND plan_date=? AND status<>'success'`
+  ).bind(status,String(error||"").slice(0,1000),t,meta.salesUserId,meta.planDate).run();
+}
+
+async function dailyPlanAdminGet(env){
+  const bj=dailyPlanBeijingParts();
+  const [salesResult,fieldState,tg]=await Promise.all([
+    env.DB.prepare(
+      `SELECT u.id,u.username,u.display_name,u.active,
+         COALESCE(d.enabled,0) enabled,
+         COALESCE(d.send_time_beijing,'09:00') send_time_beijing,
+         COALESCE(d.chat_id,'') chat_id,
+         COALESCE(cc.customer_count,0) customer_count,
+         r.status today_status,r.message_count,r.delivered_count,r.error_text,r.updated_at run_updated_at
+       FROM users u
+       LEFT JOIN daily_plan_settings d ON d.sales_user_id=u.id
+       LEFT JOIN (
+         SELECT assigned_user_id,COUNT(*) customer_count
+         FROM customers
+         WHERE deleted_at IS NULL AND archived=0
+         GROUP BY assigned_user_id
+       ) cc ON cc.assigned_user_id=u.id
+       LEFT JOIN daily_plan_runs r ON r.sales_user_id=u.id AND r.plan_date=?
+       WHERE u.role='sales'
+       ORDER BY u.active DESC,u.display_name,u.username`
+    ).bind(bj.date).all(),
+    dailyPlanFieldState(env),
+    telegramSettingsRow(env)
+  ]);
+  return responseJson({
+    ok:true,
+    timezone:"Asia/Shanghai",
+    timezoneLabel:"北京时间 UTC+8",
+    beijingNow:bj.dateTime,
+    hasBotToken:!!tg?.bot_token_enc,
+    defaultChatId:String(tg?.chat_id||""),
+    fieldConfig:fieldState.config,
+    fieldOptions:fieldState.fields,
+    items:(salesResult.results||[]).map(x=>({
+      id:x.id,
+      username:x.username,
+      displayName:x.display_name,
+      active:!!x.active,
+      enabled:!!x.enabled,
+      sendTime:String(x.send_time_beijing||"09:00"),
+      chatId:String(x.chat_id||""),
+      customerCount:Number(x.customer_count||0),
+      todayStatus:x.today_status||"",
+      messageCount:Number(x.message_count||0),
+      deliveredCount:Number(x.delivered_count||0),
+      errorText:String(x.error_text||""),
+      runUpdatedAt:x.run_updated_at||null
+    }))
+  });
+}
+
 async function telegramAdminGet(env){
   const row=await telegramSettingsRow(env);
   const normalizedTemplate=await normalizeTelegramTemplateTokens(env);
