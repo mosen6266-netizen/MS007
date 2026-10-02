@@ -1390,6 +1390,73 @@ async function dailyPlanSendNow(request,env,user,ctx){
   });
 }
 
+async function processDueDailyPlans(env,{maxSales=3}={}){
+  const tg=await telegramSettingsRow(env);
+  if(!tg?.bot_token_enc)return {processed:0,reason:"token_missing"};
+  const bj=dailyPlanBeijingParts();
+  const due=await env.DB.prepare(
+    `SELECT d.sales_user_id,d.send_time_beijing,d.chat_id,u.display_name,u.username
+     FROM daily_plan_settings d
+     JOIN users u ON u.id=d.sales_user_id AND u.role='sales' AND u.active=1
+     LEFT JOIN daily_plan_runs r
+       ON r.sales_user_id=d.sales_user_id AND r.plan_date=?
+     WHERE d.enabled=1 AND d.send_time_beijing<=? AND r.sales_user_id IS NULL
+     ORDER BY d.send_time_beijing,d.sales_user_id
+     LIMIT ?`
+  ).bind(bj.date,bj.time,Math.max(1,Math.min(10,Number(maxSales)||3))).all();
+
+  let processed=0;
+  for(const setting of due.results||[]){
+    const targetChatId=String(setting.chat_id||tg.chat_id||"").trim();
+    if(!targetChatId)continue;
+
+    const t=now();
+    const claim=await env.DB.prepare(
+      `INSERT OR IGNORE INTO daily_plan_runs(
+         sales_user_id,plan_date,status,chat_id,customer_count,message_count,
+         delivered_count,queued_at,updated_at,error_text
+       ) VALUES(?,?,'sending',?,0,0,0,?,?, '')`
+    ).bind(setting.sales_user_id,bj.date,targetChatId,t,t).run();
+    if(Number(claim?.meta?.changes||0)!==1)continue;
+
+    try{
+      const result=await dailyPlanEnqueue(env,setting.sales_user_id,{
+        manual:false,planDate:bj.date,chatId:targetChatId
+      });
+      if(!result.ok){
+        await env.DB.prepare(
+          "DELETE FROM daily_plan_runs WHERE sales_user_id=? AND plan_date=?"
+        ).bind(setting.sales_user_id,bj.date).run();
+        continue;
+      }
+      if(result.empty){
+        await env.DB.prepare(
+          `UPDATE daily_plan_runs
+           SET status='empty',customer_count=0,message_count=0,delivered_count=0,
+               error_text='',updated_at=?
+           WHERE sales_user_id=? AND plan_date=?`
+        ).bind(now(),setting.sales_user_id,bj.date).run();
+      }else{
+        await env.DB.prepare(
+          `UPDATE daily_plan_runs
+           SET status='queued',customer_count=?,message_count=?,delivered_count=0,
+               error_text='',updated_at=?
+           WHERE sales_user_id=? AND plan_date=?`
+        ).bind(
+          result.plan.customerCount,result.plan.messageCount,now(),
+          setting.sales_user_id,bj.date
+        ).run();
+      }
+      processed++;
+    }catch(e){
+      await env.DB.prepare(
+        "DELETE FROM daily_plan_runs WHERE sales_user_id=? AND plan_date=?"
+      ).bind(setting.sales_user_id,bj.date).run();
+    }
+  }
+  return {processed,date:bj.date,time:bj.time};
+}
+
 async function telegramAdminGet(env){
   const row=await telegramSettingsRow(env);
   const normalizedTemplate=await normalizeTelegramTemplateTokens(env);
