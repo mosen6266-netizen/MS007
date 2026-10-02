@@ -1374,6 +1374,61 @@ async function dailyPlanSendNow(request,env,user,ctx){
   const body=await readBody(request);
   const salesUserId=String(body?.salesUserId||"").trim();
   if(!salesUserId)return fail("请选择业务员");
+
+  const bj=dailyPlanBeijingParts();
+  const existingRun=await env.DB.prepare(
+    "SELECT status,chat_id,message_count,delivered_count FROM daily_plan_runs WHERE sales_user_id=? AND plan_date=?"
+  ).bind(salesUserId,bj.date).first();
+
+  if(existingRun && ["queued","sending","retry","needs_admin"].includes(existingRun.status)){
+    const tg=await telegramSettingsRow(env);
+    if(!tg?.bot_token_enc)return fail("请先在 Telegram 通知功能中保存 Bot Token",409);
+    const setting=await env.DB.prepare(
+      "SELECT chat_id FROM daily_plan_settings WHERE sales_user_id=?"
+    ).bind(salesUserId).first();
+    const targetChatId=String(setting?.chat_id||tg.chat_id||existingRun.chat_id||"").trim();
+    if(!targetChatId)return fail("请先给该业务员填写 Telegram 群 ID，或在 Telegram 通知中设置默认群",409);
+
+    const prefix=["dailyplan",salesUserId,bj.date,""].join(":");
+    const queuedRow=await env.DB.prepare(
+      "SELECT COUNT(*) n FROM telegram_send_queue WHERE instr(dedupe_key,?)=1"
+    ).bind(prefix).first();
+
+    if(Number(queuedRow?.n||0)>0){
+      if(existingRun.status==="retry"||existingRun.status==="needs_admin"){
+        const t=now();
+        await env.DB.prepare(
+          `UPDATE telegram_send_queue
+           SET chat_id=?,status='retry',attempts=CASE WHEN COALESCE(requires_admin,0)=1 THEN 0 ELSE attempts END,
+               next_attempt_at=?,locked_until=NULL,requires_admin=0,dead_lettered_at=NULL,
+               last_error='管理员从每日工作计划页面要求立即重试',updated_at=?
+           WHERE instr(dedupe_key,?)=1 AND status IN ('pending','retry','sending')`
+        ).bind(targetChatId,t,t,prefix).run();
+        await env.DB.prepare(
+          `UPDATE daily_plan_runs
+           SET status='retry',chat_id=?,error_text='',updated_at=?
+           WHERE sales_user_id=? AND plan_date=?`
+        ).bind(targetChatId,t,salesUserId,bj.date).run();
+      }
+
+      await audit(env,user,"retry","daily_plan",salesUserId,{
+        planDate:bj.date,
+        previousStatus:existingRun.status,
+        queuedMessages:Number(queuedRow?.n||0),
+        chatId:targetChatId
+      });
+      const existingJob=processTelegramQueue(env,{maxItems:4,maxRunMs:10000,allowShortWait:false}).catch(()=>{});
+      if(ctx?.waitUntil)ctx.waitUntil(existingJob);
+      else await existingJob;
+      return responseJson({
+        ok:true,
+        resumed:true,
+        queued:Number(queuedRow?.n||0),
+        message:"今日计划已经在发送队列中，系统已优先继续处理，不会重复生成一份"
+      });
+    }
+  }
+
   const result=await dailyPlanEnqueue(env,salesUserId,{manual:true});
   const reasonMap={
     token_missing:"请先在 Telegram 通知功能中保存 Bot Token",
