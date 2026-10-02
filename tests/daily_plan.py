@@ -47,6 +47,8 @@ for token in [
 # Scheduled runs use a deterministic per-salesperson/day dedupe key.
 assert '["dailyplan",salesUserId,date,String(i+1)].join(":")' in daily
 assert 'dailyplan-manual' in daily
+assert "instr(dedupe_key,?)=1" in daily
+assert "不会重复生成一份" in daily
 
 for token in [
     "async function renderDailyPlan",
