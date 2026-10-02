@@ -16,7 +16,7 @@ const state = {
 
 const iconMap = {
   "layout-dashboard":"▦","users":"👥","user-cog":"⚙","list-plus":"☷","check-circle":"✓",
-  "panel-left":"☰","database":"◫","user-plus":"＋","link":"↗","circle":"•"
+  "panel-left":"☰","database":"◫","user-plus":"＋","link":"↗","calendar":"🗓","circle":"•"
 };
 
 function esc(v=""){
@@ -304,6 +304,7 @@ async function renderRoute(){
     if(role==="admin"&&page==="list-settings")return renderListSettings(view);
     if(role==="admin"&&page==="dashboard-settings")return renderDashboardSettings(view);
     if(role==="admin"&&page==="capacity")return renderCapacity(view);
+    if(role==="admin"&&page==="daily-plan")return renderDailyPlan(view);
     if(role==="admin"&&page==="telegram")return renderTelegramSettings(view);
     if(role==="admin"&&page==="audit")return renderAudit(view);
     if(role==="admin"&&page==="recycle")return renderRecycle(view);
@@ -2058,6 +2059,198 @@ function dashboardWidgetModal(view,audience,w,progressDefs=[],nextSort=1,insert=
 
 
 let telegramUnresolvedRefreshTimer=null;
+
+
+async function renderDailyPlan(view){
+  const r=await api("/api/admin/daily-plans");
+  const items=Array.isArray(r.items)?r.items:[];
+  const fields=Array.isArray(r.fieldOptions)?r.fieldOptions:[];
+  const config=r.fieldConfig||{};
+
+  const fieldOptions=(selected)=>[
+    '<option value="">未指定（消息显示 —）</option>',
+    ...fields.map(f=>'<option value="'+esc(f.id)+'" '+(String(selected||"")===String(f.id)?"selected":"")+'>'+esc(f.label)+'</option>')
+  ].join("");
+
+  const statusText=(item)=>{
+    const map={
+      queued:"等待发送",sending:"正在发送",retry:"自动重试",
+      success:"已发送",empty:"今日无跟进客户",needs_admin:"需要处理",failed:"发送失败"
+    };
+    if(item.todayStatus)return map[item.todayStatus]||item.todayStatus;
+    if(!item.enabled)return "未启用";
+    return "今日 "+item.sendTime+" 待发送";
+  };
+  const statusDetail=(item)=>{
+    if(item.todayStatus==="success"&&item.messageCount){
+      return "已发送 "+item.deliveredCount+" / "+item.messageCount+" 段";
+    }
+    if(item.todayStatus==="retry")return item.errorText||"系统会自动重试";
+    if(item.todayStatus==="needs_admin"||item.todayStatus==="failed")return item.errorText||"请检查 Telegram 群 ID 或机器人权限";
+    if(item.todayStatus==="empty")return "今天没有正在跟进的客户，因此没有发送空日报";
+    return "";
+  };
+
+  view.innerHTML=pageHead(
+    "每日工作计划",
+    "每个业务员每天汇总一份客户工作计划；所有定时都固定按北京时间 UTC+8 执行。",
+    '<button class="btn secondary" id="dailyPlanRefresh">刷新状态</button>'
+  )+
+  `<div class="grid metrics" style="margin-bottom:16px">
+    <div class="card metric"><div class="label">当前北京时间</div><div class="value" style="font-size:20px">${esc(r.beijingNow||"")}</div></div>
+    <div class="card metric"><div class="label">Telegram Bot</div><div class="value" style="font-size:20px">${r.hasBotToken?"已连接":"未设置"}</div></div>
+    <div class="card metric"><div class="label">默认 Telegram 群</div><div class="value" style="font-size:16px;word-break:break-all">${esc(r.defaultChatId||"未设置")}</div></div>
+    <div class="card metric"><div class="label">业务员数量</div><div class="value">${money(items.length)}</div></div>
+  </div>
+
+  ${r.hasBotToken?"":`<div class="notice warning" style="margin-bottom:16px">
+    每日工作计划会复用系统现有的 Telegram Bot Token，但不会使用原来的“进度通知”开关和进度群规则。
+    目前还没有 Bot Token，请先到 <a href="#/admin/telegram">Telegram 通知</a> 保存机器人 Token。
+  </div>`}
+
+  <section class="card" style="margin-bottom:16px">
+    <div class="page-head" style="margin-bottom:12px">
+      <div>
+        <h2 style="font-size:18px;margin:0">日报字段对应</h2>
+        <p class="muted" style="margin:6px 0 0">客户姓名、当前进度、下一步进度由系统直接读取；下面三个项目对应你现有的登记字段。</p>
+      </div>
+    </div>
+    <div class="grid" style="grid-template-columns:repeat(3,minmax(0,1fr));gap:12px">
+      <div class="field"><label>转主号日期</label><select class="input" id="dailyTransferField">${fieldOptions(config.transferDateFieldId)}</select></div>
+      <div class="field"><label>客户来源</label><select class="input" id="dailySourceField">${fieldOptions(config.sourceFieldId)}</select></div>
+      <div class="field"><label>损失本金</label><select class="input" id="dailyLossField">${fieldOptions(config.lossFieldId)}</select></div>
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="page-head" style="margin-bottom:12px">
+      <div>
+        <h2 style="font-size:18px;margin:0">业务员推送设置</h2>
+        <p class="muted" style="margin:6px 0 0">同一时间有多人需要推送时，系统每分钟最多生成 3 名业务员的日报，再由 Telegram 可靠队列错峰发送，避免同时挤爆。</p>
+      </div>
+      <button class="btn" id="dailyPlanSave">保存全部设置</button>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>业务员</th>
+            <th>跟进客户</th>
+            <th>每日推送</th>
+            <th>北京时间</th>
+            <th>Telegram 群 ID</th>
+            <th>今日状态</th>
+            <th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${items.map(item=>`<tr data-daily-sales="${esc(item.id)}">
+            <td>
+              <strong>${esc(item.displayName||item.username)}</strong>
+              ${item.active?"":'<div class="muted" style="font-size:12px">账号已停用</div>'}
+            </td>
+            <td>${money(item.customerCount)}</td>
+            <td>
+              <label><input type="checkbox" class="daily-enabled" ${item.enabled?"checked":""} ${item.active?"":"disabled"}> 启用</label>
+            </td>
+            <td><input class="input daily-time" type="time" value="${esc(item.sendTime||"09:00")}" ${item.active?"":"disabled"} style="min-width:115px"></td>
+            <td>
+              <input class="input daily-chat" value="${esc(item.chatId||"")}" ${item.active?"":"disabled"}
+                placeholder="${r.defaultChatId?"留空使用默认群 "+esc(r.defaultChatId):"填写 Telegram 群 ID，例如 -100..."}" style="min-width:230px">
+            </td>
+            <td>
+              <span class="tag">${esc(statusText(item))}</span>
+              ${statusDetail(item)?'<div class="muted" style="font-size:12px;margin-top:5px;max-width:260px">'+esc(statusDetail(item))+'</div>':""}
+            </td>
+            <td>
+              <div class="row wrap">
+                <button class="btn ghost small" data-daily-preview="${esc(item.id)}">预览</button>
+                <button class="btn secondary small" data-daily-send="${esc(item.id)}" ${item.active?"":"disabled"}>立即发送</button>
+              </div>
+            </td>
+          </tr>`).join("")||'<tr><td colspan="7" class="muted">还没有业务员账号</td></tr>'}
+        </tbody>
+      </table>
+    </div>
+    <div class="muted" style="font-size:12px;margin-top:10px">
+      只汇总该业务员名下“未删除、未归档”的客户。若当天没有正在跟进的客户，系统会记录“今日无跟进客户”，但不会发送空消息。
+      单份内容过长时只按 Telegram 长度限制自动分段，不会拆成一个客户一条。
+    </div>
+  </section>`;
+
+  function collectDailyPlanSettings(){
+    return {
+      fieldConfig:{
+        transferDateFieldId:val("dailyTransferField"),
+        sourceFieldId:val("dailySourceField"),
+        lossFieldId:val("dailyLossField")
+      },
+      items:[...document.querySelectorAll("[data-daily-sales]")].map(row=>({
+        salesUserId:row.dataset.dailySales,
+        enabled:!!row.querySelector(".daily-enabled")?.checked,
+        sendTime:row.querySelector(".daily-time")?.value||"09:00",
+        chatId:row.querySelector(".daily-chat")?.value.trim()||""
+      }))
+    };
+  }
+
+  async function saveDailyPlanSettings(showToast=true){
+    const payload=collectDailyPlanSettings();
+    const out=await api("/api/admin/daily-plans",{method:"PUT",body:payload});
+    if(showToast)toast(out.message||"每日工作计划设置已保存");
+    return out;
+  }
+
+  document.querySelector("#dailyPlanSave").onclick=async()=>{
+    const btn=document.querySelector("#dailyPlanSave");
+    btn.disabled=true;
+    try{await saveDailyPlanSettings(true)}
+    catch(e){toast(e.message)}
+    finally{btn.disabled=false}
+  };
+
+  document.querySelector("#dailyPlanRefresh").onclick=()=>renderDailyPlan(view);
+
+  document.querySelectorAll("[data-daily-preview]").forEach(btn=>btn.onclick=async()=>{
+    btn.disabled=true;
+    try{
+      const out=await api("/api/admin/daily-plans/preview",{
+        method:"POST",body:{salesUserId:btn.dataset.dailyPreview}
+      });
+      openModal(
+        (out.salesperson||"业务员")+" · 今日工作计划预览",
+        `<div class="notice" style="margin-bottom:12px">客户 ${money(out.customerCount)} 位 · Telegram 消息 ${money(out.messageCount)} 段 · ${esc(out.generatedAtBeijing||"")}（北京时间）</div>
+         <pre style="white-space:pre-wrap;word-break:break-word;margin:0;padding:16px;border:1px solid var(--line);border-radius:12px;background:var(--soft);font-family:inherit;line-height:1.7">${esc(out.preview||"")}</pre>`
+      );
+    }catch(e){toast(e.message)}
+    finally{btn.disabled=false}
+  });
+
+  document.querySelectorAll("[data-daily-send]").forEach(btn=>btn.onclick=async()=>{
+    const row=btn.closest("[data-daily-sales]");
+    const name=row?.querySelector("strong")?.textContent||"这名业务员";
+    if(!await uiConfirm(
+      "立即把 "+name+" 当前全部跟进客户汇总成一份工作计划并发送到 Telegram？\\n\\n当前页面中修改的时间、群 ID 和字段对应也会一起保存。",
+      {title:"立即发送工作计划",confirmText:"保存并发送"}
+    ))return;
+
+    btn.disabled=true;
+    const old=btn.textContent;
+    btn.textContent="正在加入队列...";
+    try{
+      await saveDailyPlanSettings(false);
+      const out=await api("/api/admin/daily-plans/send-now",{
+        method:"POST",body:{salesUserId:btn.dataset.dailySend}
+      });
+      toast(out.message||"已进入发送队列");
+      setTimeout(()=>renderDailyPlan(view),900);
+    }catch(e){
+      toast(e.message);
+      btn.disabled=false;
+      btn.textContent=old;
+    }
+  });
+}
 
 async function renderTelegramSettings(view){
   if(telegramUnresolvedRefreshTimer){

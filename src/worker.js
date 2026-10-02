@@ -802,7 +802,7 @@ async function telegramQueueMonitor(env){
 
 async function retryTelegramQueueItem(env,user,id,ctx){
   const row=await env.DB.prepare(
-    "SELECT id,status,requires_admin,last_error,locked_until FROM telegram_send_queue WHERE id=?"
+    "SELECT id,dedupe_key,status,requires_admin,last_error,locked_until FROM telegram_send_queue WHERE id=?"
   ).bind(id).first();
   if(!row)return fail("这条 Telegram 消息已经不存在，可能已经发送成功",404);
   if(row.status==="sending" && row.locked_until && Date.parse(String(row.locked_until))>Date.now()){
@@ -825,6 +825,7 @@ async function retryTelegramQueueItem(env,user,id,ctx){
     id
   ).run();
   if(Number(result?.meta?.changes||0)!==1)return fail("这条消息状态刚刚发生变化，请刷新后重试",409);
+  await dailyPlanMarkQueueState(env,row,"retry",row.last_error||"管理员要求立即重试");
   await audit(env,user,"retry","telegram_queue",id,{
     previousStatus:row.status,
     previousRequiresAdmin:wasAdmin,
@@ -860,6 +861,11 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
       "Token 无法解密，需要管理员重新保存 Telegram Bot Token 后手动重试",
       t
     ).run();
+    await env.DB.prepare(
+      `UPDATE daily_plan_runs
+       SET status='needs_admin',error_text=?,updated_at=?
+       WHERE status IN ('queued','sending','retry')`
+    ).bind("Telegram Bot Token 无法解密，需要管理员重新保存 Token",t).run();
     return {processed,reason:"token"};
   }
 
@@ -918,6 +924,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
        )`
     ).bind(lockUntil,current,task.id,current,current).run();
     if(Number(claim?.meta?.changes||0)!==1)continue;
+    await dailyPlanMarkQueueState(env,task,"sending");
 
     const globalLease=await acquireTelegramChatLease(env,"__bot_global__",1);
     if(!globalLease.acquired){
@@ -930,6 +937,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
          SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
          WHERE id=?`
       ).bind(retryAt,"Telegram 全局发送正在安全限速，系统会自动发送",now(),task.id).run();
+      await dailyPlanMarkQueueState(env,task,"retry","Telegram 全局发送正在安全限速");
       continue;
     }
 
@@ -944,6 +952,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
          SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
          WHERE id=?`
       ).bind(retryAt,"同一群组正在安全限速排队，系统会自动发送",now(),task.id).run();
+      await dailyPlanMarkQueueState(env,task,"retry","同一群组正在安全限速排队");
       continue;
     }
 
@@ -961,6 +970,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
         status:"success",
         error:"群 "+task.chat_id
       });
+      await dailyPlanMarkQueueState(env,task,"success");
       await env.DB.prepare("DELETE FROM telegram_send_queue WHERE id=?").bind(task.id).run();
       processed++;
     }catch(e){
@@ -978,6 +988,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
            SET status='retry',attempts=?,next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
            WHERE id=?`
         ).bind(attempts,retryAt,String(reason).slice(0,1000),now(),task.id).run();
+        await dailyPlanMarkQueueState(env,task,"retry",reason);
       }else{
         const t=now();
         const reason=retryable
@@ -1003,12 +1014,514 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
           t,
           task.id
         ).run();
+        await dailyPlanMarkQueueState(env,task,"needs_admin",reason);
       }
       processed++;
     }
   }
 
   return {processed};
+}
+
+
+const DAILY_PLAN_FIELD_SETTING_KEY="daily_plan_field_config_v1";
+
+function dailyPlanBeijingParts(ms=Date.now()){
+  const iso=new Date(Number(ms)+8*60*60*1000).toISOString();
+  return {date:iso.slice(0,10),time:iso.slice(11,16),dateTime:iso.slice(0,16).replace("T"," ")};
+}
+
+function dailyPlanValidTime(value){
+  return /^([01]\d|2[0-3]):[0-5]\d$/.test(String(value||""));
+}
+
+function dailyPlanCleanValue(value,max=360){
+  const text=String(value??"").replace(/\s+/g," ").trim();
+  if(!text)return "—";
+  return text.length>max?text.slice(0,max-1)+"…":text;
+}
+
+async function dailyPlanFieldState(env){
+  const result=await env.DB.prepare(
+    "SELECT id,label,field_key FROM field_definitions WHERE enabled=1 ORDER BY sort_order,label"
+  ).all();
+  const fields=result.results||[];
+  const valid=new Set(fields.map(x=>String(x.id)));
+  const stored=await getSystemSetting(env,DAILY_PLAN_FIELD_SETTING_KEY,{});
+  const findField=(candidates)=>{
+    for(const term of candidates){
+      const exact=fields.find(x=>String(x.label||"").trim()===term);
+      if(exact)return exact.id;
+    }
+    for(const term of candidates){
+      const fuzzy=fields.find(x=>String(x.label||"").includes(term));
+      if(fuzzy)return fuzzy.id;
+    }
+    return "";
+  };
+  const config={
+    transferDateFieldId:valid.has(String(stored?.transferDateFieldId||""))
+      ?String(stored.transferDateFieldId)
+      :findField(["转主号日期","转主日期","转主号时间","转主号"]),
+    sourceFieldId:valid.has(String(stored?.sourceFieldId||""))
+      ?String(stored.sourceFieldId)
+      :findField(["客户来源","来源渠道","客户渠道","来源"]),
+    lossFieldId:valid.has(String(stored?.lossFieldId||""))
+      ?String(stored.lossFieldId)
+      :findField(["损失本金","损失金额","本金损失","损失"])
+  };
+  return {fields,config};
+}
+
+async function dailyPlanBuild(env,salesUserId){
+  const sales=await env.DB.prepare(
+    "SELECT id,username,display_name,active FROM users WHERE id=? AND role='sales'"
+  ).bind(salesUserId).first();
+  if(!sales)throw new Error("业务员不存在");
+
+  const [customerResult,progressResult,doneResult,fieldState]=await Promise.all([
+    env.DB.prepare(
+      `SELECT id,name,created_at,updated_at,progress_done,progress_total,progress_percent
+       FROM customers
+       WHERE assigned_user_id=? AND deleted_at IS NULL AND archived=0
+       ORDER BY created_at,id`
+    ).bind(salesUserId).all(),
+    env.DB.prepare(
+      "SELECT id,label,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
+    ).all(),
+    env.DB.prepare(
+      `SELECT cp.customer_id,cp.progress_id
+       FROM customer_progress cp
+       JOIN customers c ON c.id=cp.customer_id
+       JOIN progress_definitions pd ON pd.id=cp.progress_id AND pd.enabled=1
+       WHERE c.assigned_user_id=? AND c.deleted_at IS NULL AND c.archived=0 AND cp.completed=1`
+    ).bind(salesUserId).all(),
+    dailyPlanFieldState(env)
+  ]);
+
+  const customers=customerResult.results||[];
+  const progressDefs=progressResult.results||[];
+  const completedByCustomer=new Map();
+  for(const row of doneResult.results||[]){
+    if(!completedByCustomer.has(row.customer_id))completedByCustomer.set(row.customer_id,new Set());
+    completedByCustomer.get(row.customer_id).add(row.progress_id);
+  }
+
+  const cfg=fieldState.config;
+  const fieldIds=[
+    String(cfg.transferDateFieldId||""),
+    String(cfg.sourceFieldId||""),
+    String(cfg.lossFieldId||"")
+  ];
+  const valuesByCustomer=new Map();
+  if(fieldIds.some(Boolean)){
+    const values=await env.DB.prepare(
+      `SELECT cv.customer_id,cv.field_id,cv.value
+       FROM customer_values cv
+       JOIN customers c ON c.id=cv.customer_id
+       WHERE c.assigned_user_id=? AND c.deleted_at IS NULL AND c.archived=0
+         AND cv.field_id IN (?,?,?)`
+    ).bind(salesUserId,fieldIds[0],fieldIds[1],fieldIds[2]).all();
+    for(const row of values.results||[]){
+      if(!valuesByCustomer.has(row.customer_id))valuesByCustomer.set(row.customer_id,{});
+      valuesByCustomer.get(row.customer_id)[row.field_id]=row.value||"";
+    }
+  }
+
+  const blocks=[];
+  for(let i=0;i<customers.length;i++){
+    const customer=customers[i];
+    const done=completedByCustomer.get(customer.id)||new Set();
+    let current=null,next=null;
+    for(const progress of progressDefs){
+      if(done.has(progress.id))current=progress;
+      else if(!next)next=progress;
+    }
+    const custom=valuesByCustomer.get(customer.id)||{};
+    blocks.push(
+      "【"+(i+1)+"】\n"+
+      "客户姓名："+dailyPlanCleanValue(customer.name,160)+"\n"+
+      "转主号日期："+dailyPlanCleanValue(custom[fieldIds[0]],220)+"\n"+
+      "客户来源："+dailyPlanCleanValue(custom[fieldIds[1]],220)+"\n"+
+      "损失本金："+dailyPlanCleanValue(custom[fieldIds[2]],220)+"\n"+
+      "当前进度："+dailyPlanCleanValue(current?.label||"未开始",220)+"\n"+
+      "下一步进度："+dailyPlanCleanValue(next?.label||"已全部完成",220)
+    );
+  }
+
+  const bj=dailyPlanBeijingParts();
+  const baseHeader=
+    "📋 每日客户工作计划\n"+
+    "日期："+bj.date+"\n"+
+    "业务员："+dailyPlanCleanValue(sales.display_name||sales.username,120)+"\n"+
+    "客户数量："+customers.length;
+  const footer="共 "+customers.length+" 位客户\n生成时间："+bj.time+"（北京时间）";
+  const maxChars=3400;
+  const groups=[];
+  let group=[];
+  for(const block of blocks){
+    const trial=baseHeader+"\n\n"+group.concat([block]).join("\n\n")+"\n\n"+footer;
+    if(group.length && trial.length>maxChars){
+      groups.push(group);
+      group=[block];
+    }else{
+      group.push(block);
+    }
+  }
+  if(group.length)groups.push(group);
+
+  const plainMessages=groups.map((items,index)=>{
+    const part=groups.length>1?"\n分段："+(index+1)+"/"+groups.length:"";
+    return baseHeader+part+"\n\n"+items.join("\n\n")+"\n\n"+footer;
+  });
+  return {
+    sales,
+    customerCount:customers.length,
+    messageCount:plainMessages.length,
+    plainMessages,
+    htmlMessages:plainMessages.map(x=>telegramHtmlEscape(x)),
+    fieldConfig:cfg,
+    generatedAtBeijing:bj.dateTime
+  };
+}
+
+function dailyPlanQueueMeta(dedupeKey){
+  const m=String(dedupeKey||"").match(/^dailyplan:([^:]+):(\d{4}-\d{2}-\d{2}):(\d+)$/);
+  return m?{salesUserId:m[1],planDate:m[2],chunkIndex:Number(m[3]||0)}:null;
+}
+
+async function dailyPlanMarkQueueState(env,task,status,error=""){
+  const meta=dailyPlanQueueMeta(task?.dedupe_key);
+  if(!meta)return;
+  const t=now();
+  if(status==="success"){
+    await env.DB.prepare(
+      `UPDATE daily_plan_runs
+       SET delivered_count=MIN(message_count,delivered_count+1),
+           status=CASE WHEN delivered_count+1>=message_count THEN 'success' ELSE 'sending' END,
+           error_text='',updated_at=?
+       WHERE sales_user_id=? AND plan_date=?`
+    ).bind(t,meta.salesUserId,meta.planDate).run();
+    return;
+  }
+  const allowed=new Set(["sending","retry","needs_admin","failed"]);
+  if(!allowed.has(status))return;
+  await env.DB.prepare(
+    `UPDATE daily_plan_runs
+     SET status=?,error_text=?,updated_at=?
+     WHERE sales_user_id=? AND plan_date=? AND status<>'success'`
+  ).bind(status,String(error||"").slice(0,1000),t,meta.salesUserId,meta.planDate).run();
+}
+
+async function dailyPlanAdminGet(env){
+  const bj=dailyPlanBeijingParts();
+  const [salesResult,fieldState,tg]=await Promise.all([
+    env.DB.prepare(
+      `SELECT u.id,u.username,u.display_name,u.active,
+         COALESCE(d.enabled,0) enabled,
+         COALESCE(d.send_time_beijing,'09:00') send_time_beijing,
+         COALESCE(d.chat_id,'') chat_id,
+         COALESCE(cc.customer_count,0) customer_count,
+         r.status today_status,r.message_count,r.delivered_count,r.error_text,r.updated_at run_updated_at
+       FROM users u
+       LEFT JOIN daily_plan_settings d ON d.sales_user_id=u.id
+       LEFT JOIN (
+         SELECT assigned_user_id,COUNT(*) customer_count
+         FROM customers
+         WHERE deleted_at IS NULL AND archived=0
+         GROUP BY assigned_user_id
+       ) cc ON cc.assigned_user_id=u.id
+       LEFT JOIN daily_plan_runs r ON r.sales_user_id=u.id AND r.plan_date=?
+       WHERE u.role='sales'
+       ORDER BY u.active DESC,u.display_name,u.username`
+    ).bind(bj.date).all(),
+    dailyPlanFieldState(env),
+    telegramSettingsRow(env)
+  ]);
+  return responseJson({
+    ok:true,
+    timezone:"Asia/Shanghai",
+    timezoneLabel:"北京时间 UTC+8",
+    beijingNow:bj.dateTime,
+    hasBotToken:!!tg?.bot_token_enc,
+    defaultChatId:String(tg?.chat_id||""),
+    fieldConfig:fieldState.config,
+    fieldOptions:fieldState.fields,
+    items:(salesResult.results||[]).map(x=>({
+      id:x.id,
+      username:x.username,
+      displayName:x.display_name,
+      active:!!x.active,
+      enabled:!!x.enabled,
+      sendTime:String(x.send_time_beijing||"09:00"),
+      chatId:String(x.chat_id||""),
+      customerCount:Number(x.customer_count||0),
+      todayStatus:x.today_status||"",
+      messageCount:Number(x.message_count||0),
+      deliveredCount:Number(x.delivered_count||0),
+      errorText:String(x.error_text||""),
+      runUpdatedAt:x.run_updated_at||null
+    }))
+  });
+}
+
+async function dailyPlanAdminSave(request,env,user){
+  const body=await readBody(request);
+  const items=Array.isArray(body?.items)?body.items.slice(0,500):[];
+  const fieldConfig=body?.fieldConfig&&typeof body.fieldConfig==="object"?body.fieldConfig:null;
+
+  if(fieldConfig){
+    const enabledFields=await env.DB.prepare(
+      "SELECT id FROM field_definitions WHERE enabled=1"
+    ).all();
+    const valid=new Set((enabledFields.results||[]).map(x=>String(x.id)));
+    const normalized={
+      transferDateFieldId:String(fieldConfig.transferDateFieldId||""),
+      sourceFieldId:String(fieldConfig.sourceFieldId||""),
+      lossFieldId:String(fieldConfig.lossFieldId||"")
+    };
+    for(const id of Object.values(normalized)){
+      if(id&&!valid.has(id))return fail("每日工作计划选择了已停用或不存在的登记字段，请刷新后重试");
+    }
+    await setSystemSetting(env,DAILY_PLAN_FIELD_SETTING_KEY,normalized);
+  }
+
+  const t=now();
+  const statements=[];
+  for(const item of items){
+    const salesUserId=String(item?.salesUserId||item?.id||"").trim();
+    if(!salesUserId)continue;
+    const sales=await env.DB.prepare(
+      "SELECT id FROM users WHERE id=? AND role='sales'"
+    ).bind(salesUserId).first();
+    if(!sales)return fail("业务员不存在或角色已改变，请刷新后重试",409);
+    const sendTime=String(item?.sendTime||"09:00").trim();
+    if(!dailyPlanValidTime(sendTime))return fail("业务员推送时间格式不正确，请使用 00:00–23:59");
+    const chatId=String(item?.chatId||"").trim().slice(0,120);
+    statements.push(env.DB.prepare(
+      `INSERT INTO daily_plan_settings(sales_user_id,enabled,send_time_beijing,chat_id,updated_at)
+       VALUES(?,?,?,?,?)
+       ON CONFLICT(sales_user_id) DO UPDATE SET
+         enabled=excluded.enabled,
+         send_time_beijing=excluded.send_time_beijing,
+         chat_id=excluded.chat_id,
+         updated_at=excluded.updated_at`
+    ).bind(salesUserId,item?.enabled?1:0,sendTime,chatId,t));
+  }
+  if(statements.length)await env.DB.batch(statements);
+  await audit(env,user,"update","daily_plan_settings",null,{
+    salespersonCount:statements.length,
+    fieldConfigChanged:!!fieldConfig,
+    timezone:"Asia/Shanghai"
+  });
+  return responseJson({ok:true,message:"每日工作计划设置已保存"});
+}
+
+async function dailyPlanPreview(request,env){
+  const body=await readBody(request);
+  const salesUserId=String(body?.salesUserId||"").trim();
+  if(!salesUserId)return fail("请选择业务员");
+  const plan=await dailyPlanBuild(env,salesUserId);
+  return responseJson({
+    ok:true,
+    salesperson:plan.sales.display_name||plan.sales.username,
+    customerCount:plan.customerCount,
+    messageCount:plan.messageCount,
+    preview:plan.customerCount
+      ?plan.plainMessages.join("\n\n──────── 分段 ────────\n\n")
+      :"今天没有正在跟进的客户，不会发送空日报。",
+    generatedAtBeijing:plan.generatedAtBeijing
+  });
+}
+
+async function dailyPlanEnqueue(env,salesUserId,{manual=false,planDate="",chatId=""}={}){
+  const tg=await telegramSettingsRow(env);
+  if(!tg?.bot_token_enc)return {ok:false,reason:"token_missing",queued:0};
+  const setting=await env.DB.prepare(
+    `SELECT d.*,u.active,u.display_name,u.username
+     FROM users u
+     LEFT JOIN daily_plan_settings d ON d.sales_user_id=u.id
+     WHERE u.id=? AND u.role='sales'`
+  ).bind(salesUserId).first();
+  if(!setting)return {ok:false,reason:"sales_missing",queued:0};
+
+  const targetChatId=String(chatId||setting.chat_id||tg.chat_id||"").trim();
+  if(!targetChatId)return {ok:false,reason:"chat_missing",queued:0};
+
+  const plan=await dailyPlanBuild(env,salesUserId);
+  if(!plan.customerCount)return {ok:true,empty:true,queued:0,plan,targetChatId};
+
+  const bj=dailyPlanBeijingParts();
+  const date=planDate||bj.date;
+  const event=manual?uid("manual_"):date;
+  let queued=0;
+  for(let i=0;i<plan.htmlMessages.length;i++){
+    const dedupeKey=manual
+      ?["dailyplan-manual",salesUserId,event,String(i+1)].join(":")
+      :["dailyplan",salesUserId,date,String(i+1)].join(":");
+    const result=await enqueueTelegramMessage(env,{
+      dedupeKey,
+      actorUserId:salesUserId,
+      chatId:targetChatId,
+      messageText:plan.htmlMessages[i]
+    });
+    if(result.inserted)queued++;
+  }
+  return {ok:true,queued,plan,targetChatId};
+}
+
+async function dailyPlanSendNow(request,env,user,ctx){
+  const body=await readBody(request);
+  const salesUserId=String(body?.salesUserId||"").trim();
+  if(!salesUserId)return fail("请选择业务员");
+
+  const bj=dailyPlanBeijingParts();
+  const existingRun=await env.DB.prepare(
+    "SELECT status,chat_id,message_count,delivered_count FROM daily_plan_runs WHERE sales_user_id=? AND plan_date=?"
+  ).bind(salesUserId,bj.date).first();
+
+  if(existingRun && ["queued","sending","retry","needs_admin"].includes(existingRun.status)){
+    const tg=await telegramSettingsRow(env);
+    if(!tg?.bot_token_enc)return fail("请先在 Telegram 通知功能中保存 Bot Token",409);
+    const setting=await env.DB.prepare(
+      "SELECT chat_id FROM daily_plan_settings WHERE sales_user_id=?"
+    ).bind(salesUserId).first();
+    const targetChatId=String(setting?.chat_id||tg.chat_id||existingRun.chat_id||"").trim();
+    if(!targetChatId)return fail("请先给该业务员填写 Telegram 群 ID，或在 Telegram 通知中设置默认群",409);
+
+    const prefix=["dailyplan",salesUserId,bj.date,""].join(":");
+    const queuedRow=await env.DB.prepare(
+      "SELECT COUNT(*) n FROM telegram_send_queue WHERE instr(dedupe_key,?)=1"
+    ).bind(prefix).first();
+
+    if(Number(queuedRow?.n||0)>0){
+      if(existingRun.status==="retry"||existingRun.status==="needs_admin"){
+        const t=now();
+        await env.DB.prepare(
+          `UPDATE telegram_send_queue
+           SET chat_id=?,status='retry',attempts=CASE WHEN COALESCE(requires_admin,0)=1 THEN 0 ELSE attempts END,
+               next_attempt_at=?,locked_until=NULL,requires_admin=0,dead_lettered_at=NULL,
+               last_error='管理员从每日工作计划页面要求立即重试',updated_at=?
+           WHERE instr(dedupe_key,?)=1 AND status IN ('pending','retry','sending')`
+        ).bind(targetChatId,t,t,prefix).run();
+        await env.DB.prepare(
+          `UPDATE daily_plan_runs
+           SET status='retry',chat_id=?,error_text='',updated_at=?
+           WHERE sales_user_id=? AND plan_date=?`
+        ).bind(targetChatId,t,salesUserId,bj.date).run();
+      }
+
+      await audit(env,user,"retry","daily_plan",salesUserId,{
+        planDate:bj.date,
+        previousStatus:existingRun.status,
+        queuedMessages:Number(queuedRow?.n||0),
+        chatId:targetChatId
+      });
+      const existingJob=processTelegramQueue(env,{maxItems:4,maxRunMs:10000,allowShortWait:false}).catch(()=>{});
+      if(ctx?.waitUntil)ctx.waitUntil(existingJob);
+      else await existingJob;
+      return responseJson({
+        ok:true,
+        resumed:true,
+        queued:Number(queuedRow?.n||0),
+        message:"今日计划已经在发送队列中，系统已优先继续处理，不会重复生成一份"
+      });
+    }
+  }
+
+  const result=await dailyPlanEnqueue(env,salesUserId,{manual:true});
+  const reasonMap={
+    token_missing:"请先在 Telegram 通知功能中保存 Bot Token",
+    chat_missing:"请先给该业务员填写 Telegram 群 ID，或在 Telegram 通知中设置默认群",
+    sales_missing:"业务员不存在"
+  };
+  if(!result.ok)return fail(reasonMap[result.reason]||"当前无法生成工作计划",409);
+  if(result.empty){
+    return responseJson({ok:true,empty:true,queued:0,message:"这名业务员当前没有正在跟进的客户，没有发送空日报"});
+  }
+  await audit(env,user,"send_now","daily_plan",salesUserId,{
+    queued:result.queued,
+    customerCount:result.plan.customerCount,
+    messageCount:result.plan.messageCount,
+    chatId:result.targetChatId
+  });
+  const job=processTelegramQueue(env,{maxItems:4,maxRunMs:10000,allowShortWait:false}).catch(()=>{});
+  if(ctx?.waitUntil)ctx.waitUntil(job);
+  else await job;
+  return responseJson({
+    ok:true,
+    queued:result.queued,
+    customerCount:result.plan.customerCount,
+    messageCount:result.plan.messageCount,
+    message:"工作计划已进入 Telegram 可靠发送队列"
+  });
+}
+
+async function processDueDailyPlans(env,{maxSales=3}={}){
+  const tg=await telegramSettingsRow(env);
+  if(!tg?.bot_token_enc)return {processed:0,reason:"token_missing"};
+  const bj=dailyPlanBeijingParts();
+  const due=await env.DB.prepare(
+    `SELECT d.sales_user_id,d.send_time_beijing,d.chat_id,u.display_name,u.username
+     FROM daily_plan_settings d
+     JOIN users u ON u.id=d.sales_user_id AND u.role='sales' AND u.active=1
+     LEFT JOIN daily_plan_runs r
+       ON r.sales_user_id=d.sales_user_id AND r.plan_date=?
+     WHERE d.enabled=1 AND d.send_time_beijing<=? AND r.sales_user_id IS NULL
+     ORDER BY d.send_time_beijing,d.sales_user_id
+     LIMIT ?`
+  ).bind(bj.date,bj.time,Math.max(1,Math.min(10,Number(maxSales)||3))).all();
+
+  let processed=0;
+  for(const setting of due.results||[]){
+    const targetChatId=String(setting.chat_id||tg.chat_id||"").trim();
+    if(!targetChatId)continue;
+
+    const t=now();
+    const claim=await env.DB.prepare(
+      `INSERT OR IGNORE INTO daily_plan_runs(
+         sales_user_id,plan_date,status,chat_id,customer_count,message_count,
+         delivered_count,queued_at,updated_at,error_text
+       ) VALUES(?,?,'sending',?,0,0,0,?,?, '')`
+    ).bind(setting.sales_user_id,bj.date,targetChatId,t,t).run();
+    if(Number(claim?.meta?.changes||0)!==1)continue;
+
+    try{
+      const result=await dailyPlanEnqueue(env,setting.sales_user_id,{
+        manual:false,planDate:bj.date,chatId:targetChatId
+      });
+      if(!result.ok){
+        await env.DB.prepare(
+          "DELETE FROM daily_plan_runs WHERE sales_user_id=? AND plan_date=?"
+        ).bind(setting.sales_user_id,bj.date).run();
+        continue;
+      }
+      if(result.empty){
+        await env.DB.prepare(
+          `UPDATE daily_plan_runs
+           SET status='empty',customer_count=0,message_count=0,delivered_count=0,
+               error_text='',updated_at=?
+           WHERE sales_user_id=? AND plan_date=?`
+        ).bind(now(),setting.sales_user_id,bj.date).run();
+      }else{
+        await env.DB.prepare(
+          `UPDATE daily_plan_runs
+           SET status='queued',customer_count=?,message_count=?,delivered_count=0,
+               error_text='',updated_at=?
+           WHERE sales_user_id=? AND plan_date=?`
+        ).bind(
+          result.plan.customerCount,result.plan.messageCount,now(),
+          setting.sales_user_id,bj.date
+        ).run();
+      }
+      processed++;
+    }catch(e){
+      await env.DB.prepare(
+        "DELETE FROM daily_plan_runs WHERE sales_user_id=? AND plan_date=?"
+      ).bind(setting.sales_user_id,bj.date).run();
+    }
+  }
+  return {processed,date:bj.date,time:bj.time};
 }
 
 async function telegramAdminGet(env){
@@ -3961,6 +4474,26 @@ async function importChunk(request,env,user){
        ON CONFLICT(progress_id) DO UPDATE SET
         route_mode=excluded.route_mode,chat_id=excluded.chat_id,updated_at=excluded.updated_at`
     ).bind(x.progress_id,x.route_mode,x.chat_id,x.updated_at||t,x.progress_id));
+  } else if(section==="dailyPlanSettings"){
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO daily_plan_settings(sales_user_id,enabled,send_time_beijing,chat_id,updated_at)
+       SELECT id,?,?,?,?
+       FROM users
+       WHERE role='sales' AND (id=? OR username=?)
+       ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END
+       LIMIT 1
+       ON CONFLICT(sales_user_id) DO UPDATE SET
+         enabled=excluded.enabled,
+         send_time_beijing=excluded.send_time_beijing,
+         chat_id=excluded.chat_id,
+         updated_at=excluded.updated_at`
+    ).bind(
+      x.enabled?1:0,
+      /^([01]\d|2[0-3]):[0-5]\d$/.test(String(x.send_time_beijing||""))?String(x.send_time_beijing):"09:00",
+      String(x.chat_id||""),
+      x.updated_at||t,
+      x.sales_user_id,String(x.sales_username||""),x.sales_user_id
+    ));
   } else if(section==="auditLogs"){
     for(const x of rows)stmts.push(env.DB.prepare(
       `INSERT INTO audit_logs(id,actor_user_id,action,entity_type,entity_id,detail_json,created_at)
@@ -4161,7 +4694,7 @@ async function exportBusinessData(env,user){
 const BACKUP_V3_SECTIONS=[
   "users","customers","fieldDefinitions","customerValues","progressDefinitions","customerProgress",
   "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets",
-  "systemSettings","telegramSettings","telegramProgressRoutes","auditLogs","telegramDeliveryLogs"
+  "systemSettings","telegramSettings","telegramProgressRoutes","dailyPlanSettings","auditLogs","telegramDeliveryLogs"
 ];
 
 // V3 exports span multiple HTTP requests. Capture a stable rowid upper bound for
@@ -4182,6 +4715,7 @@ const BACKUP_V3_ROWID_BOUNDARIES={
   systemSettings:{table:"system_settings",ref:"system_settings.rowid"},
   telegramSettings:{table:"telegram_settings",ref:"telegram_settings.rowid"},
   telegramProgressRoutes:{table:"telegram_progress_routes",ref:"telegram_progress_routes.rowid"},
+  dailyPlanSettings:{table:"daily_plan_settings",ref:"dps.rowid"},
   auditLogs:{table:"audit_logs",ref:"a.rowid"},
   telegramDeliveryLogs:{table:"telegram_delivery_logs",ref:"l.rowid"}
 };
@@ -4263,6 +4797,13 @@ function backupSectionSpec(section){
       count:"SELECT COUNT(*) n FROM telegram_progress_routes",
       sql:"SELECT * FROM telegram_progress_routes ORDER BY progress_id LIMIT ? OFFSET ?"
     },
+    dailyPlanSettings:{
+      count:"SELECT COUNT(*) n FROM daily_plan_settings",
+      sql:`SELECT dps.*,u.username sales_username
+           FROM daily_plan_settings dps
+           LEFT JOIN users u ON u.id=dps.sales_user_id
+           ORDER BY dps.sales_user_id LIMIT ? OFFSET ?`
+    },
     auditLogs:{
       count:"SELECT COUNT(*) n FROM audit_logs",
       sql:`SELECT a.*,u.username actor_username
@@ -4311,7 +4852,7 @@ async function exportBackupManifest(env,user){
       chunkSize:1000,
       excluded:[
         "password_hashes","password_salts","login_sessions","bootstrap_token",
-        "telegram_bot_token","telegram_send_queue","telegram_chat_rate"
+        "telegram_bot_token","telegram_send_queue","telegram_chat_rate","daily_plan_runs"
       ],
       securityNote:"账号密码、登录会话、Bootstrap Token 和 Telegram Bot Token 不进入备份。恢复的账号需要重新设置密码后启用。"
     }
@@ -4620,6 +5161,10 @@ async function api(request, env, ctx) {
   }
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
+  if (path === "/api/admin/daily-plans" && method === "GET") return dailyPlanAdminGet(env);
+  if (path === "/api/admin/daily-plans" && method === "PUT") return dailyPlanAdminSave(request,env,user);
+  if (path === "/api/admin/daily-plans/preview" && method === "POST") return dailyPlanPreview(request,env);
+  if (path === "/api/admin/daily-plans/send-now" && method === "POST") return dailyPlanSendNow(request,env,user,ctx);
   if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
   if (path === "/api/admin/telegram/unresolved" && method === "GET") return responseJson({ok:true,...await telegramUnresolvedAdminGet(env)});
   if (path === "/api/admin/telegram/retry-failed-batch" && method === "POST") return retryFailedTelegramBatch(request,env,user,ctx);
@@ -4681,6 +5226,7 @@ export default {
 
   async scheduled(controller,env,ctx){
     const job=(async()=>{
+      await processDueDailyPlans(env,{maxSales:3}).catch(()=>{});
       await processTelegramQueue(env,{
         maxItems:12,
         maxRunMs:36000,
