@@ -1061,6 +1061,118 @@ async function dailyPlanFieldState(env){
   return {fields,config};
 }
 
+async function dailyPlanBuild(env,salesUserId){
+  const sales=await env.DB.prepare(
+    "SELECT id,username,display_name,active FROM users WHERE id=? AND role='sales'"
+  ).bind(salesUserId).first();
+  if(!sales)throw new Error("业务员不存在");
+
+  const [customerResult,progressResult,doneResult,fieldState]=await Promise.all([
+    env.DB.prepare(
+      `SELECT id,name,created_at,updated_at,progress_done,progress_total,progress_percent
+       FROM customers
+       WHERE assigned_user_id=? AND deleted_at IS NULL AND archived=0
+       ORDER BY created_at,id`
+    ).bind(salesUserId).all(),
+    env.DB.prepare(
+      "SELECT id,label,sort_order FROM progress_definitions WHERE enabled=1 ORDER BY sort_order,label"
+    ).all(),
+    env.DB.prepare(
+      `SELECT cp.customer_id,cp.progress_id
+       FROM customer_progress cp
+       JOIN customers c ON c.id=cp.customer_id
+       JOIN progress_definitions pd ON pd.id=cp.progress_id AND pd.enabled=1
+       WHERE c.assigned_user_id=? AND c.deleted_at IS NULL AND c.archived=0 AND cp.completed=1`
+    ).bind(salesUserId).all(),
+    dailyPlanFieldState(env)
+  ]);
+
+  const customers=customerResult.results||[];
+  const progressDefs=progressResult.results||[];
+  const completedByCustomer=new Map();
+  for(const row of doneResult.results||[]){
+    if(!completedByCustomer.has(row.customer_id))completedByCustomer.set(row.customer_id,new Set());
+    completedByCustomer.get(row.customer_id).add(row.progress_id);
+  }
+
+  const cfg=fieldState.config;
+  const fieldIds=[
+    String(cfg.transferDateFieldId||""),
+    String(cfg.sourceFieldId||""),
+    String(cfg.lossFieldId||"")
+  ];
+  const valuesByCustomer=new Map();
+  if(fieldIds.some(Boolean)){
+    const values=await env.DB.prepare(
+      `SELECT cv.customer_id,cv.field_id,cv.value
+       FROM customer_values cv
+       JOIN customers c ON c.id=cv.customer_id
+       WHERE c.assigned_user_id=? AND c.deleted_at IS NULL AND c.archived=0
+         AND cv.field_id IN (?,?,?)`
+    ).bind(salesUserId,fieldIds[0],fieldIds[1],fieldIds[2]).all();
+    for(const row of values.results||[]){
+      if(!valuesByCustomer.has(row.customer_id))valuesByCustomer.set(row.customer_id,{});
+      valuesByCustomer.get(row.customer_id)[row.field_id]=row.value||"";
+    }
+  }
+
+  const blocks=[];
+  for(let i=0;i<customers.length;i++){
+    const customer=customers[i];
+    const done=completedByCustomer.get(customer.id)||new Set();
+    let current=null,next=null;
+    for(const progress of progressDefs){
+      if(done.has(progress.id))current=progress;
+      else if(!next)next=progress;
+    }
+    const custom=valuesByCustomer.get(customer.id)||{};
+    blocks.push(
+      "【"+(i+1)+"】\n"+
+      "客户姓名："+dailyPlanCleanValue(customer.name,160)+"\n"+
+      "转主号日期："+dailyPlanCleanValue(custom[fieldIds[0]],220)+"\n"+
+      "客户来源："+dailyPlanCleanValue(custom[fieldIds[1]],220)+"\n"+
+      "损失本金："+dailyPlanCleanValue(custom[fieldIds[2]],220)+"\n"+
+      "当前进度："+dailyPlanCleanValue(current?.label||"未开始",220)+"\n"+
+      "下一步进度："+dailyPlanCleanValue(next?.label||"已全部完成",220)
+    );
+  }
+
+  const bj=dailyPlanBeijingParts();
+  const baseHeader=
+    "📋 每日客户工作计划\n"+
+    "日期："+bj.date+"\n"+
+    "业务员："+dailyPlanCleanValue(sales.display_name||sales.username,120)+"\n"+
+    "客户数量："+customers.length;
+  const footer="共 "+customers.length+" 位客户\n生成时间："+bj.time+"（北京时间）";
+  const maxChars=3400;
+  const groups=[];
+  let group=[];
+  for(const block of blocks){
+    const trial=baseHeader+"\n\n"+group.concat([block]).join("\n\n")+"\n\n"+footer;
+    if(group.length && trial.length>maxChars){
+      groups.push(group);
+      group=[block];
+    }else{
+      group.push(block);
+    }
+  }
+  if(group.length)groups.push(group);
+
+  const plainMessages=groups.map((items,index)=>{
+    const part=groups.length>1?"\n分段："+(index+1)+"/"+groups.length:"";
+    return baseHeader+part+"\n\n"+items.join("\n\n")+"\n\n"+footer;
+  });
+  return {
+    sales,
+    customerCount:customers.length,
+    messageCount:plainMessages.length,
+    plainMessages,
+    htmlMessages:plainMessages.map(x=>telegramHtmlEscape(x)),
+    fieldConfig:cfg,
+    generatedAtBeijing:bj.dateTime
+  };
+}
+
 async function telegramAdminGet(env){
   const row=await telegramSettingsRow(env);
   const normalizedTemplate=await normalizeTelegramTemplateTokens(env);
