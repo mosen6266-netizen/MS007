@@ -802,7 +802,7 @@ async function telegramQueueMonitor(env){
 
 async function retryTelegramQueueItem(env,user,id,ctx){
   const row=await env.DB.prepare(
-    "SELECT id,status,requires_admin,last_error,locked_until FROM telegram_send_queue WHERE id=?"
+    "SELECT id,dedupe_key,status,requires_admin,last_error,locked_until FROM telegram_send_queue WHERE id=?"
   ).bind(id).first();
   if(!row)return fail("这条 Telegram 消息已经不存在，可能已经发送成功",404);
   if(row.status==="sending" && row.locked_until && Date.parse(String(row.locked_until))>Date.now()){
@@ -825,6 +825,7 @@ async function retryTelegramQueueItem(env,user,id,ctx){
     id
   ).run();
   if(Number(result?.meta?.changes||0)!==1)return fail("这条消息状态刚刚发生变化，请刷新后重试",409);
+  await dailyPlanMarkQueueState(env,row,"retry",row.last_error||"管理员要求立即重试");
   await audit(env,user,"retry","telegram_queue",id,{
     previousStatus:row.status,
     previousRequiresAdmin:wasAdmin,
@@ -860,6 +861,11 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
       "Token 无法解密，需要管理员重新保存 Telegram Bot Token 后手动重试",
       t
     ).run();
+    await env.DB.prepare(
+      `UPDATE daily_plan_runs
+       SET status='needs_admin',error_text=?,updated_at=?
+       WHERE status IN ('queued','sending','retry')`
+    ).bind("Telegram Bot Token 无法解密，需要管理员重新保存 Token",t).run();
     return {processed,reason:"token"};
   }
 
@@ -918,6 +924,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
        )`
     ).bind(lockUntil,current,task.id,current,current).run();
     if(Number(claim?.meta?.changes||0)!==1)continue;
+    await dailyPlanMarkQueueState(env,task,"sending");
 
     const globalLease=await acquireTelegramChatLease(env,"__bot_global__",1);
     if(!globalLease.acquired){
@@ -930,6 +937,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
          SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
          WHERE id=?`
       ).bind(retryAt,"Telegram 全局发送正在安全限速，系统会自动发送",now(),task.id).run();
+      await dailyPlanMarkQueueState(env,task,"retry","Telegram 全局发送正在安全限速");
       continue;
     }
 
@@ -944,6 +952,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
          SET status='retry',next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
          WHERE id=?`
       ).bind(retryAt,"同一群组正在安全限速排队，系统会自动发送",now(),task.id).run();
+      await dailyPlanMarkQueueState(env,task,"retry","同一群组正在安全限速排队");
       continue;
     }
 
@@ -961,6 +970,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
         status:"success",
         error:"群 "+task.chat_id
       });
+      await dailyPlanMarkQueueState(env,task,"success");
       await env.DB.prepare("DELETE FROM telegram_send_queue WHERE id=?").bind(task.id).run();
       processed++;
     }catch(e){
@@ -978,6 +988,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
            SET status='retry',attempts=?,next_attempt_at=?,locked_until=NULL,last_error=?,updated_at=?
            WHERE id=?`
         ).bind(attempts,retryAt,String(reason).slice(0,1000),now(),task.id).run();
+        await dailyPlanMarkQueueState(env,task,"retry",reason);
       }else{
         const t=now();
         const reason=retryable
@@ -1003,6 +1014,7 @@ async function processTelegramQueue(env,{maxItems=8,maxRunMs=12000,allowShortWai
           t,
           task.id
         ).run();
+        await dailyPlanMarkQueueState(env,task,"needs_admin",reason);
       }
       processed++;
     }
@@ -4407,6 +4419,26 @@ async function importChunk(request,env,user){
        ON CONFLICT(progress_id) DO UPDATE SET
         route_mode=excluded.route_mode,chat_id=excluded.chat_id,updated_at=excluded.updated_at`
     ).bind(x.progress_id,x.route_mode,x.chat_id,x.updated_at||t,x.progress_id));
+  } else if(section==="dailyPlanSettings"){
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO daily_plan_settings(sales_user_id,enabled,send_time_beijing,chat_id,updated_at)
+       SELECT id,?,?,?,?
+       FROM users
+       WHERE role='sales' AND (id=? OR username=?)
+       ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END
+       LIMIT 1
+       ON CONFLICT(sales_user_id) DO UPDATE SET
+         enabled=excluded.enabled,
+         send_time_beijing=excluded.send_time_beijing,
+         chat_id=excluded.chat_id,
+         updated_at=excluded.updated_at`
+    ).bind(
+      x.enabled?1:0,
+      /^([01]\d|2[0-3]):[0-5]\d$/.test(String(x.send_time_beijing||""))?String(x.send_time_beijing):"09:00",
+      String(x.chat_id||""),
+      x.updated_at||t,
+      x.sales_user_id,String(x.sales_username||""),x.sales_user_id
+    ));
   } else if(section==="auditLogs"){
     for(const x of rows)stmts.push(env.DB.prepare(
       `INSERT INTO audit_logs(id,actor_user_id,action,entity_type,entity_id,detail_json,created_at)
@@ -4607,7 +4639,7 @@ async function exportBusinessData(env,user){
 const BACKUP_V3_SECTIONS=[
   "users","customers","fieldDefinitions","customerValues","progressDefinitions","customerProgress",
   "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets",
-  "systemSettings","telegramSettings","telegramProgressRoutes","auditLogs","telegramDeliveryLogs"
+  "systemSettings","telegramSettings","telegramProgressRoutes","dailyPlanSettings","auditLogs","telegramDeliveryLogs"
 ];
 
 // V3 exports span multiple HTTP requests. Capture a stable rowid upper bound for
@@ -4628,6 +4660,7 @@ const BACKUP_V3_ROWID_BOUNDARIES={
   systemSettings:{table:"system_settings",ref:"system_settings.rowid"},
   telegramSettings:{table:"telegram_settings",ref:"telegram_settings.rowid"},
   telegramProgressRoutes:{table:"telegram_progress_routes",ref:"telegram_progress_routes.rowid"},
+  dailyPlanSettings:{table:"daily_plan_settings",ref:"dps.rowid"},
   auditLogs:{table:"audit_logs",ref:"a.rowid"},
   telegramDeliveryLogs:{table:"telegram_delivery_logs",ref:"l.rowid"}
 };
@@ -4709,6 +4742,13 @@ function backupSectionSpec(section){
       count:"SELECT COUNT(*) n FROM telegram_progress_routes",
       sql:"SELECT * FROM telegram_progress_routes ORDER BY progress_id LIMIT ? OFFSET ?"
     },
+    dailyPlanSettings:{
+      count:"SELECT COUNT(*) n FROM daily_plan_settings",
+      sql:`SELECT dps.*,u.username sales_username
+           FROM daily_plan_settings dps
+           LEFT JOIN users u ON u.id=dps.sales_user_id
+           ORDER BY dps.sales_user_id LIMIT ? OFFSET ?`
+    },
     auditLogs:{
       count:"SELECT COUNT(*) n FROM audit_logs",
       sql:`SELECT a.*,u.username actor_username
@@ -4757,7 +4797,7 @@ async function exportBackupManifest(env,user){
       chunkSize:1000,
       excluded:[
         "password_hashes","password_salts","login_sessions","bootstrap_token",
-        "telegram_bot_token","telegram_send_queue","telegram_chat_rate"
+        "telegram_bot_token","telegram_send_queue","telegram_chat_rate","daily_plan_runs"
       ],
       securityNote:"账号密码、登录会话、Bootstrap Token 和 Telegram Bot Token 不进入备份。恢复的账号需要重新设置密码后启用。"
     }
@@ -5066,6 +5106,10 @@ async function api(request, env, ctx) {
   }
 
   if (path === "/api/admin/capacity" && method === "GET") return capacity(env);
+  if (path === "/api/admin/daily-plans" && method === "GET") return dailyPlanAdminGet(env);
+  if (path === "/api/admin/daily-plans" && method === "PUT") return dailyPlanAdminSave(request,env,user);
+  if (path === "/api/admin/daily-plans/preview" && method === "POST") return dailyPlanPreview(request,env);
+  if (path === "/api/admin/daily-plans/send-now" && method === "POST") return dailyPlanSendNow(request,env,user,ctx);
   if (path === "/api/admin/telegram" && method === "GET") return telegramAdminGet(env);
   if (path === "/api/admin/telegram/unresolved" && method === "GET") return responseJson({ok:true,...await telegramUnresolvedAdminGet(env)});
   if (path === "/api/admin/telegram/retry-failed-batch" && method === "POST") return retryFailedTelegramBatch(request,env,user,ctx);
@@ -5127,6 +5171,7 @@ export default {
 
   async scheduled(controller,env,ctx){
     const job=(async()=>{
+      await processDueDailyPlans(env,{maxSales:3}).catch(()=>{});
       await processTelegramQueue(env,{
         maxItems:12,
         maxRunMs:36000,
