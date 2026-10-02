@@ -4164,6 +4164,35 @@ const BACKUP_V3_SECTIONS=[
   "systemSettings","telegramSettings","telegramProgressRoutes","auditLogs","telegramDeliveryLogs"
 ];
 
+// V3 exports span multiple HTTP requests. Capture a stable rowid upper bound for
+// every section so rows created while an export is running belong to the next
+// backup rather than changing the current backup's record counts.
+const BACKUP_V3_ROWID_BOUNDARIES={
+  users:{table:"users",ref:"users.rowid"},
+  customers:{table:"customers",ref:"c.rowid"},
+  fieldDefinitions:{table:"field_definitions",ref:"field_definitions.rowid"},
+  customerValues:{table:"customer_values",ref:"cv.rowid"},
+  progressDefinitions:{table:"progress_definitions",ref:"progress_definitions.rowid"},
+  customerProgress:{table:"customer_progress",ref:"cp.rowid"},
+  sidebarCategories:{table:"sidebar_categories",ref:"sidebar_categories.rowid"},
+  sidebarItems:{table:"sidebar_items",ref:"sidebar_items.rowid"},
+  sidebarItemCategories:{table:"sidebar_item_categories",ref:"sidebar_item_categories.rowid"},
+  listColumns:{table:"list_columns",ref:"list_columns.rowid"},
+  dashboardWidgets:{table:"dashboard_widgets",ref:"dashboard_widgets.rowid"},
+  systemSettings:{table:"system_settings",ref:"system_settings.rowid"},
+  telegramSettings:{table:"telegram_settings",ref:"telegram_settings.rowid"},
+  telegramProgressRoutes:{table:"telegram_progress_routes",ref:"telegram_progress_routes.rowid"},
+  auditLogs:{table:"audit_logs",ref:"a.rowid"},
+  telegramDeliveryLogs:{table:"telegram_delivery_logs",ref:"l.rowid"}
+};
+
+function backupSectionSqlWithBoundary(sql,boundaryRef){
+  const upper=String(sql||"").toUpperCase();
+  const orderPos=upper.lastIndexOf("ORDER BY");
+  if(orderPos<0)throw new Error("备份查询缺少稳定排序");
+  return sql.slice(0,orderPos)+"WHERE "+boundaryRef+"<=?\n           "+sql.slice(orderPos);
+}
+
 function backupSectionSpec(section){
   const specs={
     users:{
@@ -4253,13 +4282,22 @@ function backupSectionSpec(section){
 async function exportBackupManifest(env,user){
   const sections={};
   for(const section of BACKUP_V3_SECTIONS){
-    const spec=backupSectionSpec(section);
-    const row=await env.DB.prepare(spec.count).first();
-    sections[section]={count:Number(row?.n||0)};
+    const boundary=BACKUP_V3_ROWID_BOUNDARIES[section];
+    if(!boundary)throw new Error("备份数据部分缺少快照边界："+section);
+    const row=await env.DB.prepare(
+      `SELECT COUNT(*) n,COALESCE(MAX(rowid),0) max_rowid FROM ${boundary.table}`
+    ).first();
+    sections[section]={
+      count:Number(row?.n||0),
+      maxRowid:Number(row?.max_rowid||0)
+    };
   }
   const recordTotal=Object.values(sections).reduce((n,x)=>n+Number(x.count||0),0);
   const exportedAt=now();
-  await audit(env,user,"export_manifest","business_data",null,{version:3,recordTotal,sections});
+  // This audit row is intentionally written after the rowid boundaries above.
+  // It belongs to the next backup snapshot and therefore cannot change this
+  // export's auditLogs count while the client is downloading chunks.
+  await audit(env,user,"export_manifest","business_data",null,{version:3,recordTotal});
   return responseJson({
     ok:true,
     format:"MS007-BUSINESS-BACKUP",
@@ -4284,13 +4322,21 @@ async function exportBackupSection(request,env){
   const url=new URL(request.url);
   const section=String(url.searchParams.get("section")||"");
   const spec=backupSectionSpec(section);
-  if(!spec)return fail("未知的备份数据部分");
+  const boundary=BACKUP_V3_ROWID_BOUNDARIES[section];
+  if(!spec||!boundary)return fail("未知的备份数据部分");
   const offset=safeInt(url.searchParams.get("offset"),0,0,2000000000);
   const limit=safeInt(url.searchParams.get("limit"),500,1,1000);
-  const r=await env.DB.prepare(spec.sql).bind(limit,offset).all();
+  const rawMaxRowid=url.searchParams.get("maxRowid");
+  const hasBoundary=rawMaxRowid!==null && /^\d+$/.test(String(rawMaxRowid));
+  const maxRowid=hasBoundary?Number(rawMaxRowid):null;
+  const sql=hasBoundary?backupSectionSqlWithBoundary(spec.sql,boundary.ref):spec.sql;
+  const r=hasBoundary
+    ?await env.DB.prepare(sql).bind(maxRowid,limit,offset).all()
+    :await env.DB.prepare(sql).bind(limit,offset).all();
   const items=r.results||[];
   return responseJson({
     ok:true,section,offset,limit,items,
+    snapshotMaxRowid:maxRowid,
     nextOffset:items.length===limit?offset+items.length:null
   });
 }
