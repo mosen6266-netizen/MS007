@@ -1253,6 +1253,75 @@ async function dailyPlanAdminGet(env){
   });
 }
 
+async function dailyPlanAdminSave(request,env,user){
+  const body=await readBody(request);
+  const items=Array.isArray(body?.items)?body.items.slice(0,500):[];
+  const fieldConfig=body?.fieldConfig&&typeof body.fieldConfig==="object"?body.fieldConfig:null;
+
+  if(fieldConfig){
+    const enabledFields=await env.DB.prepare(
+      "SELECT id FROM field_definitions WHERE enabled=1"
+    ).all();
+    const valid=new Set((enabledFields.results||[]).map(x=>String(x.id)));
+    const normalized={
+      transferDateFieldId:String(fieldConfig.transferDateFieldId||""),
+      sourceFieldId:String(fieldConfig.sourceFieldId||""),
+      lossFieldId:String(fieldConfig.lossFieldId||"")
+    };
+    for(const id of Object.values(normalized)){
+      if(id&&!valid.has(id))return fail("每日工作计划选择了已停用或不存在的登记字段，请刷新后重试");
+    }
+    await setSystemSetting(env,DAILY_PLAN_FIELD_SETTING_KEY,normalized);
+  }
+
+  const t=now();
+  const statements=[];
+  for(const item of items){
+    const salesUserId=String(item?.salesUserId||item?.id||"").trim();
+    if(!salesUserId)continue;
+    const sales=await env.DB.prepare(
+      "SELECT id FROM users WHERE id=? AND role='sales'"
+    ).bind(salesUserId).first();
+    if(!sales)return fail("业务员不存在或角色已改变，请刷新后重试",409);
+    const sendTime=String(item?.sendTime||"09:00").trim();
+    if(!dailyPlanValidTime(sendTime))return fail("业务员推送时间格式不正确，请使用 00:00–23:59");
+    const chatId=String(item?.chatId||"").trim().slice(0,120);
+    statements.push(env.DB.prepare(
+      `INSERT INTO daily_plan_settings(sales_user_id,enabled,send_time_beijing,chat_id,updated_at)
+       VALUES(?,?,?,?,?)
+       ON CONFLICT(sales_user_id) DO UPDATE SET
+         enabled=excluded.enabled,
+         send_time_beijing=excluded.send_time_beijing,
+         chat_id=excluded.chat_id,
+         updated_at=excluded.updated_at`
+    ).bind(salesUserId,item?.enabled?1:0,sendTime,chatId,t));
+  }
+  if(statements.length)await env.DB.batch(statements);
+  await audit(env,user,"update","daily_plan_settings",null,{
+    salespersonCount:statements.length,
+    fieldConfigChanged:!!fieldConfig,
+    timezone:"Asia/Shanghai"
+  });
+  return responseJson({ok:true,message:"每日工作计划设置已保存"});
+}
+
+async function dailyPlanPreview(request,env){
+  const body=await readBody(request);
+  const salesUserId=String(body?.salesUserId||"").trim();
+  if(!salesUserId)return fail("请选择业务员");
+  const plan=await dailyPlanBuild(env,salesUserId);
+  return responseJson({
+    ok:true,
+    salesperson:plan.sales.display_name||plan.sales.username,
+    customerCount:plan.customerCount,
+    messageCount:plan.messageCount,
+    preview:plan.customerCount
+      ?plan.plainMessages.join("\n\n──────── 分段 ────────\n\n")
+      :"今天没有正在跟进的客户，不会发送空日报。",
+    generatedAtBeijing:plan.generatedAtBeijing
+  });
+}
+
 async function telegramAdminGet(env){
   const row=await telegramSettingsRow(env);
   const normalizedTemplate=await normalizeTelegramTemplateTokens(env);
