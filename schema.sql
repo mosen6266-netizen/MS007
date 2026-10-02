@@ -265,6 +265,40 @@ INSERT OR IGNORE INTO telegram_settings
 VALUES
 (1,0,'','','','[{"key":"sales_name","label":"业务员"},{"key":"customer_name","label":"客户姓名"},{"key":"completed_progress","label":"已完成进度"},{"key":"next_progress","label":"下一步进度"},{"key":"progress_percent","label":"当前完成度"}]',0,'查看客户详情',datetime('now'));
 
+
+
+-- Independent daily Telegram work-plan scheduling.
+-- This feature reuses the existing encrypted Bot Token and reliable send queue,
+-- but keeps per-salesperson schedule/group settings separate from progress notifications.
+CREATE TABLE IF NOT EXISTS daily_plan_settings (
+  sales_user_id TEXT PRIMARY KEY,
+  enabled INTEGER NOT NULL DEFAULT 0,
+  send_time_beijing TEXT NOT NULL DEFAULT '09:00',
+  chat_id TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL,
+  FOREIGN KEY (sales_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_daily_plan_settings_due
+ON daily_plan_settings(enabled,send_time_beijing,sales_user_id);
+
+CREATE TABLE IF NOT EXISTS daily_plan_runs (
+  sales_user_id TEXT NOT NULL,
+  plan_date TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued'
+    CHECK (status IN ('queued','sending','retry','success','empty','needs_admin','failed')),
+  chat_id TEXT NOT NULL DEFAULT '',
+  customer_count INTEGER NOT NULL DEFAULT 0,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  delivered_count INTEGER NOT NULL DEFAULT 0,
+  queued_at TEXT,
+  updated_at TEXT NOT NULL,
+  error_text TEXT NOT NULL DEFAULT '',
+  PRIMARY KEY (sales_user_id,plan_date),
+  FOREIGN KEY (sales_user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_daily_plan_runs_date_status
+ON daily_plan_runs(plan_date,status,updated_at);
+
 CREATE TABLE IF NOT EXISTS telegram_progress_routes (
   progress_id TEXT PRIMARY KEY,
   route_mode TEXT NOT NULL CHECK (route_mode IN ('replace','additional')),
@@ -326,6 +360,10 @@ CREATE TABLE IF NOT EXISTS telegram_chat_rate (
 INSERT OR IGNORE INTO sidebar_items
 (id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
 ('sa_telegram','admin','Telegram 通知','link','#/admin/telegram','same',1,75,'通知',datetime('now'),datetime('now'));
+
+INSERT OR IGNORE INTO sidebar_items
+(id,audience,label,icon,url,target,enabled,sort_order,group_label,created_at,updated_at) VALUES
+('sa_daily_plan','admin','每日工作计划','calendar','#/admin/daily-plan','same',1,76,'通知',datetime('now'),datetime('now'));
 
 
 -- Preserve existing sidebar group labels as real categories without changing any existing item.
