@@ -1,0 +1,67 @@
+name: Build MS007 New Account Recovery Package
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [recovery-package-20261002]
+    paths:
+      - "scripts/build-recovery-package.py"
+      - ".github/workflows/build-recovery-package.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout recovery build branch
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Source syntax checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check public/app.js
+          cp src/worker.js /tmp/worker.mjs
+          node --check /tmp/worker.mjs
+          python -m py_compile scripts/build-recovery-package.py
+
+      - name: Core regression checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python tests/batch1_integrity.py
+          python tests/batch2_integrity.py
+          python tests/batch3_backup_v3.py
+          python tests/batch4_performance.py
+          python tests/batch5_reliability.py
+          python tests/batch7_scale.py
+
+      - name: Build new-account recovery package
+        env:
+          MS007_SYSTEM_COMMIT: ccc0b1d9dff530c2bf2f656df2a667c4e330f3b3
+        run: python scripts/build-recovery-package.py
+
+      - name: Verify generated package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python dist-recovery/MS007_NEW_ACCOUNT_RECOVERY/VERIFY_RECOVERY_PACKAGE.py
+          unzip -t dist-recovery/MS007_NEW_ACCOUNT_RECOVERY_ccc0b1d9.zip
+          sha256sum dist-recovery/MS007_NEW_ACCOUNT_RECOVERY_ccc0b1d9.zip | tee dist-recovery/MS007_NEW_ACCOUNT_RECOVERY_ccc0b1d9.zip.sha256
+
+      - name: Upload final recovery package
+        uses: actions/upload-artifact@v4
+        with:
+          name: MS007-NEW-ACCOUNT-RECOVERY-ccc0b1d9
+          path: |
+            dist-recovery/MS007_NEW_ACCOUNT_RECOVERY_ccc0b1d9.zip
+            dist-recovery/MS007_NEW_ACCOUNT_RECOVERY_ccc0b1d9.zip.sha256
+          if-no-files-found: error
+          retention-days: 90
