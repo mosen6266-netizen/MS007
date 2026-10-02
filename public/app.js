@@ -3020,7 +3020,12 @@ async function renderBackup(view){
         const rows=[];
         let offset=0;
         while(true){
-          const chunk=await api(`/api/admin/export-section?section=${encodeURIComponent(section)}&offset=${offset}&limit=1000`);
+          const sectionSpec=meta.manifest.sections?.[section]||{};
+          const maxRowid=Number(sectionSpec.maxRowid||0);
+          const snapshotParam=Number.isFinite(maxRowid)&&maxRowid>=0
+            ?("&maxRowid="+encodeURIComponent(String(maxRowid)))
+            :"";
+          const chunk=await api(`/api/admin/export-section?section=${encodeURIComponent(section)}&offset=${offset}&limit=1000${snapshotParam}`);
           const items=Array.isArray(chunk.items)?chunk.items:[];
           rows.push(...items);
           done+=items.length;
