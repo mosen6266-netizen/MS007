@@ -1322,6 +1322,74 @@ async function dailyPlanPreview(request,env){
   });
 }
 
+async function dailyPlanEnqueue(env,salesUserId,{manual=false,planDate="",chatId=""}={}){
+  const tg=await telegramSettingsRow(env);
+  if(!tg?.bot_token_enc)return {ok:false,reason:"token_missing",queued:0};
+  const setting=await env.DB.prepare(
+    `SELECT d.*,u.active,u.display_name,u.username
+     FROM users u
+     LEFT JOIN daily_plan_settings d ON d.sales_user_id=u.id
+     WHERE u.id=? AND u.role='sales'`
+  ).bind(salesUserId).first();
+  if(!setting)return {ok:false,reason:"sales_missing",queued:0};
+
+  const targetChatId=String(chatId||setting.chat_id||tg.chat_id||"").trim();
+  if(!targetChatId)return {ok:false,reason:"chat_missing",queued:0};
+
+  const plan=await dailyPlanBuild(env,salesUserId);
+  if(!plan.customerCount)return {ok:true,empty:true,queued:0,plan,targetChatId};
+
+  const bj=dailyPlanBeijingParts();
+  const date=planDate||bj.date;
+  const event=manual?uid("manual_"):date;
+  let queued=0;
+  for(let i=0;i<plan.htmlMessages.length;i++){
+    const dedupeKey=manual
+      ?["dailyplan-manual",salesUserId,event,String(i+1)].join(":")
+      :["dailyplan",salesUserId,date,String(i+1)].join(":");
+    const result=await enqueueTelegramMessage(env,{
+      dedupeKey,
+      actorUserId:salesUserId,
+      chatId:targetChatId,
+      messageText:plan.htmlMessages[i]
+    });
+    if(result.inserted)queued++;
+  }
+  return {ok:true,queued,plan,targetChatId};
+}
+
+async function dailyPlanSendNow(request,env,user,ctx){
+  const body=await readBody(request);
+  const salesUserId=String(body?.salesUserId||"").trim();
+  if(!salesUserId)return fail("请选择业务员");
+  const result=await dailyPlanEnqueue(env,salesUserId,{manual:true});
+  const reasonMap={
+    token_missing:"请先在 Telegram 通知功能中保存 Bot Token",
+    chat_missing:"请先给该业务员填写 Telegram 群 ID，或在 Telegram 通知中设置默认群",
+    sales_missing:"业务员不存在"
+  };
+  if(!result.ok)return fail(reasonMap[result.reason]||"当前无法生成工作计划",409);
+  if(result.empty){
+    return responseJson({ok:true,empty:true,queued:0,message:"这名业务员当前没有正在跟进的客户，没有发送空日报"});
+  }
+  await audit(env,user,"send_now","daily_plan",salesUserId,{
+    queued:result.queued,
+    customerCount:result.plan.customerCount,
+    messageCount:result.plan.messageCount,
+    chatId:result.targetChatId
+  });
+  const job=processTelegramQueue(env,{maxItems:4,maxRunMs:10000,allowShortWait:false}).catch(()=>{});
+  if(ctx?.waitUntil)ctx.waitUntil(job);
+  else await job;
+  return responseJson({
+    ok:true,
+    queued:result.queued,
+    customerCount:result.plan.customerCount,
+    messageCount:result.plan.messageCount,
+    message:"工作计划已进入 Telegram 可靠发送队列"
+  });
+}
+
 async function telegramAdminGet(env){
   const row=await telegramSettingsRow(env);
   const normalizedTemplate=await normalizeTelegramTemplateTokens(env);
