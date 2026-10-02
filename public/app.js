@@ -221,17 +221,56 @@ function stopSidebarSync(){
 }
 function onVisible(){ if(document.visibilityState==="visible")refreshSidebar(false); }
 
+function sidebarCollapseStorageKey(){
+  return `ms007SidebarCollapsed:${state.user?.id||state.user?.role||"guest"}`;
+}
+function sidebarCollapsedGroups(){
+  try{
+    const raw=JSON.parse(localStorage.getItem(sidebarCollapseStorageKey())||"[]");
+    return new Set(Array.isArray(raw)?raw.map(String):[]);
+  }catch{
+    return new Set();
+  }
+}
+function sidebarGroupCollapsed(group){
+  return sidebarCollapsedGroups().has(String(group||""));
+}
+function setSidebarGroupCollapsed(group,collapsed){
+  const key=String(group||"");
+  if(!key)return;
+  const groups=sidebarCollapsedGroups();
+  if(collapsed)groups.add(key);else groups.delete(key);
+  localStorage.setItem(sidebarCollapseStorageKey(),JSON.stringify([...groups]));
+}
+function toggleSidebarGroup(group){
+  const key=String(group||"");
+  if(!key)return;
+  setSidebarGroupCollapsed(key,!sidebarGroupCollapsed(key));
+  renderSidebarOnly();
+}
 function sideHtml(){
   let currentGroup=null, html="";
   for(const item of state.sidebar){
     const g=item.group_label||"";
-    if(g!==currentGroup){ currentGroup=g; if(g)html+=`<div class="side-group">${esc(g)}</div>`; }
+    if(g!==currentGroup){
+      if(currentGroup)html+="</div></section>";
+      currentGroup=g;
+      if(g){
+        const collapsed=sidebarGroupCollapsed(g);
+        html+=`<section class="side-group-block ${collapsed?"collapsed":""}" data-side-group="${esc(g)}">
+          <button class="side-group" type="button" data-side-group-toggle="${esc(g)}" aria-expanded="${collapsed?"false":"true"}" title="${collapsed?"展开":"收起"} ${esc(g)}">
+            <span class="side-group-label">${esc(g)}</span><span class="side-group-chevron" aria-hidden="true">⌄</span>
+          </button>
+          <div class="side-group-items">`;
+      }
+    }
     const icon=iconMap[item.icon]||"•";
     const active=item.url.startsWith("#/")&&location.hash===item.url?"active":"";
     const isNewCustomer=item.url==="#/sales/new"||item.url==="#/admin/new";
     html+=`<a class="side-link ${active}" href="${isNewCustomer?"#":esc(item.url)}" ${isNewCustomer?'data-action="new-customer"':""} ${!isNewCustomer&&item.target==="new"?'target="_blank" rel="noopener"':""}>
       <span class="side-icon">${esc(icon)}</span><span>${esc(item.label)}</span></a>`;
   }
+  if(currentGroup)html+="</div></section>";
   return html;
 }
 function renderSidebarOnly(){
@@ -259,6 +298,12 @@ async function renderShell(){
     </div>`;
   document.querySelector("#logoutBtn").onclick=logout;
   document.querySelector("#sideNav").onclick=e=>{
+    const groupToggle=e.target.closest("[data-side-group-toggle]");
+    if(groupToggle){
+      e.preventDefault();
+      toggleSidebarGroup(groupToggle.dataset.sideGroupToggle||"");
+      return;
+    }
     const a=e.target.closest('[data-action="new-customer"]');
     if(a){e.preventDefault();openCustomerEditor();}
   };
