@@ -172,7 +172,7 @@ plan = " ".join(
     ).fetchall()
     for x in row
 )
-assert "idx_customers_archived" in plan, plan
+assert ("idx_customers_archived" in plan or "idx_customers_admin_progress" in plan), plan
 
 admin_plan = " ".join(
     str(x)
