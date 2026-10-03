@@ -141,6 +141,13 @@ function encodeCursor(row) {
   return encodeKeysetCursor(row.updated_at,row.id);
 }
 
+function encodeCustomerProgressCursor(row) {
+  return btoa(unescape(encodeURIComponent(JSON.stringify([
+    Number(row.progress_done || 0), row.updated_at, row.id
+  ]))))
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
 function decodeCursor(value) {
   if (!value) return null;
   try {
@@ -2360,17 +2367,30 @@ async function listCustomers(request, env, user) {
     }
   }
 
-  if (cursor && Array.isArray(cursor) && cursor.length === 2) {
-    where.push("(c.updated_at < ? OR (c.updated_at=? AND c.id < ?))");
-    binds.push(cursor[0], cursor[0], cursor[1]);
+  const adminProgressSort = normalizedRole(user.role) === "admin";
+  if (cursor && Array.isArray(cursor)) {
+    if (adminProgressSort && cursor.length === 3) {
+      where.push(`(c.progress_done < ? OR (
+        c.progress_done=? AND (
+          c.updated_at < ? OR (c.updated_at=? AND c.id < ?)
+        )
+      ))`);
+      binds.push(cursor[0], cursor[0], cursor[1], cursor[1], cursor[2]);
+    } else if (!adminProgressSort && cursor.length === 2) {
+      where.push("(c.updated_at < ? OR (c.updated_at=? AND c.id < ?))");
+      binds.push(cursor[0], cursor[0], cursor[1]);
+    }
   }
 
+  const orderBy = adminProgressSort
+    ? "c.progress_done DESC,c.updated_at DESC,c.id DESC"
+    : "c.updated_at DESC,c.id DESC";
   const sql = `SELECT c.id,c.name,c.assigned_user_id,c.progress_done,c.progress_total,c.progress_percent,
     c.archived,c.created_at,c.updated_at,u.display_name AS owner_name
     FROM customers c
     LEFT JOIN users u ON u.id=c.assigned_user_id
     WHERE ${where.join(" AND ")}
-    ORDER BY c.updated_at DESC,c.id DESC LIMIT ?`;
+    ORDER BY ${orderBy} LIMIT ?`;
   binds.push(limit + 1);
   const result = await env.DB.prepare(sql).bind(...binds).all();
   const rows = result.results || [];
@@ -2447,7 +2467,11 @@ async function listCustomers(request, env, user) {
     ok: true,
     items,
     visibleFields,
-    nextCursor: hasMore && page.length ? encodeCursor(page[page.length - 1]) : null
+    nextCursor: hasMore && page.length
+      ? (adminProgressSort
+        ? encodeCustomerProgressCursor(page[page.length - 1])
+        : encodeCursor(page[page.length - 1]))
+      : null
   });
 }
 

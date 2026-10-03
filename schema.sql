@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS customers (
 CREATE INDEX IF NOT EXISTS idx_customers_assigned ON customers(assigned_user_id, deleted_at, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_customers_name ON customers(name);
 CREATE INDEX IF NOT EXISTS idx_customers_archived ON customers(archived, deleted_at, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_customers_admin_progress ON customers(archived, deleted_at, progress_done DESC, updated_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_customers_updated ON customers(updated_at DESC, id DESC);
 
 CREATE TABLE IF NOT EXISTS field_definitions (

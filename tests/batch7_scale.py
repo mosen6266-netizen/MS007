@@ -7,6 +7,13 @@ from datetime import datetime, timedelta, timezone
 root = pathlib.Path(__file__).resolve().parents[1]
 worker = (root / "src/worker.js").read_text(encoding="utf-8")
 
+# Admin 全部客户 defaults to most completed progress first while sales keeps the
+# existing recent-update order. The admin cursor includes the full sort tuple.
+list_block = worker[worker.index("async function listCustomers"):worker.index("function validateCustomerName")]
+assert "adminProgressSort" in list_block
+assert "c.progress_done DESC,c.updated_at DESC,c.id DESC" in list_block
+assert "encodeCustomerProgressCursor" in list_block
+
 # Batch 7.2 cache wiring must remain present.
 for token in [
     "dashboard_statistics_cache",
@@ -125,6 +132,35 @@ page2 = con.execute(
 assert len(page2) == 51
 assert not ({r[0] for r in page1[:50]} & {r[0] for r in page2[:50]})
 
+# Admin 全部客户: completed progress count desc, then latest update, then id.
+admin_page1 = con.execute(
+    """SELECT id,progress_done,updated_at FROM customers
+       WHERE deleted_at IS NULL AND archived=0
+       ORDER BY progress_done DESC,updated_at DESC,id DESC LIMIT 51"""
+).fetchall()
+assert len(admin_page1) == 51
+assert all(
+    (admin_page1[i][1], admin_page1[i][2], admin_page1[i][0])
+    >= (admin_page1[i + 1][1], admin_page1[i + 1][2], admin_page1[i + 1][0])
+    for i in range(len(admin_page1) - 1)
+)
+cursor_done, cursor_time, cursor_id = (
+    admin_page1[49][1], admin_page1[49][2], admin_page1[49][0]
+)
+admin_page2 = con.execute(
+    """SELECT id,progress_done,updated_at FROM customers
+       WHERE deleted_at IS NULL AND archived=0
+         AND (progress_done < ? OR (
+           progress_done=? AND (
+             updated_at < ? OR (updated_at=? AND id < ?)
+           )
+         ))
+       ORDER BY progress_done DESC,updated_at DESC,id DESC LIMIT 51""",
+    (cursor_done, cursor_done, cursor_time, cursor_time, cursor_id),
+).fetchall()
+assert len(admin_page2) == 51
+assert not ({r[0] for r in admin_page1[:50]} & {r[0] for r in admin_page2[:50]})
+
 # The large customer list must be index-backed rather than a full table scan.
 plan = " ".join(
     str(x)
@@ -137,6 +173,18 @@ plan = " ".join(
     for x in row
 )
 assert "idx_customers_archived" in plan, plan
+
+admin_plan = " ".join(
+    str(x)
+    for row in con.execute(
+        """EXPLAIN QUERY PLAN
+           SELECT id,progress_done,updated_at FROM customers
+           WHERE deleted_at IS NULL AND archived=0
+           ORDER BY progress_done DESC,updated_at DESC,id DESC LIMIT 51"""
+    ).fetchall()
+    for x in row
+)
+assert "idx_customers_admin_progress" in admin_plan, admin_plan
 
 owner_plan = " ".join(
     str(x)
