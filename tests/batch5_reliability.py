@@ -116,6 +116,23 @@ assert "s.status='success'" in failure_query
 
 sender=worker[worker.index("async function sendTelegramProgressNotification"):worker.index("async function retryTelegramDeliveryLog")]
 assert "options?.processImmediately!==false" in sender
+for token in [
+    "telegram_progress_notifications",
+    "notification_not_configured",
+    "notification_disabled",
+]:
+    assert token in sender,token
+
+for token in [
+    "进度通知管理",
+    "tgAddProgressBtn",
+    "tg-notification-enabled",
+    "tg-notification-remove",
+    "collectNotifications",
+    "添加进度通知",
+    "删除进度通知",
+]:
+    assert token in telegram_ui,token
 
 assert "每批最多 10 条" in telegram_ui
 assert "setTimeout(resolve,900)" in telegram_ui
@@ -129,5 +146,7 @@ for p in sorted((root/"migrations").glob("*.sql")):
 cols={r[1] for r in con.execute("PRAGMA table_info(telegram_send_queue)")}
 assert "requires_admin" in cols
 assert "dead_lettered_at" in cols
+notification_cols={r[1] for r in con.execute("PRAGMA table_info(telegram_progress_notifications)")}
+assert {"progress_id","enabled","updated_at"} <= notification_cols
 
 print("Batch 5 draft/Telegram reliability checks passed.")
