@@ -2311,10 +2311,17 @@ async function renderTelegramSettings(view){
   let messageTemplate=String(s.messageTemplate||defaultTemplate);
 
   const progressById=new Map(progressDefs.map(p=>[p.id,p]));
+  const progressOrder=new Map(progressDefs.map((p,index)=>[p.id,index]));
   const routeMap=new Map((r.routes||[]).map(x=>[
     x.progress_id,
     {progressId:x.progress_id,mode:x.route_mode||"default",chatId:x.chat_id||""}
   ]));
+  const sortNotificationsByProgressOrder=()=>{
+    notifications.sort((a,b)=>
+      (progressOrder.get(a.progressId)??Number.MAX_SAFE_INTEGER)-
+      (progressOrder.get(b.progressId)??Number.MAX_SAFE_INTEGER)
+    );
+  };
   let notifications=(r.notifications||[])
     .filter(x=>progressById.has(x.progress_id))
     .map(x=>{
@@ -2326,6 +2333,7 @@ async function renderTelegramSettings(view){
         chatId:route?.chatId||""
       };
     });
+  sortNotificationsByProgressOrder();
 
   const queueMonitor=r.queueMonitor||{};
   const unresolvedInitial=Array.isArray(r.unresolved?.items)?r.unresolved.items:[];
@@ -2674,11 +2682,7 @@ async function renderTelegramSettings(view){
     const progressId=val("tgAddProgress");
     if(!progressId||notifications.some(x=>x.progressId===progressId))return;
     notifications.push({progressId,enabled:true,mode:"default",chatId:""});
-    notifications.sort((a,b)=>{
-      const pa=progressById.get(a.progressId);
-      const pb=progressById.get(b.progressId);
-      return Number(pa?.sort_order||0)-Number(pb?.sort_order||0);
-    });
+    sortNotificationsByProgressOrder();
     refreshNotificationEditor();
     const progress=progressById.get(progressId);
     toast("已添加「"+(progress?.label||"客户进度")+"」通知；点击“保存全部设置”后生效");
