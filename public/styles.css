@@ -434,13 +434,20 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
   font-size:11px;
   white-space:nowrap;
 }
+.telegram-notification-add{
+  display:grid;
+  grid-template-columns:minmax(260px,1fr) auto;
+  gap:10px;
+  align-items:center;
+  margin-bottom:12px;
+}
 .telegram-route-list{
   display:grid;
   gap:8px;
 }
 .telegram-route-row{
   display:grid;
-  grid-template-columns:minmax(150px,.8fr) minmax(180px,.9fr) minmax(260px,1.3fr);
+  grid-template-columns:minmax(150px,.75fr) minmax(105px,.42fr) minmax(180px,.85fr) minmax(240px,1.15fr) auto;
   gap:10px;
   align-items:center;
   padding:10px 12px;
@@ -464,6 +471,17 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
   color:var(--muted);
   font-size:11px;
 }
+.tg-notification-toggle{
+  display:flex;
+  align-items:center;
+  gap:7px;
+  font-size:12px;
+  font-weight:700;
+  white-space:nowrap;
+}
+.tg-notification-remove{
+  min-width:64px;
+}
 .telegram-route-row .tg-route-chat:disabled{
   background:#eef2f7;
   color:#94a3b8;
@@ -481,6 +499,7 @@ tr[data-field-row]:hover,tr[data-progress-row]:hover,tr[data-dashboard-row]:hove
 @media(max-width:900px){
   .telegram-route-head{flex-direction:column}
   .telegram-route-legend{justify-content:flex-start}
+  .telegram-notification-add{grid-template-columns:1fr}
   .telegram-route-row{grid-template-columns:1fr}
 }
 
