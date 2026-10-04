@@ -131,8 +131,13 @@ for token in [
     "collectNotifications",
     "添加进度通知",
     "删除进度通知",
+    "progressOrder",
+    "sortNotificationsByProgressOrder",
 ]:
     assert token in telegram_ui,token
+
+admin_get=worker[worker.index("async function telegramAdminGet"):worker.index("async function telegramLogs")]
+assert "ORDER BY p.sort_order,p.label,p.id" in admin_get
 
 assert "每批最多 10 条" in telegram_ui
 assert "setTimeout(resolve,900)" in telegram_ui
