@@ -1539,7 +1539,7 @@ async function telegramAdminGet(env){
     const parsed=JSON.parse(row.fields_json||"[]");
     if(Array.isArray(parsed))fields=parsed;
   }catch{}
-  const [availableFields,logs,progressDefs,routes,templateVariables,queueMonitor,unresolved,retryableProbe]=await Promise.all([
+  const [availableFields,logs,progressDefs,routes,notifications,templateVariables,queueMonitor,unresolved,retryableProbe]=await Promise.all([
     telegramAvailableFields(env),
     telegramRecentActivity(env,20).then(results=>({results})),
     env.DB.prepare(
@@ -1547,6 +1547,9 @@ async function telegramAdminGet(env){
     ).all(),
     env.DB.prepare(
       "SELECT progress_id,route_mode,chat_id FROM telegram_progress_routes"
+    ).all(),
+    env.DB.prepare(
+      "SELECT progress_id,enabled FROM telegram_progress_notifications"
     ).all(),
     telegramTemplateVariables(env),
     telegramQueueMonitor(env),
@@ -1570,6 +1573,7 @@ async function telegramAdminGet(env){
     templateVariables,
     progressDefs:progressDefs.results||[],
     routes:routes.results||[],
+    notifications:notifications.results||[],
     queueMonitor,
     unresolved:{...unresolved,hasRetryableFailures:retryableProbe.length>0},
     logs:logs.results||[]
@@ -1683,16 +1687,24 @@ async function telegramAdminSave(request,env,user){
     "SELECT id FROM progress_definitions WHERE enabled=1"
   ).all();
   const validProgressIds=new Set((progressResult.results||[]).map(x=>x.id));
-  const routeInput=Array.isArray(b.routes)?b.routes:[];
+  const notificationInput=Array.isArray(b.notifications)?b.notifications:[];
+  const notifications=[];
   const routes=[];
-  const seenRouteProgress=new Set();
-  for(const item of routeInput.slice(0,200)){
+  const seenProgress=new Set();
+  for(const item of notificationInput.slice(0,200)){
     const progressId=String(item?.progressId||"").trim();
-    const mode=["replace","additional"].includes(item?.mode)?item.mode:"";
+    if(!progressId||!validProgressIds.has(progressId)||seenProgress.has(progressId))continue;
+    seenProgress.add(progressId);
+    const notificationEnabled=item?.enabled!==false;
+    const mode=["replace","additional"].includes(item?.mode)?item.mode:"default";
     const routeChatId=String(item?.chatId||"").trim();
-    if(!progressId||!validProgressIds.has(progressId)||!mode||!routeChatId||seenRouteProgress.has(progressId))continue;
-    seenRouteProgress.add(progressId);
-    routes.push({progressId,mode,chatId:routeChatId});
+    if(notificationEnabled && mode!=="default" && !routeChatId){
+      return fail("指定群模式必须填写 Telegram 群 ID");
+    }
+    notifications.push({progressId,enabled:notificationEnabled});
+    if(mode!=="default"){
+      routes.push({progressId,mode,chatId:routeChatId});
+    }
   }
 
   const t=now();
@@ -1703,11 +1715,19 @@ async function telegramAdminSave(request,env,user){
        WHERE id=1`
     ).bind(enabled?1:0,chatId,encToken,hint,JSON.stringify(fields),notifyAdmin?1:0,linkLabel,t),
     env.DB.prepare("DELETE FROM telegram_progress_routes"),
+    env.DB.prepare("DELETE FROM telegram_progress_notifications"),
     env.DB.prepare(
       `INSERT INTO system_settings(setting_key,value_json,updated_at) VALUES('telegram_message_template',?,?)
        ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at`
     ).bind(JSON.stringify(messageTemplate),t)
   ];
+  for(const notification of notifications){
+    stmts.push(
+      env.DB.prepare(
+        "INSERT INTO telegram_progress_notifications(progress_id,enabled,updated_at) VALUES(?,?,?)"
+      ).bind(notification.progressId,notification.enabled?1:0,t)
+    );
+  }
   for(const route of routes){
     stmts.push(
       env.DB.prepare(
@@ -1734,12 +1754,13 @@ async function telegramAdminSave(request,env,user){
       fieldCount:fields.length,
       notifyAdmin,
       linkLabel,
+      notificationCount:notifications.length,
       routeCount:routes.length,
       templateLength:messageTemplate.length
     },
     tokenChanged:!!newToken
   });
-  return responseJson({ok:true,tokenHint:hint,hasToken:!!encToken,routeCount:routes.length});
+  return responseJson({ok:true,tokenHint:hint,hasToken:!!encToken,notificationCount:notifications.length,routeCount:routes.length});
 }
 
 async function telegramAdminTest(request,env,user){
@@ -1810,6 +1831,13 @@ async function sendTelegramProgressNotification(request,env,user,customerId,prog
   const manual=!!options?.manual;
   if(!row.enabled)return {ok:false,reason:"disabled",queued:0};
   if(normalizedRole(user.role)==="admin"&&!row.notify_admin&&!manual)return {ok:false,reason:"admin_disabled",queued:0};
+
+  const notification=await env.DB.prepare(
+    "SELECT enabled FROM telegram_progress_notifications WHERE progress_id=?"
+  ).bind(progressDef.id).first();
+  if(!notification)return {ok:false,reason:"notification_not_configured",queued:0};
+  if(!notification.enabled)return {ok:false,reason:"notification_disabled",queued:0};
+
   if(!row.bot_token_enc){
     if(!manual)await logTelegramDelivery(env,{customerId,actorUserId:user.id,progressId:progressDef.id,status:"skipped",error:"Telegram Bot Token 未设置"});
     return {ok:false,reason:"token_missing",queued:0};
@@ -3247,6 +3275,7 @@ async function hardDeleteProgressDef(env,user,id){
   const statements=[
     env.DB.prepare("DELETE FROM customer_progress WHERE progress_id=?").bind(id),
     env.DB.prepare("DELETE FROM telegram_progress_routes WHERE progress_id=?").bind(id),
+    env.DB.prepare("DELETE FROM telegram_progress_notifications WHERE progress_id=?").bind(id),
     env.DB.prepare("DELETE FROM telegram_send_queue WHERE progress_id=?").bind(id)
   ];
   for(const widget of widgetRefs){
@@ -4490,6 +4519,14 @@ async function importChunk(request,env,user){
          WHERE id=1`
       ).bind(x.enabled?1:0,String(x.chat_id||""),x.fields_json||"[]",x.notify_admin?1:0,String(x.link_label||"查看客户详情"),t));
     }
+  } else if(section==="telegramProgressNotifications"){
+    for(const x of rows)stmts.push(env.DB.prepare(
+      `INSERT INTO telegram_progress_notifications(progress_id,enabled,updated_at)
+       SELECT ?,?,?
+       WHERE EXISTS(SELECT 1 FROM progress_definitions WHERE id=?)
+       ON CONFLICT(progress_id) DO UPDATE SET
+        enabled=excluded.enabled,updated_at=excluded.updated_at`
+    ).bind(x.progress_id,x.enabled?1:0,x.updated_at||t,x.progress_id));
   } else if(section==="telegramProgressRoutes"){
     for(const x of rows)stmts.push(env.DB.prepare(
       `INSERT INTO telegram_progress_routes(progress_id,route_mode,chat_id,updated_at)
@@ -4718,7 +4755,7 @@ async function exportBusinessData(env,user){
 const BACKUP_V3_SECTIONS=[
   "users","customers","fieldDefinitions","customerValues","progressDefinitions","customerProgress",
   "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets",
-  "systemSettings","telegramSettings","telegramProgressRoutes","dailyPlanSettings","auditLogs","telegramDeliveryLogs"
+  "systemSettings","telegramSettings","telegramProgressNotifications","telegramProgressRoutes","dailyPlanSettings","auditLogs","telegramDeliveryLogs"
 ];
 
 // V3 exports span multiple HTTP requests. Capture a stable rowid upper bound for
@@ -4738,6 +4775,7 @@ const BACKUP_V3_ROWID_BOUNDARIES={
   dashboardWidgets:{table:"dashboard_widgets",ref:"dashboard_widgets.rowid"},
   systemSettings:{table:"system_settings",ref:"system_settings.rowid"},
   telegramSettings:{table:"telegram_settings",ref:"telegram_settings.rowid"},
+  telegramProgressNotifications:{table:"telegram_progress_notifications",ref:"telegram_progress_notifications.rowid"},
   telegramProgressRoutes:{table:"telegram_progress_routes",ref:"telegram_progress_routes.rowid"},
   dailyPlanSettings:{table:"daily_plan_settings",ref:"dps.rowid"},
   auditLogs:{table:"audit_logs",ref:"a.rowid"},
@@ -4816,6 +4854,10 @@ function backupSectionSpec(section){
       count:"SELECT COUNT(*) n FROM telegram_settings",
       sql:`SELECT id,enabled,chat_id,fields_json,notify_admin,link_label,updated_at
            FROM telegram_settings ORDER BY id LIMIT ? OFFSET ?`
+    },
+    telegramProgressNotifications:{
+      count:"SELECT COUNT(*) n FROM telegram_progress_notifications",
+      sql:"SELECT * FROM telegram_progress_notifications ORDER BY progress_id LIMIT ? OFFSET ?"
     },
     telegramProgressRoutes:{
       count:"SELECT COUNT(*) n FROM telegram_progress_routes",
