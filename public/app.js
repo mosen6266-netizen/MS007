@@ -2310,15 +2310,22 @@ async function renderTelegramSettings(view){
   let fields=(s.fields||[]).map(x=>({...x}));
   let messageTemplate=String(s.messageTemplate||defaultTemplate);
 
+  const progressById=new Map(progressDefs.map(p=>[p.id,p]));
   const routeMap=new Map((r.routes||[]).map(x=>[
     x.progress_id,
     {progressId:x.progress_id,mode:x.route_mode||"default",chatId:x.chat_id||""}
   ]));
-  let routes=progressDefs.map(p=>routeMap.get(p.id)||{
-    progressId:p.id,
-    mode:"default",
-    chatId:""
-  });
+  let notifications=(r.notifications||[])
+    .filter(x=>progressById.has(x.progress_id))
+    .map(x=>{
+      const route=routeMap.get(x.progress_id);
+      return {
+        progressId:x.progress_id,
+        enabled:!!x.enabled,
+        mode:route?.mode||"default",
+        chatId:route?.chatId||""
+      };
+    });
 
   const queueMonitor=r.queueMonitor||{};
   const unresolvedInitial=Array.isArray(r.unresolved?.items)?r.unresolved.items:[];
@@ -2435,36 +2442,25 @@ async function renderTelegramSettings(view){
     <section class="card" style="margin-top:16px">
       <div class="telegram-route-head">
         <div>
-          <h3 style="margin:0">进度通知群设置</h3>
-          <p class="muted" style="margin:6px 0 0">每个客户进度都可以单独指定通知群。没有设置的进度自动使用上面的默认群。</p>
+          <h3 style="margin:0">进度通知管理</h3>
+          <p class="muted" style="margin:6px 0 0">只有添加到这里的客户进度才会发送 Telegram 通知。你可以随时添加、关闭或删除通知；删除通知不会删除客户进度本身。</p>
         </div>
         <div class="telegram-route-legend">
-          <span>默认群</span>
-          <span>仅指定群</span>
-          <span>默认群 + 指定群</span>
+          <span>自由添加</span>
+          <span>单独关闭</span>
+          <span>单独删除</span>
         </div>
       </div>
 
-      <div class="telegram-route-list" id="tgRouteRows">
-        ${progressDefs.map((p,i)=>{
-          const route=routes[i];
-          return `<div class="telegram-route-row" data-route-index="${i}">
-            <div class="telegram-route-progress">
-              <strong>${esc(p.label)}</strong>
-              <span>客户进度</span>
-            </div>
-            <select class="input tg-route-mode">
-              <option value="default" ${route.mode==="default"?"selected":""}>使用默认群</option>
-              <option value="replace" ${route.mode==="replace"?"selected":""}>仅发送到指定群</option>
-              <option value="additional" ${route.mode==="additional"?"selected":""}>默认群 + 指定群</option>
-            </select>
-            <input class="input tg-route-chat" value="${esc(route.chatId||"")}" placeholder="指定 Telegram 群 ID，例如 -100..." ${route.mode==="default"?"disabled":""}>
-          </div>`;
-        }).join("")||'<div class="empty-options">还没有客户进度，请先在“客户进度管理”中添加。</div>'}
+      <div class="telegram-notification-add">
+        <select class="input" id="tgAddProgress"></select>
+        <button class="btn secondary" type="button" id="tgAddProgressBtn">+ 添加进度通知</button>
       </div>
 
+      <div class="telegram-route-list" id="tgRouteRows"></div>
+
       <div class="telegram-route-example">
-        <strong>例：</strong>所有进度都使用默认群；“客户建档”选择“仅发送到指定群”，再填写另一个群 ID，那么只有客户建档会改发到那个群。
+        <strong>说明：</strong>“关闭”会保留这条通知设置但暂停发送；“删除”会把它从 Telegram 通知列表移除。以后需要时可以再次从上方选择该进度重新添加。
       </div>
     </section>
 
@@ -2595,41 +2591,127 @@ async function renderTelegramSettings(view){
     templateBox.dispatchEvent(new Event("input",{bubbles:true}));
   };
 
-  document.querySelectorAll("[data-route-index]").forEach(row=>{
-    const i=Number(row.dataset.routeIndex);
-    const mode=row.querySelector(".tg-route-mode");
-    const chat=row.querySelector(".tg-route-chat");
-
-    mode.onchange=()=>{
-      routes[i].mode=mode.value;
-      chat.disabled=mode.value==="default";
-      if(mode.value!=="default")chat.focus();
-    };
-    chat.oninput=()=>routes[i].chatId=chat.value.trim();
-  });
-
-  function collectRoutes(){
-    const output=[];
-    document.querySelectorAll("[data-route-index]").forEach(row=>{
-      const i=Number(row.dataset.routeIndex);
-      const mode=row.querySelector(".tg-route-mode").value;
-      const chatId=row.querySelector(".tg-route-chat").value.trim();
-      routes[i].mode=mode;
-      routes[i].chatId=chatId;
-      if(mode!=="default"){
-        if(!chatId)throw new Error("请填写「"+progressDefs[i].label+"」的指定 Telegram 群 ID");
-        output.push({
-          progressId:progressDefs[i].id,
-          mode,
-          chatId
-        });
-      }
-    });
-    return output;
+  function notificationRowsHtml(){
+    if(!notifications.length){
+      return '<div class="empty-options">当前没有进度通知。请从上方选择一个客户进度并点击“添加进度通知”。</div>';
+    }
+    return notifications.map((item,i)=>{
+      const progress=progressById.get(item.progressId);
+      if(!progress)return "";
+      return '<div class="telegram-route-row" data-notification-index="'+i+'">'+
+        '<div class="telegram-route-progress">'+
+          '<strong>'+esc(progress.label)+'</strong>'+
+          '<span class="tg-notification-status">'+(item.enabled?"已启用":"已关闭")+'</span>'+
+        '</div>'+
+        '<label class="tg-notification-toggle"><input type="checkbox" class="tg-notification-enabled" '+(item.enabled?"checked":"")+'> 启用通知</label>'+
+        '<select class="input tg-route-mode">'+
+          '<option value="default" '+(item.mode==="default"?"selected":"")+'>使用默认群</option>'+
+          '<option value="replace" '+(item.mode==="replace"?"selected":"")+'>仅发送到指定群</option>'+
+          '<option value="additional" '+(item.mode==="additional"?"selected":"")+'>默认群 + 指定群</option>'+
+        '</select>'+
+        '<input class="input tg-route-chat" value="'+esc(item.chatId||"")+'" placeholder="指定 Telegram 群 ID，例如 -100..." '+(item.mode==="default"?"disabled":"")+'>'+
+        '<button class="btn ghost small tg-notification-remove" type="button">删除</button>'+
+      '</div>';
+    }).join("");
   }
 
+  function refreshNotificationAddOptions(){
+    const select=document.querySelector("#tgAddProgress");
+    const button=document.querySelector("#tgAddProgressBtn");
+    if(!select||!button)return;
+    const used=new Set(notifications.map(x=>x.progressId));
+    const available=progressDefs.filter(p=>!used.has(p.id));
+    select.innerHTML=available.length
+      ?available.map(p=>'<option value="'+esc(p.id)+'">'+esc(p.label)+'</option>').join("")
+      :'<option value="">所有客户进度都已添加</option>';
+    select.disabled=!available.length;
+    button.disabled=!available.length;
+  }
+
+  function bindNotificationRows(){
+    document.querySelectorAll("[data-notification-index]").forEach(row=>{
+      const i=Number(row.dataset.notificationIndex);
+      const item=notifications[i];
+      if(!item)return;
+      const enabledBox=row.querySelector(".tg-notification-enabled");
+      const mode=row.querySelector(".tg-route-mode");
+      const chat=row.querySelector(".tg-route-chat");
+      const status=row.querySelector(".tg-notification-status");
+      const remove=row.querySelector(".tg-notification-remove");
+
+      enabledBox.onchange=()=>{
+        item.enabled=!!enabledBox.checked;
+        if(status)status.textContent=item.enabled?"已启用":"已关闭";
+      };
+      mode.onchange=()=>{
+        item.mode=mode.value;
+        chat.disabled=mode.value==="default";
+        if(mode.value!=="default")chat.focus();
+      };
+      chat.oninput=()=>item.chatId=chat.value.trim();
+      remove.onclick=async()=>{
+        const progress=progressById.get(item.progressId);
+        const label=progress?.label||"这个进度";
+        if(!await uiConfirm(
+          "从 Telegram 通知列表删除「"+label+"」？\n\n只会删除通知设置，不会删除客户进度，也不会影响客户资料。",
+          {title:"删除进度通知",confirmText:"删除通知",danger:true}
+        ))return;
+        notifications.splice(i,1);
+        refreshNotificationEditor();
+        toast("已从通知列表移除；点击“保存全部设置”后生效");
+      };
+    });
+  }
+
+  function refreshNotificationEditor(){
+    const list=document.querySelector("#tgRouteRows");
+    if(list)list.innerHTML=notificationRowsHtml();
+    refreshNotificationAddOptions();
+    bindNotificationRows();
+  }
+
+  document.querySelector("#tgAddProgressBtn").onclick=()=>{
+    const progressId=val("tgAddProgress");
+    if(!progressId||notifications.some(x=>x.progressId===progressId))return;
+    notifications.push({progressId,enabled:true,mode:"default",chatId:""});
+    notifications.sort((a,b)=>{
+      const pa=progressById.get(a.progressId);
+      const pb=progressById.get(b.progressId);
+      return Number(pa?.sort_order||0)-Number(pb?.sort_order||0);
+    });
+    refreshNotificationEditor();
+    const progress=progressById.get(progressId);
+    toast("已添加「"+(progress?.label||"客户进度")+"」通知；点击“保存全部设置”后生效");
+  };
+
+  function collectNotifications(){
+    document.querySelectorAll("[data-notification-index]").forEach(row=>{
+      const i=Number(row.dataset.notificationIndex);
+      const item=notifications[i];
+      if(!item)return;
+      item.enabled=!!row.querySelector(".tg-notification-enabled")?.checked;
+      item.mode=row.querySelector(".tg-route-mode")?.value||"default";
+      item.chatId=row.querySelector(".tg-route-chat")?.value.trim()||"";
+    });
+
+    return notifications.map(item=>{
+      const progress=progressById.get(item.progressId);
+      if(item.enabled && item.mode!=="default" && !item.chatId){
+        throw new Error("请填写「"+(progress?.label||"客户进度")+"」的指定 Telegram 群 ID");
+      }
+      return {
+        progressId:item.progressId,
+        enabled:item.enabled,
+        mode:item.mode,
+        chatId:item.chatId
+      };
+    });
+  }
+
+  refreshNotificationEditor();
+
   async function saveSettings(showToast=true){
-    const routePayload=collectRoutes();
+    const notificationPayload=collectNotifications();
     const body={
       botToken:val("tgBotToken"),
       chatId:val("tgChatId"),
@@ -2637,13 +2719,13 @@ async function renderTelegramSettings(view){
       enabled:checked("tgEnabled"),
       notifyAdmin:checked("tgNotifyAdmin"),
       fields,
-      routes:routePayload,
+      notifications:notificationPayload,
       messageTemplate:templateBox.value
     };
     const out=await api("/api/admin/telegram",{method:"PUT",body});
     document.querySelector("#tgBotToken").value="";
     document.querySelector("#tgBotToken").placeholder="已保存 "+(out.tokenHint||"")+"，不修改请留空";
-    if(showToast)toast("Telegram 设置、通知模板和进度通知群已保存");
+    if(showToast)toast("Telegram 设置、通知模板和进度通知管理已保存");
   }
 
   document.querySelector("#tgSave").onclick=async()=>{
@@ -3175,7 +3257,7 @@ async function renderBackup(view){
   const backupOrder=[
     "users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress",
     "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets",
-    "systemSettings","telegramSettings","telegramProgressRoutes","auditLogs","telegramDeliveryLogs"
+    "systemSettings","telegramSettings","telegramProgressNotifications","telegramProgressRoutes","auditLogs","telegramDeliveryLogs"
   ];
   const legacyOrder=[
     "users","fieldDefinitions","progressDefinitions","customers","customerValues","customerProgress",
@@ -3331,7 +3413,9 @@ async function renderBackup(view){
     btn.textContent="正在检查...";
     try{
       const isV3=Number(backup.version||0)>=3;
-      const order=isV3?backupOrder:legacyOrder;
+      const order=isV3
+        ?backupOrder.filter(k=>Object.prototype.hasOwnProperty.call(backup.manifest?.sections||{},k))
+        :legacyOrder;
       const total=order.reduce((n,k)=>n+(Array.isArray(backup.data[k])?backup.data[k].length:0),0);
 
       if(isV3){
