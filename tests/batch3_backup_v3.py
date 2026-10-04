@@ -18,7 +18,7 @@ for token in [
 for section in [
     "users","customers","fieldDefinitions","customerValues","progressDefinitions","customerProgress",
     "sidebarCategories","sidebarItems","sidebarItemCategories","listColumns","dashboardWidgets",
-    "systemSettings","telegramSettings","telegramProgressRoutes","auditLogs","telegramDeliveryLogs",
+    "systemSettings","telegramSettings","telegramProgressNotifications","telegramProgressRoutes","auditLogs","telegramDeliveryLogs",
 ]:
     assert f'"{section}"' in worker,section
 
@@ -69,6 +69,7 @@ assert "/api/admin/import-preview-chunk" in backup_ui
 assert 'crypto.subtle.digest("SHA-256"' in backup_ui
 assert "sha256" in backup_ui
 assert "telegramSettings" in backup_ui
+assert "telegramProgressNotifications" in backup_ui
 assert "telegramProgressRoutes" in backup_ui
 assert "auditLogs" in backup_ui
 assert "telegramDeliveryLogs" in backup_ui
