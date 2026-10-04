@@ -63,7 +63,7 @@ jobs:
               "sidebar_categories","sidebar_item_categories","list_columns",
               "dashboard_widgets","audit_logs","system_settings","telegram_settings",
               "telegram_delivery_logs","telegram_send_queue","telegram_chat_rate",
-              "daily_plan_settings","daily_plan_runs",
+              "daily_plan_settings","daily_plan_runs","telegram_progress_notifications",
               "customer_search_index","maintenance_jobs","dashboard_statistics_cache","ms007_migration_guard"
           }
           tables={r[0] for r in con.execute("select name from sqlite_master where type='table'")}
