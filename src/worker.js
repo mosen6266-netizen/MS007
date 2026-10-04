@@ -1549,7 +1549,10 @@ async function telegramAdminGet(env){
       "SELECT progress_id,route_mode,chat_id FROM telegram_progress_routes"
     ).all(),
     env.DB.prepare(
-      "SELECT progress_id,enabled FROM telegram_progress_notifications"
+      `SELECT n.progress_id,n.enabled
+       FROM telegram_progress_notifications n
+       JOIN progress_definitions p ON p.id=n.progress_id AND p.enabled=1
+       ORDER BY p.sort_order,p.label,p.id`
     ).all(),
     telegramTemplateVariables(env),
     telegramQueueMonitor(env),
