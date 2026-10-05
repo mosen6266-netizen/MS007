@@ -1,0 +1,149 @@
+name: Build Signal Scheduler V7.3 Full Offline
+
+on:
+  push:
+    branches:
+      - build/signal-scheduler-v7.3-offline
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Assemble complete offline application
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $root = $PWD.Path
+          $srcZip = Join-Path $env:RUNNER_TEMP 'signal-source.zip'
+          Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/mosen6266-netizen/mosen6266/build/signal-scheduler-v7.3-offline/build_assets/signal_scheduler_v7_3_source_payload.zip' -OutFile $srcZip
+
+          $work = Join-Path $root 'work'
+          $stage = Join-Path $root 'stage'
+          Remove-Item $work,$stage -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $work,$stage | Out-Null
+          Expand-Archive -LiteralPath $srcZip -DestinationPath $work -Force
+          $src = Get-ChildItem $work -Directory | Select-Object -First 1
+          if (-not $src) { throw 'source payload missing' }
+          Copy-Item (Join-Path $src.FullName '*') $stage -Recurse -Force
+
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'runtime\python\Lib\site-packages') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'runtime\jre') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $stage 'runtime\signal-cli') | Out-Null
+
+          $pyZip = Join-Path $env:RUNNER_TEMP 'python.zip'
+          Invoke-WebRequest -Uri 'https://www.python.org/ftp/python/3.13.14/python-3.13.14-embed-amd64.zip' -OutFile $pyZip
+          Expand-Archive -LiteralPath $pyZip -DestinationPath (Join-Path $stage 'runtime\python') -Force
+          @('python313.zip','.','Lib','Lib\site-packages','import site') | Set-Content -LiteralPath (Join-Path $stage 'runtime\python\python313._pth') -Encoding ascii
+
+          python -m pip install --disable-pip-version-check --no-cache-dir --target (Join-Path $stage 'runtime\python\Lib\site-packages') 'fastapi==0.115.6' 'uvicorn==0.34.0' 'httpx==0.28.1' 'qrcode==8.2'
+
+          $jreZip = Join-Path $env:RUNNER_TEMP 'jre.zip'
+          Invoke-WebRequest -Uri 'https://api.adoptium.net/v3/binary/latest/25/ga/windows/x64/jre/hotspot/normal/eclipse?project=jdk' -OutFile $jreZip
+          $jreTmp = Join-Path $env:RUNNER_TEMP 'jre-unpack'
+          Remove-Item $jreTmp -Recurse -Force -ErrorAction SilentlyContinue
+          Expand-Archive -LiteralPath $jreZip -DestinationPath $jreTmp -Force
+          $jreRoot = Get-ChildItem $jreTmp -Directory | Select-Object -First 1
+          if (-not $jreRoot) { throw 'JRE extraction failed' }
+          Copy-Item (Join-Path $jreRoot.FullName '*') (Join-Path $stage 'runtime\jre') -Recurse -Force
+
+          $sigTgz = Join-Path $env:RUNNER_TEMP 'signal-cli.tar.gz'
+          Invoke-WebRequest -Uri 'https://github.com/AsamK/signal-cli/releases/download/v0.14.8/signal-cli-0.14.8.tar.gz' -OutFile $sigTgz
+          $sigTmp = Join-Path $env:RUNNER_TEMP 'signal-unpack'
+          Remove-Item $sigTmp -Recurse -Force -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path $sigTmp | Out-Null
+          tar.exe -xzf $sigTgz -C $sigTmp
+          if ($LASTEXITCODE -ne 0) { throw 'signal-cli extraction failed' }
+          $sigRoot = Get-ChildItem $sigTmp -Directory | Select-Object -First 1
+          if (-not $sigRoot) { throw 'signal-cli root missing' }
+          Copy-Item (Join-Path $sigRoot.FullName '*') (Join-Path $stage 'runtime\signal-cli') -Recurse -Force
+
+          & (Join-Path $stage 'runtime\python\python.exe') -c "import fastapi,uvicorn,httpx,qrcode,pydantic; print('embedded python ok')"
+          if ($LASTEXITCODE -ne 0) { throw 'embedded Python verification failed' }
+
+          $env:JAVA_HOME = Join-Path $stage 'runtime\jre'
+          $env:PATH = (Join-Path $env:JAVA_HOME 'bin') + ';' + $env:PATH
+          & (Join-Path $stage 'runtime\jre\bin\java.exe') -version
+          if ($LASTEXITCODE -ne 0) { throw 'Java verification failed' }
+          cmd.exe /d /c ('"' + (Join-Path $stage 'runtime\signal-cli\bin\signal-cli.bat') + '" --version')
+          if ($LASTEXITCODE -ne 0) { throw 'signal-cli verification failed' }
+
+          Write-Host ('Offline stage bytes: ' + ((Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum))
+
+      - name: Build native offline installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iss = Join-Path $PWD.Path 'SignalSchedulerV73.iss'
+          @'
+          [Setup]
+          AppId=SignalSchedulerV73
+          AppName=Signal Auto Scheduler
+          AppVerName=Signal Auto Scheduler V7.3 Full Offline
+          AppVersion=7.3
+          AppPublisher=Signal Scheduler
+          DefaultDirName={localappdata}\SignalScheduler
+          DefaultGroupName=Signal Auto Scheduler
+          UninstallDisplayName=Signal Auto Scheduler V7.3
+          OutputDir=output
+          OutputBaseFilename=SignalScheduler_Setup_V7.3_Full_Offline
+          Compression=lzma2/ultra64
+          SolidCompression=yes
+          WizardStyle=modern
+          PrivilegesRequired=lowest
+          ArchitecturesAllowed=x64
+          ArchitecturesInstallIn64BitMode=x64
+          DisableProgramGroupPage=yes
+          CloseApplications=no
+          RestartApplications=no
+          SetupLogging=yes
+          VersionInfoVersion=7.3.0.0
+          VersionInfoProductName=Signal Auto Scheduler
+          VersionInfoProductVersion=7.3
+          VersionInfoCompany=Signal Scheduler
+          VersionInfoDescription=Signal Auto Scheduler full offline installer
+
+          [Languages]
+          Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
+          [Files]
+          Source: "stage\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+          [Icons]
+          Name: "{autodesktop}\Signal 自动调度台"; Filename: "{app}\runtime\python\pythonw.exe"; Parameters: """{app}\launcher.pyw"""; WorkingDir: "{app}"
+          Name: "{userprograms}\Signal 自动调度台"; Filename: "{app}\runtime\python\pythonw.exe"; Parameters: """{app}\launcher.pyw"""; WorkingDir: "{app}"
+
+          [Run]
+          Filename: "{app}\runtime\python\pythonw.exe"; Parameters: """{app}\launcher.pyw"""; WorkingDir: "{app}"; Description: "启动 Signal 自动调度台"; Flags: postinstall nowait skipifsilent
+
+          [UninstallRun]
+          Filename: "{cmd}"; Parameters: "/d /c echo shutdown>{app}\shutdown.request"; Flags: runhidden; RunOnceId: "StopScheduler"
+          '@ | Set-Content -LiteralPath $iss -Encoding utf8
+
+          $iscc = Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6\ISCC.exe'
+          if (-not (Test-Path $iscc)) { choco install innosetup --no-progress -y }
+          if (-not (Test-Path $iscc)) { throw 'Inno Setup compiler not found' }
+          & $iscc $iss
+          if ($LASTEXITCODE -ne 0) { throw 'Inno Setup failed' }
+
+          $exe = Join-Path $PWD.Path 'output\SignalScheduler_Setup_V7.3_Full_Offline.exe'
+          if (-not (Test-Path $exe)) { throw 'installer missing' }
+          Get-FileHash $exe -Algorithm SHA256 | Format-List
+          Write-Host ('Installer bytes: ' + (Get-Item $exe).Length)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SignalScheduler-V7.3-Full-Offline
+          path: output/SignalScheduler_Setup_V7.3_Full_Offline.exe
+          if-no-files-found: error
+          retention-days: 7
